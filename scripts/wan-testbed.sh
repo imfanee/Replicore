@@ -12,14 +12,16 @@
 # Usage:
 #   sudo scripts/wan-testbed.sh up          # build namespaces (+ WAN shaping)
 #   sudo scripts/wan-testbed.sh status      # show addresses, qdiscs, ping
-#   sudo scripts/wan-testbed.sh sink        # run replicored sink in rc-b (fg)
-#   sudo scripts/wan-testbed.sh source      # run replicored source in rc-a (fg)
+#   sudo scripts/wan-testbed.sh certs       # gen node identities + configs (M1)
+#   sudo scripts/wan-testbed.sh run-a       # run replicored daemon in rc-a (fg)
+#   sudo scripts/wan-testbed.sh run-b       # run replicored daemon in rc-b (fg)
 #   sudo scripts/wan-testbed.sh shell-a     # interactive shell in rc-a
 #   sudo scripts/wan-testbed.sh down        # tear everything down
 #
 # Tunables (env vars, with defaults):
 #   MODE=wan|lan   DELAY=75ms   JITTER=10ms   LOSS=1%   RATE=        (e.g. 100mbit)
 #   PORT=7000      DIR_A=/srv/replicore/a    DIR_B=/srv/replicore/b
+#   ETC=/srv/replicore/etc   STATE=/srv/replicore/state
 #   BIN=./target/release/replicored
 #
 # Note: DELAY is one-way and applied on BOTH veth ends, so RTT ~= 2*DELAY.
@@ -40,7 +42,11 @@ RATE=${RATE:-}
 PORT=${PORT:-7000}
 DIR_A=${DIR_A:-/srv/replicore/a}
 DIR_B=${DIR_B:-/srv/replicore/b}
+ETC=${ETC:-/srv/replicore/etc}
+STATE=${STATE:-/srv/replicore/state}
 BIN=${BIN:-./target/release/replicored}
+NODE_ID_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+NODE_ID_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 die() { echo "error: $*" >&2; exit 1; }
 need_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use sudo)"; }
@@ -108,18 +114,54 @@ status() {
   ip netns exec "$NS_A" ping -c 5 -i 0.3 "$IP_B" 2>&1 | tail -3 || echo "(no link)"
 }
 
-run_sink() {
+# M1: generate both node identities and write the two daemon configs.
+gen_certs() {
   need_root
   [ -x "$BIN" ] || die "binary not found at $BIN (build with: cargo build --release)"
-  echo "sink in ${NS_B} on ${IP_B}:${PORT} -> ${DIR_B}"
-  exec ip netns exec "$NS_B" "$BIN" sink --listen "${IP_B}:${PORT}" --dir "$DIR_B"
+  mkdir -p "$ETC" "$STATE" "$DIR_A" "$DIR_B"
+  "$BIN" gen-cert --out-dir "$ETC" --name node-a > "$ETC/node-a.gen"
+  "$BIN" gen-cert --out-dir "$ETC" --name node-b > "$ETC/node-b.gen"
+  local fp_a fp_b
+  fp_a=$(awk '/^fingerprint:/{print $2}' "$ETC/node-a.gen")
+  fp_b=$(awk '/^fingerprint:/{print $2}' "$ETC/node-b.gen")
+
+  cat > "$ETC/node-a.toml" <<EOF
+node_id   = "$NODE_ID_A"
+listen    = "${IP_A}:${PORT}"
+share_dir = "$DIR_A"
+db_path   = "$STATE/node-a.db"
+cert_path = "$ETC/node-a.cert.pem"
+key_path  = "$ETC/node-a.key.pem"
+
+[[peers]]
+node_id     = "$NODE_ID_B"
+addr        = "${IP_B}:${PORT}"
+fingerprint = "$fp_b"
+EOF
+  cat > "$ETC/node-b.toml" <<EOF
+node_id   = "$NODE_ID_B"
+listen    = "${IP_B}:${PORT}"
+share_dir = "$DIR_B"
+db_path   = "$STATE/node-b.db"
+cert_path = "$ETC/node-b.cert.pem"
+key_path  = "$ETC/node-b.key.pem"
+
+[[peers]]
+node_id     = "$NODE_ID_A"
+addr        = "${IP_A}:${PORT}"
+fingerprint = "$fp_a"
+EOF
+  echo "configs written: $ETC/node-a.toml, $ETC/node-b.toml"
+  echo "next: 'run-a' in one terminal, 'run-b' in another."
 }
 
-run_source() {
+run_node() { # $1 = a|b
   need_root
   [ -x "$BIN" ] || die "binary not found at $BIN (build with: cargo build --release)"
-  echo "source in ${NS_A} watching ${DIR_A} -> peer ${IP_B}:${PORT}"
-  exec ip netns exec "$NS_A" "$BIN" source --peer "${IP_B}:${PORT}" --dir "$DIR_A"
+  [ -f "$ETC/node-$1.toml" ] || die "no config at $ETC/node-$1.toml (run 'certs' first)"
+  local ns; ns=$([ "$1" = a ] && echo "$NS_A" || echo "$NS_B")
+  echo "replicored node-$1 in ${ns} (config $ETC/node-$1.toml)"
+  exec ip netns exec "$ns" env RUST_LOG="${RUST_LOG:-info}" "$BIN" run --config "$ETC/node-$1.toml"
 }
 
 down() {
@@ -134,9 +176,10 @@ case "${1:-}" in
   up)       up ;;
   down)     down ;;
   status)   status ;;
-  sink)     run_sink ;;
-  source)   run_source ;;
+  certs)    gen_certs ;;
+  run-a)    run_node a ;;
+  run-b)    run_node b ;;
   shell-a)  need_root; exec ip netns exec "$NS_A" "${SHELL:-bash}" ;;
   shell-b)  need_root; exec ip netns exec "$NS_B" "${SHELL:-bash}" ;;
-  *) echo "usage: $0 {up|down|status|sink|source|shell-a|shell-b}"; exit 1 ;;
+  *) echo "usage: $0 {up|down|status|certs|run-a|run-b|shell-a|shell-b}"; exit 1 ;;
 esac
