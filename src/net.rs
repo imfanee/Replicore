@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::apply::apply;
+use crate::apply::apply_write;
 use crate::proto::{FileMsg, ALPN};
 
 // ---------------------------------------------------------------------------
@@ -46,7 +46,17 @@ async fn handle_conn(connecting: quinn::Connecting, dir: PathBuf) -> Result<()> 
                     .await
                     .context("read stream")?;
                 let msg: FileMsg = bincode::deserialize(&buf).context("decode FileMsg")?;
-                if let Err(e) = apply(&dir, &msg) {
+                // Throwaway suppressor: the M0 sink has no watcher to suppress.
+                // The net rewrite (M1) threads the real shared one through.
+                let suppress = crate::suppress::Suppressor::new();
+                if let Err(e) = apply_write(
+                    &dir,
+                    &msg.rel_path,
+                    msg.mode,
+                    &msg.hash,
+                    &msg.data,
+                    &suppress,
+                ) {
                     eprintln!("[sink] apply failed: {e:#}");
                 }
             }

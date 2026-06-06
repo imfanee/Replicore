@@ -11,6 +11,7 @@ pub mod net;
 pub mod oplog;
 pub mod proto;
 pub mod state;
+pub mod suppress;
 pub mod vv;
 pub mod watch;
 
