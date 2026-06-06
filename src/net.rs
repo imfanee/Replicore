@@ -389,7 +389,7 @@ impl Engine {
             Frame::Hello {
                 proto_version,
                 node_id,
-                resume_from,
+                resume,
             } => {
                 if proto_version != PROTO_VERSION {
                     return Err(NetError::Version(proto_version));
@@ -400,7 +400,13 @@ impl Engine {
                 if node_id != peer.node_id {
                     return Err(NetError::PeerIdentityMismatch);
                 }
-                resume_from
+                // M2 full mesh: we push only our own ops, so only our entry
+                // of the frontier map matters. The rest is the relay seam.
+                resume
+                    .iter()
+                    .find(|(origin, _)| origin == &self.cfg.node_id)
+                    .map(|(_, cursor)| *cursor)
+                    .unwrap_or(0)
             }
             _ => return Err(NetError::Violation("expected Hello")),
         };
@@ -476,7 +482,12 @@ impl Engine {
     ) -> Result<(), NetError> {
         loop {
             match read_msg::<_, Frame>(&mut ctl_recv).await {
-                Ok(Frame::OplogAck { up_to_seq }) => {
+                Ok(Frame::OplogAck { origin, up_to_seq }) => {
+                    // M2 full mesh: only our own ops ride this connection, so
+                    // only acks for our origin are meaningful.
+                    if origin != self.cfg.node_id {
+                        return Err(NetError::Violation("ack for an origin we did not push"));
+                    }
                     // Never trust network input: an ack is only meaningful up
                     // to what we pushed on this connection. Beyond that is a
                     // lying or broken peer — drop it rather than let it
@@ -601,7 +612,9 @@ impl Engine {
             &Frame::Hello {
                 proto_version: PROTO_VERSION,
                 node_id: self.cfg.node_id,
-                resume_from,
+                // Frontier map; in the M2 full mesh the only meaningful entry
+                // is the peer's own origin (FR-603 relay seam carries more).
+                resume: vec![(peer.node_id, resume_from)],
             },
         )
         .await?;
@@ -631,12 +644,20 @@ impl Engine {
                 Ok(Frame::OplogPush(op)) => {
                     let seq = op.origin_seq;
                     if op.origin != peer.node_id {
-                        // M1 peers push only their own ops; forwarding is M2.
+                        // Full-mesh peers push only their own ops; forwarding
+                        // arrives with the relay policy (FR-603 seam).
                         return Err(NetError::Violation("op origin is not the pushing peer"));
                     }
                     self.process_remote_op(&conn, op).await?;
                     // Durably handled (COMMIT above) — only now may we ack.
-                    write_msg(&mut ctl_send, &Frame::OplogAck { up_to_seq: seq }).await?;
+                    write_msg(
+                        &mut ctl_send,
+                        &Frame::OplogAck {
+                            origin: peer.node_id,
+                            up_to_seq: seq,
+                        },
+                    )
+                    .await?;
                 }
                 Ok(Frame::Ping { nonce }) => {
                     write_msg(&mut ctl_send, &Frame::Pong { nonce }).await?;
@@ -830,8 +851,10 @@ mod tests {
             listen,
             share_dir: dir.to_path_buf(),
             db_path: dir.join("db"),
+            cas_dir: dir.join("cas"),
             cert_path,
             key_path,
+            health_listen: None,
             peers: peers
                 .into_iter()
                 .map(|(node_id, addr, fingerprint)| crate::config::Peer {
@@ -842,7 +865,14 @@ mod tests {
                 .collect(),
             quiesce_ms: 50,
             scan_interval_secs: 1,
+            reconcile_interval_secs: 300,
             max_file_bytes: 1024 * 1024,
+            chunk_min_bytes: 4096,
+            chunk_avg_bytes: 16 * 1024,
+            chunk_max_bytes: 64 * 1024,
+            per_file_chunk_concurrency: 4,
+            max_concurrent_transfers: 4,
+            serve_concurrency: 8,
         }
     }
 
@@ -1104,15 +1134,21 @@ mod tests {
             &Frame::Hello {
                 proto_version: PROTO_VERSION,
                 node_id: B,
-                resume_from: 0,
+                resume: vec![(A, 0)],
             },
         )
         .await
         .unwrap();
         let _hello_ack: Frame = read_msg(&mut recv).await.unwrap();
-        write_msg(&mut send, &Frame::OplogAck { up_to_seq: 999_999 })
-            .await
-            .unwrap();
+        write_msg(
+            &mut send,
+            &Frame::OplogAck {
+                origin: A,
+                up_to_seq: 999_999,
+            },
+        )
+        .await
+        .unwrap();
 
         let result = res_rx.recv().await.unwrap();
         assert!(

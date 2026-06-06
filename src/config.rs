@@ -45,6 +45,10 @@ pub enum ConfigError {
     BadShareDir(PathBuf),
     #[error("{what} must not live inside share_dir (it would be watched, hashed every scan, and replicated): {path}")]
     PathInsideShare { what: &'static str, path: PathBuf },
+    #[error(
+        "chunk sizes must satisfy 4096 <= min <= avg <= max <= 64 MiB (got {min}/{avg}/{max})"
+    )]
+    BadChunkSizes { min: u32, avg: u32, max: u32 },
 }
 
 /// Validated runtime configuration.
@@ -54,16 +58,34 @@ pub struct Config {
     pub listen: SocketAddr,
     pub share_dir: PathBuf,
     pub db_path: PathBuf,
+    /// Content-addressed chunk store root (FR-402). Defaults to
+    /// `<db_path>.cas`. Must live outside the share. No GC in M2 —
+    /// SEAM(M3): refcounted CAS GC via manifest_chunks.
+    pub cas_dir: PathBuf,
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    /// Health endpoint bind address (FR-1102); absent = disabled.
+    pub health_listen: Option<SocketAddr>,
     pub peers: Vec<Peer>,
     /// Per-path quiescence window before a local write becomes an op (FR-105).
     pub quiesce_ms: u64,
     /// Periodic scanner cadence; the rescan is the correctness backstop.
     pub scan_interval_secs: u64,
-    /// Upper bound for a single fetched file (whole-file transfer is M1;
-    /// chunking lands in M2, FR-402).
+    /// Periodic anti-entropy cadence per peer (FR-702).
+    pub reconcile_interval_secs: u64,
+    /// Upper bound for a single replicated file.
     pub max_file_bytes: u64,
+    /// fastcdc bounds (FR-402). `chunk_max_bytes` is also the wire guard for
+    /// a single chunk transfer.
+    pub chunk_min_bytes: u32,
+    pub chunk_avg_bytes: u32,
+    pub chunk_max_bytes: u32,
+    /// In-flight chunk fetches within one file transfer (FR-403).
+    pub per_file_chunk_concurrency: usize,
+    /// Concurrent file transfers across all subscriptions (FR-1106).
+    pub max_concurrent_transfers: usize,
+    /// Concurrent serve streams we grant each peer connection (FR-1106).
+    pub serve_concurrency: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -81,16 +103,34 @@ struct RawConfig {
     listen: SocketAddr,
     share_dir: PathBuf,
     db_path: PathBuf,
+    #[serde(default)]
+    cas_dir: Option<PathBuf>,
     cert_path: PathBuf,
     key_path: PathBuf,
+    #[serde(default)]
+    health_listen: Option<SocketAddr>,
     #[serde(default)]
     peers: Vec<RawPeer>,
     #[serde(default = "default_quiesce_ms")]
     quiesce_ms: u64,
     #[serde(default = "default_scan_interval_secs")]
     scan_interval_secs: u64,
+    #[serde(default = "default_reconcile_interval_secs")]
+    reconcile_interval_secs: u64,
     #[serde(default = "default_max_file_bytes")]
     max_file_bytes: u64,
+    #[serde(default = "default_chunk_min_bytes")]
+    chunk_min_bytes: u32,
+    #[serde(default = "default_chunk_avg_bytes")]
+    chunk_avg_bytes: u32,
+    #[serde(default = "default_chunk_max_bytes")]
+    chunk_max_bytes: u32,
+    #[serde(default = "default_per_file_chunk_concurrency")]
+    per_file_chunk_concurrency: usize,
+    #[serde(default = "default_max_concurrent_transfers")]
+    max_concurrent_transfers: usize,
+    #[serde(default = "default_serve_concurrency")]
+    serve_concurrency: usize,
 }
 
 #[derive(Deserialize)]
@@ -107,8 +147,29 @@ fn default_quiesce_ms() -> u64 {
 fn default_scan_interval_secs() -> u64 {
     5
 }
+fn default_reconcile_interval_secs() -> u64 {
+    300
+}
 fn default_max_file_bytes() -> u64 {
     64 * 1024 * 1024
+}
+fn default_chunk_min_bytes() -> u32 {
+    256 * 1024
+}
+fn default_chunk_avg_bytes() -> u32 {
+    1024 * 1024
+}
+fn default_chunk_max_bytes() -> u32 {
+    4 * 1024 * 1024
+}
+fn default_per_file_chunk_concurrency() -> usize {
+    6
+}
+fn default_max_concurrent_transfers() -> usize {
+    8
+}
+fn default_serve_concurrency() -> usize {
+    16
 }
 
 fn parse_node_id(s: &str) -> Result<NodeId, ConfigError> {
@@ -149,17 +210,44 @@ impl Config {
             });
         }
 
+        if raw.chunk_min_bytes < 4096
+            || raw.chunk_min_bytes > raw.chunk_avg_bytes
+            || raw.chunk_avg_bytes > raw.chunk_max_bytes
+            || raw.chunk_max_bytes > 64 * 1024 * 1024
+        {
+            return Err(ConfigError::BadChunkSizes {
+                min: raw.chunk_min_bytes,
+                avg: raw.chunk_avg_bytes,
+                max: raw.chunk_max_bytes,
+            });
+        }
+
+        // Default CAS root: sibling of the db (e.g. /var/lib/replicore/a.db
+        // -> /var/lib/replicore/a.cas).
+        let cas_dir = raw
+            .cas_dir
+            .unwrap_or_else(|| raw.db_path.with_extension("cas"));
+
         Ok(Config {
             node_id,
             listen: raw.listen,
             share_dir: raw.share_dir,
             db_path: raw.db_path,
+            cas_dir,
             cert_path: raw.cert_path,
             key_path: raw.key_path,
+            health_listen: raw.health_listen,
             peers,
             quiesce_ms: raw.quiesce_ms,
             scan_interval_secs: raw.scan_interval_secs,
+            reconcile_interval_secs: raw.reconcile_interval_secs,
             max_file_bytes: raw.max_file_bytes,
+            chunk_min_bytes: raw.chunk_min_bytes,
+            chunk_avg_bytes: raw.chunk_avg_bytes,
+            chunk_max_bytes: raw.chunk_max_bytes,
+            per_file_chunk_concurrency: raw.per_file_chunk_concurrency,
+            max_concurrent_transfers: raw.max_concurrent_transfers,
+            serve_concurrency: raw.serve_concurrency,
         })
     }
 
@@ -188,6 +276,7 @@ impl Config {
         // (the key!). Fail fast (FR-1202).
         for (what, path) in [
             ("db_path", &cfg.db_path),
+            ("cas_dir", &cfg.cas_dir),
             ("cert_path", &cfg.cert_path),
             ("key_path", &cfg.key_path),
         ] {
@@ -244,6 +333,46 @@ mod tests {
         assert_eq!(cfg.quiesce_ms, 300);
         assert_eq!(cfg.scan_interval_secs, 5);
         assert_eq!(cfg.max_file_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn m2_defaults_and_cas_derivation() {
+        let cfg = Config::from_toml_str(GOOD).unwrap();
+        assert_eq!(cfg.cas_dir, PathBuf::from("/var/lib/replicore/a.cas"));
+        assert_eq!(cfg.health_listen, None);
+        assert_eq!(cfg.reconcile_interval_secs, 300);
+        assert_eq!(
+            (
+                cfg.chunk_min_bytes,
+                cfg.chunk_avg_bytes,
+                cfg.chunk_max_bytes
+            ),
+            (256 * 1024, 1024 * 1024, 4 * 1024 * 1024)
+        );
+        assert_eq!(cfg.per_file_chunk_concurrency, 6);
+        assert_eq!(cfg.max_concurrent_transfers, 8);
+        assert_eq!(cfg.serve_concurrency, 16);
+
+        // Top-level keys must precede [[peers]] in TOML.
+        let text = GOOD.replace(
+            "[[peers]]",
+            "cas_dir = \"/data/cas\"\nhealth_listen = \"127.0.0.1:8800\"\n[[peers]]",
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!(cfg.cas_dir, PathBuf::from("/data/cas"));
+        assert_eq!(cfg.health_listen, Some("127.0.0.1:8800".parse().unwrap()));
+    }
+
+    #[test]
+    fn rejects_inverted_chunk_sizes() {
+        let text = GOOD.replace(
+            "[[peers]]",
+            "chunk_min_bytes = 2097152\nchunk_avg_bytes = 1048576\n[[peers]]",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&text),
+            Err(ConfigError::BadChunkSizes { .. })
+        ));
     }
 
     #[test]

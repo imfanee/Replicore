@@ -15,10 +15,13 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::vv::{NodeId, VersionVector};
 
 /// Negotiated in `Hello`; mismatch closes the connection cleanly (FR-504).
-pub const PROTO_VERSION: u16 = 1;
+/// M2 is a flag-day bump (chunked data plane, frontier Hello, per-origin
+/// acks, reconcile sessions): v1 peers are refused. The mesh ships as a unit.
+pub const PROTO_VERSION: u16 = 2;
 
-/// ALPN identifier for every QUIC connection.
-pub const ALPN: &[u8] = b"replicore/1";
+/// ALPN identifier for every QUIC connection. Bumped with PROTO_VERSION so a
+/// stale binary fails at the TLS layer, not mid-protocol.
+pub const ALPN: &[u8] = b"replicore/2";
 
 /// Hard cap for one control/fetch-header frame. Ops are small (path + vv);
 /// anything near this size is hostile or a bug.
@@ -64,13 +67,16 @@ pub fn op_id(origin: &NodeId, origin_seq: i64) -> [u8; 32] {
 /// Control-stream frames.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum Frame {
-    /// Sent by the dialer. `resume_from` is the dialer's durable cursor of the
-    /// listener's ops ("push me your ops with origin_seq > this"). The
-    /// receiver's persisted cursor is the resume authority (FR-503/801).
+    /// Sent by the dialer. `resume` is the dialer's durable cursor frontier:
+    /// one `(origin, cursor)` entry per origin whose ops it wants pushed
+    /// ("push me ops with origin_seq > cursor"). In the M2 full mesh the
+    /// listener reads only its own entry (it pushes only its own ops); the
+    /// full map is the relay/designated-link seam (FR-603). The receiver's
+    /// persisted cursor remains the resume authority (FR-503/801).
     Hello {
         proto_version: u16,
         node_id: NodeId,
-        resume_from: i64,
+        resume: Vec<(NodeId, i64)>,
     },
     /// Listener's reply; after this it starts pushing its ops.
     HelloAck {
@@ -78,11 +84,18 @@ pub enum Frame {
         node_id: NodeId,
     },
     OplogPush(OpRecord),
-    /// Contiguous ack: every op with `origin_seq <= up_to_seq` is durably
-    /// handled (persisted **before** this frame is sent — FR-801).
+    /// Contiguous per-origin ack: every `origin`-origin op with
+    /// `origin_seq <= up_to_seq` is durably handled (persisted **before**
+    /// this frame is sent — FR-801). In the M2 full mesh `origin` is always
+    /// the pushing peer itself; the field exists for the relay seam.
     OplogAck {
+        origin: NodeId,
         up_to_seq: i64,
     },
+    /// Reconcile gate (FR-702): the dialer sends this after its anti-entropy
+    /// session with the listener completes; the listener pushes NO ops before
+    /// receiving it. A restarted node never trusts the live stream unreconciled.
+    SubscribeOps,
     Ping {
         nonce: u64,
     },
@@ -91,14 +104,116 @@ pub enum Frame {
     },
 }
 
-/// Opens an ephemeral bi-stream: "send me the content with this hash".
+// ---------------------------------------------------------------------------
+// Ephemeral bi-streams. The initiator writes one tag byte, then framed
+// messages; bulk chunk bytes are raw (never inside a frame).
+// ---------------------------------------------------------------------------
+
+pub const STREAM_TAG_CHUNK: u8 = 1;
+pub const STREAM_TAG_MANIFEST: u8 = 2;
+pub const STREAM_TAG_RECONCILE: u8 = 3;
+
+/// One entry of a file manifest: a chunk's BLAKE3 and its length. Offsets are
+/// implicit prefix sums — the ordered list fully determines the file.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChunkEntry {
+    pub hash: [u8; 32],
+    pub len: u32,
+}
+
+/// "Send me the chunk with this hash" (FR-401/403). Response: `ChunkResp`
+/// header, then exactly `len` raw bytes. The receiver verifies BLAKE3 before
+/// the chunk is trusted or stored — every path.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ChunkReq {
+    pub hash: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ChunkResp {
+    pub found: bool,
+    pub len: u32,
+}
+
+/// Manifest page size: 4096 entries × 36 B ≈ 147 KiB per frame, far under
+/// MAX_FRAME. Never raise MAX_FRAME for manifests — paginate.
+pub const MANIFEST_PAGE: u32 = 4096;
+
+/// "Send me a page of the manifest for this content hash."
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ManifestReq {
+    pub content_hash: [u8; 32],
+    pub offset: u32,
+    pub count: u32,
+}
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct ManifestResp {
+    pub found: bool,
+    pub content_hash: [u8; 32],
+    /// Total chunk count of the whole manifest (drives pagination).
+    pub total: u32,
+    pub chunks: Vec<ChunkEntry>,
+}
+
+/// Directory-children page size for reconcile descent. Names are ≤255 bytes
+/// on Linux: 512 × ~300 B ≈ 150 KiB worst case per frame.
+pub const TREE_PAGE: u32 = 512;
+
+/// One child of a Merkle directory node.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct WireChild {
+    pub name: String,
+    pub hash: [u8; 32],
+    pub is_dir: bool,
+}
+
+/// Anti-entropy session messages (FR-701/703), request/response on one
+/// ephemeral bi-stream. The initiator is the puller; descent only enters
+/// subtrees whose hashes differ (O(diff) network cost).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub enum ReconcileFrame {
+    Begin,
+    RootIs {
+        hash: [u8; 32],
+    },
+    /// Paginated children of a directory node, sorted by name, strictly after
+    /// `after_name` (empty = from the start).
+    TreeReq {
+        prefix: String,
+        after_name: String,
+        limit: u32,
+    },
+    TreeResp {
+        children: Vec<WireChild>,
+        more: bool,
+    },
+    LeafReq {
+        path: String,
+    },
+    /// `mode`/`size` ride along for the state upsert but are NOT part of the
+    /// Merkle leaf hash (metadata fidelity is M3 — no flap on unreconciled
+    /// fields).
+    LeafResp {
+        found: bool,
+        tombstone: bool,
+        content_hash: Option<[u8; 32]>,
+        vv: VersionVector,
+        mode: u32,
+        size: u64,
+    },
+    Done,
+}
+
+// -- M1 leftovers, deleted with the chunked receive-path swap ----------------
+
+/// SPIKE/M1-ONLY whole-file fetch; superseded by ChunkReq/ManifestReq.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct FetchReq {
     pub hash: [u8; 32],
 }
 
-/// Header on the fetch response stream; `size` raw bytes follow when `found`.
-/// The receiver verifies BLAKE3 over the bytes before using them.
+/// SPIKE/M1-ONLY.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct FetchResp {
     pub found: bool,
@@ -192,10 +307,14 @@ mod tests {
             Frame::Hello {
                 proto_version: PROTO_VERSION,
                 node_id: [1u8; 16],
-                resume_from: 17,
+                resume: vec![([2u8; 16], 17), ([3u8; 16], 0)],
             },
             Frame::OplogPush(sample_op()),
-            Frame::OplogAck { up_to_seq: 42 },
+            Frame::OplogAck {
+                origin: [2u8; 16],
+                up_to_seq: 42,
+            },
+            Frame::SubscribeOps,
             Frame::Ping { nonce: 7 },
         ];
         for f in &frames {
@@ -254,6 +373,95 @@ mod tests {
         a.write_all(&[0xff; 4]).await.unwrap();
         let err = read_msg::<_, Frame>(&mut b).await.unwrap_err();
         assert!(matches!(err, ProtoError::Decode(_)));
+    }
+
+    #[tokio::test]
+    async fn v2_stream_messages_round_trip() {
+        let (mut a, mut b) = tokio::io::duplex(1 << 21);
+        write_msg(&mut a, &ChunkReq { hash: [5; 32] })
+            .await
+            .unwrap();
+        let got: ChunkReq = read_msg(&mut b).await.unwrap();
+        assert_eq!(got.hash, [5; 32]);
+
+        let mreq = ManifestReq {
+            content_hash: [6; 32],
+            offset: 4096,
+            count: MANIFEST_PAGE,
+        };
+        write_msg(&mut a, &mreq).await.unwrap();
+        assert_eq!(read_msg::<_, ManifestReq>(&mut b).await.unwrap(), mreq);
+
+        let frames = vec![
+            ReconcileFrame::Begin,
+            ReconcileFrame::RootIs { hash: [7; 32] },
+            ReconcileFrame::TreeReq {
+                prefix: "a/b".into(),
+                after_name: "c".into(),
+                limit: TREE_PAGE,
+            },
+            ReconcileFrame::TreeResp {
+                children: vec![WireChild {
+                    name: "c.wav".into(),
+                    hash: [8; 32],
+                    is_dir: false,
+                }],
+                more: true,
+            },
+            ReconcileFrame::LeafReq {
+                path: "a/b/c".into(),
+            },
+            ReconcileFrame::LeafResp {
+                found: true,
+                tombstone: false,
+                content_hash: Some([9; 32]),
+                vv: [([7u8; 16], 3u64)].into_iter().collect(),
+                mode: 0o644,
+                size: 123,
+            },
+            ReconcileFrame::Done,
+        ];
+        for f in &frames {
+            write_msg(&mut a, f).await.unwrap();
+        }
+        for f in &frames {
+            assert_eq!(&read_msg::<_, ReconcileFrame>(&mut b).await.unwrap(), f);
+        }
+    }
+
+    #[tokio::test]
+    async fn worst_case_pages_stay_under_max_frame() {
+        // A full manifest page of 4096 entries...
+        let resp = ManifestResp {
+            found: true,
+            content_hash: [1; 32],
+            total: u32::MAX,
+            chunks: vec![
+                ChunkEntry {
+                    hash: [0xff; 32],
+                    len: u32::MAX,
+                };
+                MANIFEST_PAGE as usize
+            ],
+        };
+        let (mut a, mut b) = tokio::io::duplex(1 << 21);
+        write_msg(&mut a, &resp).await.unwrap(); // would error with TooLarge if over
+        assert_eq!(read_msg::<_, ManifestResp>(&mut b).await.unwrap(), resp);
+
+        // ...and a full tree page with maximum-length (255 B) names.
+        let resp = ReconcileFrame::TreeResp {
+            children: vec![
+                WireChild {
+                    name: "x".repeat(255),
+                    hash: [0xff; 32],
+                    is_dir: false,
+                };
+                TREE_PAGE as usize
+            ],
+            more: true,
+        };
+        write_msg(&mut a, &resp).await.unwrap();
+        assert_eq!(read_msg::<_, ReconcileFrame>(&mut b).await.unwrap(), resp);
     }
 
     #[test]

@@ -271,12 +271,21 @@ mod tests {
             listen: "127.0.0.1:0".parse().unwrap(),
             share_dir: share.clone(),
             db_path: dir.path().join("db"),
+            cas_dir: dir.path().join("cas"),
             cert_path: dir.path().join("c"),
             key_path: dir.path().join("k"),
+            health_listen: None,
             peers: vec![],
             quiesce_ms: 30,
             scan_interval_secs: 1,
+            reconcile_interval_secs: 300,
             max_file_bytes: 1024,
+            chunk_min_bytes: 4096,
+            chunk_avg_bytes: 16 * 1024,
+            chunk_max_bytes: 64 * 1024,
+            per_file_chunk_concurrency: 4,
+            max_concurrent_transfers: 4,
+            serve_concurrency: 8,
         };
         let (tx, rx) = mpsc::channel(64);
         let ingest = Ingest::new(cfg, store.clone(), suppress.clone(), rx);
