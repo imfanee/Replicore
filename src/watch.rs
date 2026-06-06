@@ -17,10 +17,16 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
+
 use crate::ingest::LocalEvent;
 use crate::TMP_SUFFIX;
 
-pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<LocalEvent>) -> Result<()> {
+pub fn run(
+    dir: &Path,
+    tx: tokio::sync::mpsc::Sender<LocalEvent>,
+    rescan: Arc<tokio::sync::Notify>,
+) -> Result<()> {
     // Initialize fanotify in notification class; events carry an fd to the object.
     let fan = unsafe {
         libc::fanotify_init(
@@ -76,6 +82,14 @@ pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<LocalEvent>) -> Result<()> 
             let ev_len = meta.event_len as isize;
             if ev_len < meta_sz {
                 break; // malformed / truncated; avoid an infinite loop
+            }
+
+            // FR-104: the kernel dropped events (queue overflow). The signal
+            // carries no fd; wake the scanner for a targeted rescan instead
+            // of silently losing changes.
+            if meta.mask & libc::FAN_Q_OVERFLOW != 0 {
+                tracing::warn!("fanotify queue overflow; triggering targeted rescan (FR-104)");
+                rescan.notify_one();
             }
 
             if meta.fd >= 0 {

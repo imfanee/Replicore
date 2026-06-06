@@ -73,12 +73,22 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
 
     // Remove staging temps orphaned by a previous kill -9, BEFORE anything
     // that could stage a new one is running (the sweep must never race a
-    // live staging file).
+    // live staging file). Same rule for the CAS insert temps.
     let swept = replicore::scanner::sweep_orphan_temps(&cfg.share_dir)
         .context("sweep orphaned staging temps")?;
     if swept > 0 {
         tracing::info!(count = swept, "removed orphaned staging temps");
     }
+    let cas = replicore::chunk::Cas::open(&cfg.cas_dir).context("open chunk store")?;
+    let swept = cas
+        .sweep_orphan_temps()
+        .context("sweep orphaned CAS temps")?;
+    if swept > 0 {
+        tracing::info!(count = swept, "removed orphaned CAS insert temps");
+    }
+
+    // FR-104: fanotify overflow → targeted rescan, instead of silent loss.
+    let rescan = std::sync::Arc::new(tokio::sync::Notify::new());
 
     // Fanotify watcher: the low-latency write path. Best-effort by doctrine —
     // if it cannot start (no CAP_SYS_ADMIN), the scanner still guarantees
@@ -86,10 +96,11 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     {
         let dir = cfg.share_dir.clone();
         let tx = events_tx.clone();
+        let rescan = rescan.clone();
         std::thread::Builder::new()
             .name("replicore-watch".into())
             .spawn(move || {
-                if let Err(e) = replicore::watch::run(&dir, tx) {
+                if let Err(e) = replicore::watch::run(&dir, tx, rescan) {
                     tracing::warn!(
                         error = format!("{e:#}"),
                         "fanotify watcher unavailable; relying on periodic rescan only"
@@ -104,10 +115,21 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         cfg.clone(),
         store.clone(),
         events_tx,
+        rescan,
     ));
 
-    // Ingest: events -> ops (debounce, suppression, no-op filter).
-    tokio::spawn(Ingest::new(cfg.clone(), store.clone(), suppress.clone(), events_rx).run());
+    // Ingest: events -> ops (debounce, suppression, no-op filter), chunking
+    // local writes into the CAS as it hashes them.
+    tokio::spawn(
+        Ingest::new(
+            cfg.clone(),
+            store.clone(),
+            suppress.clone(),
+            cas.clone(),
+            events_rx,
+        )
+        .run(),
+    );
 
     // Transport: listener + one subscription per configured peer. Runs until
     // the process is killed.

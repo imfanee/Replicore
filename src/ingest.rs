@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::chunk::{chunk_file_into_cas, Cas, CasError, ChunkParams, Manifest};
 use crate::config::Config;
 use crate::oplog::{LocalChange, Store};
 use crate::proto::OpType;
@@ -39,6 +40,9 @@ pub struct Ingest {
     cfg: Config,
     store: Store,
     suppress: Suppressor,
+    /// Local writes are chunked into the CAS while being hashed (FR-402) so
+    /// this node can serve its own content chunk-by-chunk.
+    cas: Cas,
     rx: mpsc::Receiver<LocalEvent>,
     /// rel path → (absolute path, quiescence deadline). Coalesces bursts:
     /// a thousand rapid writes to one file become one hash + one op (FR-105).
@@ -50,12 +54,14 @@ impl Ingest {
         cfg: Config,
         store: Store,
         suppress: Suppressor,
+        cas: Cas,
         rx: mpsc::Receiver<LocalEvent>,
     ) -> Ingest {
         Ingest {
             cfg,
             store,
             suppress,
+            cas,
             rx,
             pending: HashMap::new(),
         }
@@ -123,47 +129,64 @@ impl Ingest {
 
     async fn handle_write(&mut self, rel: String, abs: PathBuf) {
         let max = self.cfg.max_file_bytes;
-        // Hash + metadata off the async runtime (whole-file read; chunked
-        // streaming hash is M2).
-        let observed = tokio::task::spawn_blocking(move || -> std::io::Result<Option<Observed>> {
-            let meta = std::fs::symlink_metadata(&abs)?;
-            if !meta.is_file() {
-                return Ok(None); // symlinks/dirs/special: M3 fidelity (FR-106)
-            }
-            if meta.len() > max {
-                return Ok(Some(Observed::TooBig(meta.len())));
-            }
-            let data = std::fs::read(&abs)?;
-            use std::os::unix::fs::PermissionsExt;
-            Ok(Some(Observed::File {
-                hash: *blake3::hash(&data).as_bytes(),
-                size: data.len() as u64,
-                mode: meta.permissions().mode() & 0o7777,
-            }))
-        })
-        .await;
+        let params = ChunkParams {
+            min: self.cfg.chunk_min_bytes,
+            avg: self.cfg.chunk_avg_bytes,
+            max: self.cfg.chunk_max_bytes,
+        };
+        let cas = self.cas.clone();
+        // ONE streamed pass off the async runtime: fastcdc chunks → CAS
+        // inserts (idempotent — re-observed unchanged files cost a stat per
+        // chunk) → whole-file hash (FR-402).
+        let observed =
+            tokio::task::spawn_blocking(move || -> Result<Option<Observed>, CasError> {
+                let meta = std::fs::symlink_metadata(&abs).map_err(|source| CasError::Io {
+                    ctx: "stat",
+                    path: abs.clone(),
+                    source,
+                })?;
+                if !meta.is_file() {
+                    return Ok(None); // symlinks/dirs/special: M3 fidelity (FR-106)
+                }
+                if meta.len() > max {
+                    return Ok(Some(Observed::TooBig(meta.len())));
+                }
+                let manifest = chunk_file_into_cas(&abs, &params, &cas)?;
+                use std::os::unix::fs::PermissionsExt;
+                Ok(Some(Observed::File {
+                    manifest,
+                    mode: meta.permissions().mode() & 0o7777,
+                }))
+            })
+            .await;
 
+        let vanished = |e: &CasError| {
+            matches!(e, CasError::Io { source, .. }
+                if source.kind() == std::io::ErrorKind::NotFound)
+        };
         let observed = match observed {
             Ok(Ok(Some(o))) => o,
             Ok(Ok(None)) => return,
             // Vanished between event and read: the scanner's delete pass owns it.
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Ok(Err(e)) if vanished(&e) => return,
             Ok(Err(e)) => {
-                tracing::warn!(path = %rel, error = %e, "cannot read changed file; skipping");
+                tracing::warn!(path = %rel, error = %e, "cannot chunk changed file; skipping");
                 return;
             }
             Err(join) => {
-                tracing::error!(error = %join, "hashing task failed");
+                tracing::error!(error = %join, "chunking task failed");
                 return;
             }
         };
-        let (hash, size, mode) = match observed {
+        let (manifest, mode) = match observed {
             Observed::TooBig(len) => {
                 tracing::warn!(path = %rel, len, "file exceeds max_file_bytes; not replicated");
                 return;
             }
-            Observed::File { hash, size, mode } => (hash, size, mode),
+            Observed::File { manifest, mode } => (manifest, mode),
         };
+        let hash = manifest.content_hash;
+        let size = manifest.total_len();
 
         // Loop defense 1 (FR-902): our own remote apply observed back.
         if self.suppress.check_write(&rel, &hash) {
@@ -172,7 +195,8 @@ impl Ingest {
         }
 
         // Loop defense 2 (FR-901) lives in the store: append_local no-ops on
-        // identical content, atomically with the VV increment.
+        // identical content, atomically with the VV increment. The manifest
+        // rides in the same transaction.
         match self
             .store
             .append_local(LocalChange {
@@ -181,7 +205,7 @@ impl Ingest {
                 mode,
                 size,
                 content_hash: Some(hash),
-                manifest: None,
+                manifest: Some(manifest),
             })
             .await
         {
@@ -238,11 +262,7 @@ impl Ingest {
 }
 
 enum Observed {
-    File {
-        hash: [u8; 32],
-        size: u64,
-        mode: u32,
-    },
+    File { manifest: Manifest, mode: u32 },
     TooBig(u64),
 }
 
@@ -259,6 +279,7 @@ mod tests {
         share: PathBuf,
         store: Store,
         suppress: Suppressor,
+        cas: Cas,
         tx: mpsc::Sender<LocalEvent>,
     }
 
@@ -289,14 +310,16 @@ mod tests {
             max_concurrent_transfers: 4,
             serve_concurrency: 8,
         };
+        let cas = Cas::open(&cfg.cas_dir).unwrap();
         let (tx, rx) = mpsc::channel(64);
-        let ingest = Ingest::new(cfg, store.clone(), suppress.clone(), rx);
+        let ingest = Ingest::new(cfg, store.clone(), suppress.clone(), cas.clone(), rx);
         tokio::spawn(ingest.run());
         Rig {
             _dir: dir,
             share,
             store,
             suppress,
+            cas,
             tx,
         }
     }
@@ -415,6 +438,31 @@ mod tests {
                 .unwrap()
                 .tombstone
         );
+    }
+
+    #[tokio::test]
+    async fn local_write_populates_cas_and_manifest() {
+        let r = rig();
+        let data = b"locally written content";
+        let hash = *blake3::hash(data).as_bytes();
+        let f = r.share.join("served.bin");
+        std::fs::write(&f, data).unwrap();
+        r.tx.send(LocalEvent::Write(f)).await.unwrap();
+        settle().await;
+
+        // The op, its manifest, and every chunk are durable: this node can
+        // now serve its own content chunk-by-chunk (FR-402).
+        let manifest = r
+            .store
+            .manifest_for(hash)
+            .await
+            .unwrap()
+            .expect("manifest persisted with the op");
+        assert_eq!(manifest.content_hash, hash);
+        assert!(!manifest.chunks.is_empty());
+        for c in &manifest.chunks {
+            assert!(r.cas.has(&c.hash), "chunk missing from CAS");
+        }
     }
 
     #[tokio::test]

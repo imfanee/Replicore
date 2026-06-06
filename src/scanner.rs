@@ -41,9 +41,16 @@ pub enum ScanError {
     Join(#[from] tokio::task::JoinError),
 }
 
-/// Run forever: baseline scan immediately (FR-103), then periodic passes.
+/// Run forever: baseline scan immediately (FR-103), then periodic passes —
+/// or sooner when `rescan` fires (FR-104: fanotify queue overflow / detected
+/// gaps trigger a targeted rescan instead of waiting out the timer).
 /// Per-pass errors are logged; the loop keeps going (the next pass retries).
-pub async fn run(cfg: Config, store: Store, tx: mpsc::Sender<LocalEvent>) {
+pub async fn run(
+    cfg: Config,
+    store: Store,
+    tx: mpsc::Sender<LocalEvent>,
+    rescan: std::sync::Arc<tokio::sync::Notify>,
+) {
     let interval = Duration::from_secs(cfg.scan_interval_secs.max(1));
     loop {
         match scan_once(&cfg.share_dir, &store, &tx).await {
@@ -55,7 +62,12 @@ pub async fn run(cfg: Config, store: Store, tx: mpsc::Sender<LocalEvent>) {
             Err(ScanError::ChannelClosed) => return, // shutting down
             Err(e) => tracing::warn!(error = %e, "scan pass failed; will retry"),
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = rescan.notified() => {
+                tracing::info!("targeted rescan triggered (FR-104)");
+            }
+        }
     }
 }
 
