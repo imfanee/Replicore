@@ -11,6 +11,7 @@ pub mod decide;
 pub mod ingest;
 pub mod net;
 pub mod oplog;
+pub mod peer;
 pub mod proto;
 pub mod replica;
 pub mod scanner;

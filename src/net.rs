@@ -44,6 +44,7 @@ use crate::apply::{apply_delete, apply_write, ApplyError};
 use crate::config::{Config, Peer};
 use crate::decide::{decide, Decision};
 use crate::oplog::{Store, StoreError};
+use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
     read_msg, write_msg, FetchReq, FetchResp, Frame, OpRecord, OpType, ProtoError, ALPN,
     PROTO_VERSION,
@@ -53,8 +54,6 @@ use crate::vv::NodeId;
 
 /// Ops pushed per batch between cursor reads.
 const PUSH_BATCH: u32 = 64;
-const RECONNECT_MIN: Duration = Duration::from_millis(500);
-const RECONNECT_MAX: Duration = Duration::from_secs(15);
 
 #[derive(thiserror::Error, Debug)]
 pub enum NetError {
@@ -295,6 +294,10 @@ pub struct Engine {
     cfg: Arc<Config>,
     store: Store,
     suppress: Suppressor,
+    /// Live connections (inbound AND outbound) for multi-source fetch.
+    conns: ConnRegistry,
+    /// Liveness/anti-entropy status for /healthz.
+    peers_reg: PeerRegistry,
 }
 
 impl Engine {
@@ -303,6 +306,8 @@ impl Engine {
             cfg: Arc::new(cfg),
             store,
             suppress,
+            conns: ConnRegistry::new(),
+            peers_reg: PeerRegistry::new(),
         })
     }
 
@@ -383,6 +388,19 @@ impl Engine {
         let conn = incoming.await?;
         let peer = self.identify(&conn)?; // bind connection -> configured peer
 
+        // Authenticated inbound connections serve multi-source fetch too.
+        let peer_id = peer.node_id;
+        self.conns.insert(peer_id, conn.clone());
+        let result = self.inbound_io(conn.clone(), peer).await;
+        self.conns.remove_if_same(&peer_id, &conn);
+        result
+    }
+
+    async fn inbound_io(
+        self: &Arc<Engine>,
+        conn: quinn::Connection,
+        peer: Peer,
+    ) -> Result<(), NetError> {
         // The dialer opens the control stream and speaks first.
         let (mut ctl_send, mut ctl_recv) = conn.accept_bi().await?;
         let resume_from = match read_msg::<_, Frame>(&mut ctl_recv).await? {
@@ -572,18 +590,20 @@ impl Engine {
     // -- outbound -----------------------------------------------------------
 
     /// Maintain our subscription to `peer`'s ops forever, reconnecting with
-    /// backoff (FR-602-lite; full liveness detection is M2).
+    /// bounded, jittered backoff (FR-602 — no thundering herd on flap).
     async fn dial_loop(self: Arc<Engine>, endpoint: quinn::Endpoint, peer: Peer) {
-        let mut backoff = RECONNECT_MIN;
+        let mut attempt: u32 = 0;
         loop {
-            match self.subscribe_once(&endpoint, &peer, &mut backoff).await {
+            self.peers_reg.set_state(peer.node_id, PeerState::Dialing);
+            match self.subscribe_once(&endpoint, &peer, &mut attempt).await {
                 Ok(()) => tracing::info!(addr = %peer.addr, "subscription closed; reconnecting"),
                 Err(e) => {
                     tracing::warn!(addr = %peer.addr, error = %e, "subscription failed; reconnecting")
                 }
             }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(RECONNECT_MAX);
+            self.peers_reg.set_state(peer.node_id, PeerState::Backoff);
+            tokio::time::sleep(jittered_backoff(attempt)).await;
+            attempt = attempt.saturating_add(1);
         }
     }
 
@@ -593,7 +613,7 @@ impl Engine {
         &self,
         endpoint: &quinn::Endpoint,
         peer: &Peer,
-        backoff: &mut Duration,
+        attempt: &mut u32,
     ) -> Result<(), NetError> {
         // The server name is irrelevant under pinning but required by the API.
         let conn = endpoint.connect(peer.addr, "replicore")?.await?;
@@ -605,6 +625,22 @@ impl Engine {
             return Err(NetError::PeerIdentityMismatch);
         }
 
+        // Authenticated: make this connection borrowable for multi-source
+        // fetch, and guarantee deregistration on every exit path below.
+        self.conns.insert(peer.node_id, conn.clone());
+        let result = self.subscription_io(&conn, peer, attempt).await;
+        self.conns.remove_if_same(&peer.node_id, &conn);
+        self.peers_reg
+            .set_state(peer.node_id, PeerState::Disconnected);
+        result
+    }
+
+    async fn subscription_io(
+        &self,
+        conn: &quinn::Connection,
+        peer: &Peer,
+        attempt: &mut u32,
+    ) -> Result<(), NetError> {
         let (mut ctl_send, mut ctl_recv) = conn.open_bi().await?;
         let resume_from = self.store.recv_cursor(peer.node_id).await?;
         write_msg(
@@ -637,7 +673,8 @@ impl Engine {
             resume_from,
             "subscribed to peer ops"
         );
-        *backoff = RECONNECT_MIN; // handshake succeeded: reset
+        *attempt = 0; // handshake succeeded: reset the backoff schedule
+        self.peers_reg.set_state(peer.node_id, PeerState::Live);
 
         loop {
             match read_msg::<_, Frame>(&mut ctl_recv).await {
@@ -648,7 +685,7 @@ impl Engine {
                         // arrives with the relay policy (FR-603 seam).
                         return Err(NetError::Violation("op origin is not the pushing peer"));
                     }
-                    self.process_remote_op(&conn, op).await?;
+                    self.process_remote_op(conn, op).await?;
                     // Durably handled (COMMIT above) — only now may we ack.
                     write_msg(
                         &mut ctl_send,
@@ -1045,8 +1082,8 @@ mod tests {
         tokio::spawn({
             let engine = engine_b.clone();
             async move {
-                let mut backoff = RECONNECT_MIN;
-                let _ = engine.subscribe_once(&ep_b, &peer_a, &mut backoff).await;
+                let mut attempt: u32 = 0;
+                let _ = engine.subscribe_once(&ep_b, &peer_a, &mut attempt).await;
             }
         });
 
