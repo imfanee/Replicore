@@ -56,6 +56,7 @@ use crate::proto::{
     ProtoError, ReconcileFrame, ALPN, MANIFEST_PAGE, PROTO_VERSION, STREAM_TAG_CHUNK,
     STREAM_TAG_MANIFEST, STREAM_TAG_RECONCILE, TREE_PAGE,
 };
+use crate::stats::Stats;
 use crate::suppress::Suppressor;
 use crate::vv::NodeId;
 
@@ -311,10 +312,17 @@ pub struct Engine {
     conns: ConnRegistry,
     /// Liveness/anti-entropy status for /healthz.
     peers_reg: PeerRegistry,
+    /// Transfer/reconcile counters for /healthz and the mesh tests.
+    stats: Arc<Stats>,
+    /// Engine-wide bound on concurrent file transfers (FR-1106).
+    transfers: Arc<tokio::sync::Semaphore>,
 }
 
 impl Engine {
     pub fn new(cfg: Config, store: Store, suppress: Suppressor, cas: Cas) -> Arc<Engine> {
+        let transfers = Arc::new(tokio::sync::Semaphore::new(
+            cfg.max_concurrent_transfers.max(1),
+        ));
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
@@ -322,6 +330,8 @@ impl Engine {
             cas,
             conns: ConnRegistry::new(),
             peers_reg: PeerRegistry::new(),
+            stats: Arc::new(Stats::default()),
+            transfers,
         })
     }
 
@@ -682,6 +692,8 @@ impl Engine {
                 tokio::io::copy(&mut reader, &mut send)
                     .await
                     .map_err(NetError::Io)?;
+                Stats::inc(&self.stats.chunks_served);
+                Stats::add(&self.stats.bytes_out, len);
             }
             _ => {
                 // Absent (or absurd on disk): the fetcher tries another peer.
@@ -987,35 +999,18 @@ impl Engine {
                     if op.size > self.cfg.max_file_bytes {
                         return Err(NetError::TooBig);
                     }
-                    let limits = self.fetch_limits();
-                    // Multi-source: candidates come from the shared registry,
-                    // origin first — not just this subscription's connection.
-                    let manifest = crate::fetch::obtain_manifest(
-                        hash,
-                        &self.store,
-                        &self.conns,
-                        op.origin,
-                        &limits,
-                    )
-                    .await?;
-                    crate::fetch::fetch_file_chunks(
-                        &manifest,
-                        &self.cas,
-                        &self.conns,
-                        op.origin,
-                        &limits,
-                    )
-                    .await?;
-                    let share = self.cfg.share_dir.clone();
-                    let rel = op.path.clone();
-                    let mode = op.mode;
-                    let suppress = self.suppress.clone();
-                    let cas = self.cas.clone();
-                    // fsync-heavy: keep it off the async runtime.
-                    tokio::task::spawn_blocking(move || {
-                        apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
-                    })
-                    .await??;
+                    // Engine-wide transfer bound (FR-1106): total in-flight
+                    // bytes <= transfers x per-file concurrency x chunk max.
+                    let _transfer_permit = self
+                        .transfers
+                        .clone()
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+                    Stats::gauge_inc(&self.stats.inflight_transfers);
+                    let result = self.fetch_and_assemble(op, hash).await;
+                    Stats::gauge_dec(&self.stats.inflight_transfers);
+                    result?;
                 }
             }
             OpType::Delete => {
@@ -1027,6 +1022,54 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    /// Manifest -> missing chunks -> CAS -> streamed atomic assembly.
+    async fn fetch_and_assemble(&self, op: &OpRecord, hash: [u8; 32]) -> Result<(), NetError> {
+        let limits = self.fetch_limits();
+        // Multi-source: candidates come from the shared registry, origin
+        // first — not just this subscription's connection.
+        let manifest = crate::fetch::obtain_manifest(
+            hash,
+            &self.store,
+            &self.conns,
+            op.origin,
+            &limits,
+            &self.stats,
+        )
+        .await?;
+        crate::fetch::fetch_file_chunks(
+            &manifest,
+            &self.cas,
+            &self.conns,
+            op.origin,
+            &limits,
+            &self.stats,
+        )
+        .await?;
+        let share = self.cfg.share_dir.clone();
+        let rel = op.path.clone();
+        let mode = op.mode;
+        let suppress = self.suppress.clone();
+        let cas = self.cas.clone();
+        // fsync-heavy: keep it off the async runtime.
+        tokio::task::spawn_blocking(move || {
+            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub fn stats(&self) -> Arc<Stats> {
+        self.stats.clone()
+    }
+
+    pub fn peer_registry(&self) -> PeerRegistry {
+        self.peers_reg.clone()
+    }
+
+    pub fn conn_registry(&self) -> ConnRegistry {
+        self.conns.clone()
     }
 
     fn fetch_limits(&self) -> crate::fetch::FetchLimits {
@@ -1063,6 +1106,7 @@ impl Engine {
         let report = reconcile_pull(&local, &mut transport, &ctx).await?;
         let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
         let _ = transport.send.finish();
+        Stats::inc(&self.stats.reconcile_runs);
         Ok(report)
     }
 
@@ -1190,10 +1234,18 @@ impl ReconcileTransport for QuicReconcile<'_> {
             &self.engine.conns,
             self.peer,
             &limits,
+            &self.engine.stats,
         )
         .await?;
-        crate::fetch::fetch_file_chunks(&manifest, cas, &self.engine.conns, self.peer, &limits)
-            .await?;
+        crate::fetch::fetch_file_chunks(
+            &manifest,
+            cas,
+            &self.engine.conns,
+            self.peer,
+            &limits,
+            &self.engine.stats,
+        )
+        .await?;
         Ok(manifest)
     }
 }
@@ -1548,13 +1600,26 @@ mod tests {
         // Origin-first ordering hits the dead conn first; the fetch must
         // fall through to A and land the chunk in B's CAS (FR-403).
         let limits = engine_b.fetch_limits();
-        let manifest =
-            crate::fetch::obtain_manifest(hash, &engine_b.store, &engine_b.conns, GHOST, &limits)
-                .await
-                .expect("manifest via the surviving peer");
-        crate::fetch::fetch_file_chunks(&manifest, &engine_b.cas, &engine_b.conns, GHOST, &limits)
-            .await
-            .expect("chunks via the surviving peer");
+        let manifest = crate::fetch::obtain_manifest(
+            hash,
+            &engine_b.store,
+            &engine_b.conns,
+            GHOST,
+            &limits,
+            &engine_b.stats,
+        )
+        .await
+        .expect("manifest via the surviving peer");
+        crate::fetch::fetch_file_chunks(
+            &manifest,
+            &engine_b.cas,
+            &engine_b.conns,
+            GHOST,
+            &limits,
+            &engine_b.stats,
+        )
+        .await
+        .expect("chunks via the surviving peer");
         assert!(engine_b.cas.has(&hash));
 
         // A hash nobody holds: every live peer answers not-found, which is
@@ -1565,6 +1630,7 @@ mod tests {
             &engine_b.conns,
             GHOST,
             &limits,
+            &engine_b.stats,
         )
         .await
         .unwrap_err();

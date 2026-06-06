@@ -27,6 +27,7 @@ use crate::proto::{
     read_msg, write_msg, ChunkEntry, ChunkReq, ChunkResp, ManifestReq, ManifestResp, ProtoError,
     MANIFEST_PAGE, STREAM_TAG_CHUNK, STREAM_TAG_MANIFEST,
 };
+use crate::stats::Stats;
 use crate::vv::NodeId;
 
 /// Backstop against a hostile `total` in ManifestResp: 2^24 chunks ≈ 64 TiB
@@ -78,6 +79,7 @@ pub async fn obtain_manifest(
     registry: &ConnRegistry,
     origin: NodeId,
     limits: &FetchLimits,
+    stats: &Arc<Stats>,
 ) -> Result<Manifest, FetchError> {
     if let Some(m) = store.manifest_for(content_hash).await? {
         return Ok(m);
@@ -90,6 +92,7 @@ pub async fn obtain_manifest(
     for (peer, conn) in candidates {
         match manifest_from_peer(&conn, content_hash, limits).await {
             Ok(Some(m)) => {
+                Stats::inc(&stats.manifests_fetched);
                 store.put_manifest(m.clone()).await?;
                 return Ok(m);
             }
@@ -188,6 +191,7 @@ pub async fn fetch_file_chunks(
     registry: &ConnRegistry,
     origin: NodeId,
     limits: &FetchLimits,
+    stats: &Arc<Stats>,
 ) -> Result<(), FetchError> {
     // Dedup within the manifest (repeated content costs one fetch) and skip
     // everything already present — THE resume step.
@@ -218,9 +222,10 @@ pub async fn fetch_file_chunks(
         let cas = cas.clone();
         let registry = registry.clone();
         let limits = *limits;
+        let stats = stats.clone();
         tasks.spawn(async move {
             let _permit = permit; // bounds in-flight chunks (FR-1106)
-            fetch_one_chunk(entry, &cas, &registry, origin, &limits).await
+            fetch_one_chunk(entry, &cas, &registry, origin, &limits, &stats).await
         });
     }
     let mut first_err: Option<FetchError> = None;
@@ -260,6 +265,7 @@ async fn fetch_one_chunk(
     registry: &ConnRegistry,
     origin: NodeId,
     limits: &FetchLimits,
+    stats: &Arc<Stats>,
 ) -> Result<(), FetchError> {
     if entry.len > limits.max_chunk_bytes {
         return Err(FetchError::BadManifest("chunk length out of bounds"));
@@ -274,6 +280,8 @@ async fn fetch_one_chunk(
             Ok(Some(bytes)) => {
                 // Verified by chunk_from_peer; put_verified re-checks and is
                 // the ONLY path that writes into the store.
+                Stats::inc(&stats.chunks_fetched);
+                Stats::add(&stats.bytes_in, bytes.len() as u64);
                 let cas = cas.clone();
                 let hash = entry.hash;
                 tokio::task::spawn_blocking(move || cas.put_verified(&hash, &bytes)).await??;

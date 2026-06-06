@@ -18,6 +18,7 @@ pub mod proto;
 pub mod replica;
 pub mod scanner;
 pub mod state;
+pub mod stats;
 pub mod suppress;
 pub mod vv;
 pub mod watch;
