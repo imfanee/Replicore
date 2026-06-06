@@ -193,6 +193,19 @@ impl Ingest {
     }
 
     async fn handle_delete(&mut self, rel: String) {
+        // Authoritative last look: the scanner's delete observation is a
+        // snapshot diff (disk walked, THEN index queried), so a remote write
+        // applied mid-pass can surface here as a false delete for a file
+        // that exists. Tombstoning is destructive and propagates — re-verify
+        // absence at the choke point before emitting it.
+        if tokio::fs::symlink_metadata(self.cfg.share_dir.join(&rel))
+            .await
+            .is_ok()
+        {
+            tracing::debug!(path = %rel, "delete observation stale (path exists); skipping");
+            return;
+        }
+
         // A pending write for a now-gone path is moot.
         self.pending.remove(&rel);
 
@@ -352,6 +365,45 @@ mod tests {
             .unwrap();
         settle().await;
         assert_eq!(r.store.op_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_delete_for_existing_file_is_ignored() {
+        // Race found in review: the scanner walks the disk BEFORE querying
+        // the index, so a remote write applied mid-pass shows up as a live
+        // index row with no walked file -> a false Delete observation. The
+        // file exists; tombstoning it would propagate a transient deletion.
+        let r = rig();
+        let f = r.share.join("raced.bin");
+        std::fs::write(&f, b"applied mid-scan").unwrap();
+        r.tx.send(LocalEvent::Write(f.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1);
+
+        // Stale observation arrives while the file is very much on disk.
+        r.tx.send(LocalEvent::Delete("raced.bin".into()))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1, "false delete emitted");
+        let local = r.store.load_file("raced.bin").await.unwrap().unwrap();
+        assert!(!local.tombstone);
+
+        // A genuine delete afterwards still works.
+        std::fs::remove_file(&f).unwrap();
+        r.tx.send(LocalEvent::Delete("raced.bin".into()))
+            .await
+            .unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 2);
+        assert!(
+            r.store
+                .load_file("raced.bin")
+                .await
+                .unwrap()
+                .unwrap()
+                .tombstone
+        );
     }
 
     #[tokio::test]
