@@ -89,8 +89,17 @@ async fn deliver_permuted(
     }
 }
 
+/// Default 64 cases for CI speed; override with PROPTEST_CASES for deep runs
+/// (e.g. `PROPTEST_CASES=20000 cargo test --release --test convergence_proptest`).
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(64))]
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     /// Partitioned namespaces: full convergence under permuted, duplicated
     /// delivery, and total quiescence on redelivery (the no-storm property).

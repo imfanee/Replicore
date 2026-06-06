@@ -71,6 +71,15 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let suppress = Suppressor::new();
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<LocalEvent>(1024);
 
+    // Remove staging temps orphaned by a previous kill -9, BEFORE anything
+    // that could stage a new one is running (the sweep must never race a
+    // live staging file).
+    let swept = replicore::scanner::sweep_orphan_temps(&cfg.share_dir)
+        .context("sweep orphaned staging temps")?;
+    if swept > 0 {
+        tracing::info!(count = swept, "removed orphaned staging temps");
+    }
+
     // Fanotify watcher: the low-latency write path. Best-effort by doctrine —
     // if it cannot start (no CAP_SYS_ADMIN), the scanner still guarantees
     // correctness, so we degrade loudly instead of dying.

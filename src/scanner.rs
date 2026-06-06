@@ -137,6 +137,41 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
     Ok(out)
 }
 
+/// Unlink every staging temp under `root`.
+///
+/// A kill -9 between staging and rename leaves a `.replicore-tmp` orphan that
+/// the watcher and scanner both (correctly) ignore — nothing else ever
+/// deletes it. Any temp present at startup predates this process and cannot
+/// be in flight (one daemon per share). MUST be called before the engine
+/// spawns, so the sweep can never race a live staging file.
+pub fn sweep_orphan_temps(root: &Path) -> Result<usize, ScanError> {
+    let mut removed = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|source| ScanError::Walk {
+            path: dir.clone(),
+            source,
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| ScanError::Walk {
+                path: dir.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let ftype = entry.file_type().map_err(|source| ScanError::Walk {
+                path: path.clone(),
+                source,
+            })?;
+            if ftype.is_dir() {
+                stack.push(path);
+            } else if ftype.is_file() && is_tmp(&path) && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn is_tmp(p: &Path) -> bool {
     p.file_name()
         .and_then(|n| n.to_str())
@@ -152,6 +187,22 @@ mod tests {
     use crate::vv::NodeId;
 
     const NODE: NodeId = [0xaa; 16];
+
+    #[test]
+    fn orphan_temp_sweep_removes_only_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path();
+        std::fs::create_dir_all(share.join("sub")).unwrap();
+        std::fs::write(share.join("real.txt"), b"keep").unwrap();
+        std::fs::write(share.join(format!(".f{TMP_SUFFIX}.123.0")), b"orphan").unwrap();
+        std::fs::write(share.join(format!("sub/.g{TMP_SUFFIX}.123.1")), b"orphan").unwrap();
+
+        let removed = sweep_orphan_temps(share).unwrap();
+        assert_eq!(removed, 2);
+        assert!(share.join("real.txt").exists());
+        assert!(!share.join(format!(".f{TMP_SUFFIX}.123.0")).exists());
+        assert!(!share.join(format!("sub/.g{TMP_SUFFIX}.123.1")).exists());
+    }
 
     #[tokio::test]
     async fn baseline_emits_writes_and_diff_emits_deletes() {

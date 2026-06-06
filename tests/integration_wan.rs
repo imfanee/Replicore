@@ -150,8 +150,9 @@ fn wait_for(what: &str, timeout: Duration, mut cond: impl FnMut() -> bool) {
     panic!("timed out after {timeout:?} waiting for: {what}");
 }
 
-/// path → blake3, for whole-tree comparison (skips nothing; staging temps
-/// must not exist at quiescence).
+/// path → blake3, for whole-tree comparison. Staging temps are excluded (a
+/// poll can race an in-flight apply); files that vanish between listing and
+/// reading are skipped — callers compare snapshots until they stabilize.
 fn tree(root: &str) -> std::collections::BTreeMap<String, String> {
     let mut out = std::collections::BTreeMap::new();
     let mut stack = vec![PathBuf::from(root)];
@@ -160,13 +161,15 @@ fn tree(root: &str) -> std::collections::BTreeMap<String, String> {
             let path = entry.expect("entry").path();
             if path.is_dir() {
                 stack.push(path);
-            } else {
+            } else if !path.to_string_lossy().contains(".replicore-tmp") {
                 let rel = path
                     .strip_prefix(root)
                     .expect("prefix")
                     .to_string_lossy()
                     .into_owned();
-                let data = std::fs::read(&path).expect("read file");
+                let Ok(data) = std::fs::read(&path) else {
+                    continue; // renamed/unlinked mid-walk
+                };
                 out.insert(rel, blake3::hash(&data).to_hex().to_string());
             }
         }
@@ -174,17 +177,34 @@ fn tree(root: &str) -> std::collections::BTreeMap<String, String> {
     out
 }
 
-fn oplog_rows(db: &str) -> i64 {
-    let conn =
-        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .expect("open db read-only");
-    conn.query_row("SELECT COUNT(*) FROM oplog", [], |r| r.get(0))
-        .expect("count oplog")
+/// Every staging temp currently under `root` (hygiene assertion input).
+fn temps(root: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![PathBuf::from(root)];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.to_string_lossy().contains(".replicore-tmp") {
+                out.push(path);
+            }
+        }
+    }
+    out
 }
 
-#[test]
-#[ignore = "needs root + netns; run: cargo build --release && sudo -E cargo test --test integration_wan -- --ignored --nocapture"]
-fn two_node_wan_end_to_end() {
+struct Bed {
+    _rig: Rig,
+    cfg_a: PathBuf,
+    cfg_b: PathBuf,
+    fp_a: String,
+    addr_a: String,
+}
+
+/// Tear down any stale rig, bring up a fresh one (netem per MODE), wipe state
+/// dirs, generate identities, and write both configs.
+fn setup() -> Bed {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         panic!("this test must run as root (sudo -E)");
@@ -194,9 +214,8 @@ fn two_node_wan_end_to_end() {
     let _ = sh(&["down"]); // stale rig from a previous failed run
     let up = sh(&["up"]);
     assert!(up.status.success(), "testbed up failed: {up:?}");
-    let _rig = Rig;
+    let rig = Rig;
 
-    // Fresh state every run.
     for d in [DIR_A, DIR_B, ETC, STATE] {
         let _ = std::fs::remove_dir_all(d);
         std::fs::create_dir_all(d).expect("mkdir");
@@ -224,6 +243,29 @@ fn two_node_wan_end_to_end() {
         "node-b",
         (NODE_A, &addr_a, &fp_a),
     );
+    Bed {
+        _rig: rig,
+        cfg_a,
+        cfg_b,
+        fp_a,
+        addr_a,
+    }
+}
+
+fn oplog_rows(db: &str) -> i64 {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open db read-only");
+    conn.query_row("SELECT COUNT(*) FROM oplog", [], |r| r.get(0))
+        .expect("count oplog")
+}
+
+#[test]
+#[ignore = "needs root + netns; run: cargo build --release && sudo -E cargo test --test integration_wan -- --ignored --nocapture"]
+fn two_node_wan_end_to_end() {
+    let bed = setup();
+    let (cfg_a, cfg_b) = (bed.cfg_a.clone(), bed.cfg_b.clone());
+    let (fp_a, addr_a) = (bed.fp_a.clone(), bed.addr_a.clone());
 
     let _a = Node::spawn("rc-a", &cfg_a, "node-a");
     let mut b = Node::spawn("rc-b", &cfg_b, "node-b");
@@ -324,4 +366,98 @@ fn two_node_wan_end_to_end() {
     );
 
     eprintln!("[test] all WAN exit criteria demonstrated");
+}
+
+/// Crash-during-apply stress: kill -9 the receiver WHILE it is materializing
+/// inbound ops, with the scanner running at a 1 s interval, ~20 times with the
+/// kill swept across the apply window (mid-push, mid-fetch, mid-stage/rename,
+/// post-commit-pre-ack). This is the regime where review finding #1 lived
+/// (scanner walk racing recovery applies → false deletes): if a regression
+/// reappears, files vanish from A or trees flap instead of converging.
+///
+/// Run SERIALLY (it owns the same rig as the other test):
+///   sudo -E cargo test --test integration_wan kill_during -- --ignored --nocapture
+#[test]
+#[ignore = "needs root + netns; run: cargo build --release && sudo -E cargo test --test integration_wan kill_during -- --ignored --nocapture"]
+fn kill_during_inbound_apply_loop() {
+    const ITERATIONS: usize = 20;
+    const FILES_PER_ITER: usize = 6;
+
+    let bed = setup();
+    let _a = Node::spawn("rc-a", &bed.cfg_a, "node-a");
+    let mut b = Node::spawn("rc-b", &bed.cfg_b, "node-b");
+
+    // Establish the link before the abuse starts.
+    std::fs::create_dir_all(format!("{DIR_A}/from-a")).expect("mkdir");
+    std::fs::write(format!("{DIR_A}/from-a/probe.txt"), b"probe").expect("write");
+    wait_for("initial replication", Duration::from_secs(60), || {
+        Path::new(&format!("{DIR_B}/from-a/probe.txt")).exists()
+    });
+
+    let mut expected = tree(DIR_A);
+    for i in 0..ITERATIONS {
+        // 64 KiB files: big enough that fetch+stage spans several shaped RTTs.
+        for j in 0..FILES_PER_ITER {
+            let body = vec![(i * 31 + j) as u8; 64 * 1024];
+            std::fs::write(format!("{DIR_A}/from-a/r{i:02}-{j}.bin"), &body).expect("write");
+        }
+        // Sweep the kill point across the receive pipeline (200ms..2.1s).
+        std::thread::sleep(Duration::from_millis(200 + (i as u64) * 100));
+        b.kill_dash_nine();
+        b = Node::spawn("rc-b", &bed.cfg_b, "node-b");
+
+        wait_for(
+            &format!("iteration {i} converges after kill -9"),
+            Duration::from_secs(90),
+            || {
+                let ta = tree(DIR_A);
+                !ta.is_empty() && ta == tree(DIR_B)
+            },
+        );
+
+        // Finding-#1 guard: nothing ever replicated may vanish or regress on
+        // A — a false delete minted by B's scanner racing its recovery
+        // applies would propagate here as a missing file.
+        let ta = tree(DIR_A);
+        for (path, hash) in &expected {
+            assert_eq!(
+                ta.get(path),
+                Some(hash),
+                "iteration {i}: {path} vanished or regressed on A (false delete propagated)"
+            );
+        }
+        expected = ta;
+    }
+
+    // Hygiene: no orphaned staging temps survive the kill loop (startup
+    // sweep) and none linger after quiescence (atomic apply cleanup).
+    std::thread::sleep(Duration::from_secs(3));
+    let (ta, tb) = (temps(DIR_A), temps(DIR_B));
+    assert!(
+        ta.is_empty() && tb.is_empty(),
+        "orphaned staging temps: A={ta:?} B={tb:?}"
+    );
+
+    // No storm: op counts stable across several scan cycles after the abuse.
+    let counts = (
+        oplog_rows(&format!("{STATE}/node-a.db")),
+        oplog_rows(&format!("{STATE}/node-b.db")),
+    );
+    std::thread::sleep(Duration::from_secs(8));
+    let counts_later = (
+        oplog_rows(&format!("{STATE}/node-a.db")),
+        oplog_rows(&format!("{STATE}/node-b.db")),
+    );
+    assert_eq!(
+        counts, counts_later,
+        "op counts kept growing after the kill loop"
+    );
+
+    // Exact final census: probe + every burst file, byte-identical trees.
+    let final_a = tree(DIR_A);
+    assert_eq!(final_a.len(), 1 + ITERATIONS * FILES_PER_ITER);
+    assert_eq!(final_a, tree(DIR_B));
+    eprintln!(
+        "[test] {ITERATIONS} kill -9 mid-apply iterations converged; no temps, no storm, no losses"
+    );
 }
