@@ -1,71 +1,78 @@
-//! main.rs — Replicore M0 spike entrypoint.
+//! main.rs — `replicored` entrypoint (anyhow boundary).
 //!
-//! Two modes prove the M0 exit criterion (a file written on the source appears,
-//! intact and atomically, on the sink over QUIC):
+//!   replicored gen-cert --out-dir DIR --name NAME
+//!       Generate a self-signed node identity (NAME.cert.pem / NAME.key.pem,
+//!       key mode 0600) and print the SHA-256 fingerprint to pin in peers'
+//!       config allowlists (FR-1002).
 //!
-//!   replicored sink   --listen 0.0.0.0:7000 --dir /srv/replicore/in
-//!   replicored source --peer 10.0.0.2:7000  --dir /srv/replicore/out
+//!   replicored run --config FILE
+//!       Run the replication daemon. Lands with the daemon wiring commit.
 //!
-//! This is one-directional by design for M0. Phase 1 makes it bidirectional with
-//! the op-log, version vectors, and apply-suppression (FR-201/301/902).
+//! The M0 spike's one-way `sink`/`source` modes are gone along with the
+//! SPIKE-ONLY accept-anything certificate verifier they depended on.
 
 use anyhow::{bail, Context, Result};
-use replicore::{net, watch};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let mode = args.next().unwrap_or_default();
-
-    // Tiny hand-rolled flag parser (no clap dependency for the spike).
-    let mut listen: Option<SocketAddr> = None;
-    let mut peer: Option<SocketAddr> = None;
-    let mut dir: Option<PathBuf> = None;
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--listen" => listen = Some(parse_addr(args.next())?),
-            "--peer" => peer = Some(parse_addr(args.next())?),
-            "--dir" => dir = Some(PathBuf::from(args.next().context("--dir needs a value")?)),
-            other => bail!("unknown argument: {other}"),
+    match args.next().as_deref() {
+        Some("gen-cert") => gen_cert(args),
+        Some("run") => {
+            bail!("`run` is not wired yet — the daemon assembly lands in the next commits")
         }
-    }
-
-    match mode.as_str() {
-        "sink" => {
-            let listen = listen.context("sink needs --listen HOST:PORT")?;
-            let dir = dir.context("sink needs --dir PATH")?;
-            std::fs::create_dir_all(&dir).ok();
-            net::run_sink(listen, dir).await
-        }
-        "source" => {
-            let peer = peer.context("source needs --peer HOST:PORT")?;
-            let dir = dir.context("source needs --dir PATH")?;
-            let dir = dir.canonicalize().context("--dir must exist for source")?;
-
-            // Watcher (blocking, fanotify) -> bounded channel -> async sender.
-            let (tx, rx) = tokio::sync::mpsc::channel::<PathBuf>(1024);
-            let watch_dir = dir.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = watch::run(&watch_dir, tx) {
-                    eprintln!("[watch] fatal: {e:#}");
-                    std::process::exit(1);
-                }
-            });
-
-            net::run_source(peer, dir, rx).await
-        }
-        "" => {
-            eprintln!("usage:\n  replicored sink   --listen HOST:PORT --dir PATH\n  replicored source --peer HOST:PORT --dir PATH");
+        _ => {
+            eprintln!(
+                "usage:\n  replicored gen-cert --out-dir DIR --name NAME\n  replicored run --config FILE"
+            );
             Ok(())
         }
-        other => bail!("unknown mode '{other}' (expected 'sink' or 'source')"),
     }
 }
 
-fn parse_addr(v: Option<String>) -> Result<SocketAddr> {
-    v.context("expected HOST:PORT")?
-        .parse()
-        .context("invalid HOST:PORT")
+fn gen_cert(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let mut out_dir: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--out-dir" => {
+                out_dir = Some(PathBuf::from(
+                    args.next().context("--out-dir needs a value")?,
+                ))
+            }
+            "--name" => name = Some(args.next().context("--name needs a value")?),
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+    let out_dir = out_dir.context("gen-cert needs --out-dir DIR")?;
+    let name = name.context("gen-cert needs --name NAME")?;
+    std::fs::create_dir_all(&out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+
+    let ident = replicore::net::generate_identity().context("generate identity")?;
+    let cert_path = out_dir.join(format!("{name}.cert.pem"));
+    let key_path = out_dir.join(format!("{name}.key.pem"));
+    std::fs::write(&cert_path, &ident.cert_pem)
+        .with_context(|| format!("write {}", cert_path.display()))?;
+    write_private(&key_path, ident.key_pem.as_bytes())
+        .with_context(|| format!("write {}", key_path.display()))?;
+
+    println!("cert:        {}", cert_path.display());
+    println!("key:         {} (mode 0600)", key_path.display());
+    println!("fingerprint: {}", hex::encode(ident.fingerprint));
+    println!();
+    println!("Pin this fingerprint in each peer's [[peers]] entry.");
+    Ok(())
+}
+
+/// Write the key with owner-only permissions from the start (no chmod window).
+fn write_private(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(contents)
 }

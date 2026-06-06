@@ -166,20 +166,6 @@ where
     opts().deserialize(&body).map_err(ProtoError::Decode)
 }
 
-// ---------------------------------------------------------------------------
-// M0 leftover, used only by the spike net.rs; deleted with the net rewrite.
-// ---------------------------------------------------------------------------
-
-/// One file, whole, with just enough metadata for an atomic, verified apply.
-/// SPIKE-ONLY: replaced by `OpRecord` + fetch streams.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct FileMsg {
-    pub rel_path: String,
-    pub mode: u32,
-    pub hash: [u8; 32],
-    pub data: Vec<u8>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
