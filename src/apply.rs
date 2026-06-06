@@ -24,7 +24,11 @@ pub fn apply(root: &Path, msg: &FileMsg) -> Result<()> {
 
     // Resolve destination, refusing path escapes.
     let rel = Path::new(&msg.rel_path);
-    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         bail!("unsafe relative path: {}", msg.rel_path);
     }
     let dest = root.join(rel);
@@ -42,7 +46,8 @@ pub fn apply(root: &Path, msg: &FileMsg) -> Result<()> {
     ));
 
     {
-        let mut f = std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(&msg.data).context("write staged data")?;
         f.flush().ok();
         f.sync_all().context("fsync staged file")?; // durability before rename

@@ -70,7 +70,8 @@ pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<PathBuf>) -> Result<()> {
         let meta_sz = size_of::<libc::fanotify_event_metadata>() as isize;
         while (n as isize) - off >= meta_sz {
             // SAFETY: we just bounds-checked that a full metadata struct fits.
-            let meta = unsafe { &*(buf.as_ptr().offset(off) as *const libc::fanotify_event_metadata) };
+            let meta =
+                unsafe { &*(buf.as_ptr().offset(off) as *const libc::fanotify_event_metadata) };
             let ev_len = meta.event_len as isize;
             if ev_len < meta_sz {
                 break; // malformed / truncated; avoid an infinite loop

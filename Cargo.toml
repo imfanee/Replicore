@@ -16,11 +16,11 @@ rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rcgen = "0.11"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
-blake3 = "=1.5.5"
+blake3 = "1"
 anyhow = "1"
-# Pin transitive deps to versions that build on the apt toolchain (Rust 1.75,
-# no edition2024). Remove these once on a newer toolchain.
-time = "=0.3.36"
+
+[dev-dependencies]
+proptest = "1"
 
 [profile.release]
 opt-level = 2
