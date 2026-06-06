@@ -5,6 +5,7 @@
 //! integration tests can drive it directly.
 
 pub mod apply;
+pub mod chunk;
 pub mod config;
 pub mod decide;
 pub mod ingest;
