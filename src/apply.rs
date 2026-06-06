@@ -35,6 +35,8 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+    #[error("chunk store: {0}")]
+    Cas(#[from] crate::chunk::CasError),
 }
 
 fn io_err<'p>(ctx: &'static str, path: &'p Path) -> impl FnOnce(std::io::Error) -> ApplyError + 'p {
@@ -107,19 +109,7 @@ pub fn apply_write(
 
         // Verify what actually landed on disk (FR-803: stage → fsync →
         // verify → rename). Catches torn writes the in-memory check cannot.
-        let mut staged = std::fs::File::open(&tmp).map_err(io_err("reopen", &tmp))?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = staged.read(&mut buf).map_err(io_err("readback", &tmp))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        if hasher.finalize().as_bytes() != hash {
-            return Err(ApplyError::HashMismatch(rel.to_string()));
-        }
+        verify_on_disk(&tmp, hash, rel)?;
 
         // Atomic publish, then persist the rename itself.
         std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
@@ -133,6 +123,97 @@ pub fn apply_write(
         // Never leave a staged temp behind on failure.
         let _ = std::fs::remove_file(&tmp);
     })
+}
+
+/// Atomically publish a file assembled from CAS chunks at `root/rel`
+/// (FR-803 extended to the chunked data plane). Stages a temp in the
+/// destination directory, streams each (re-verified) chunk into it while
+/// accumulating the whole-file BLAKE3, fsyncs, REQUIRES the streamed hash to
+/// equal `whole_hash` before the rename, then re-reads the staged file as an
+/// independent torn-write check — exactly M1's discipline, minus the
+/// in-memory `data` buffer (files can exceed RAM). Suppression is registered
+/// before the first mutation; failures clean up the temp. Blocking — call in
+/// spawn_blocking.
+pub fn apply_assembled(
+    root: &Path,
+    rel: &str,
+    mode: u32,
+    whole_hash: &[u8; 32],
+    manifest: &crate::chunk::Manifest,
+    cas: &crate::chunk::Cas,
+    suppress: &Suppressor,
+) -> Result<(), ApplyError> {
+    // Structure sanity before any fs work: the manifest must claim to
+    // reconstruct exactly the content the op promised.
+    if &manifest.content_hash != whole_hash {
+        return Err(ApplyError::HashMismatch(rel.to_string()));
+    }
+
+    let dest = safe_dest(root, rel)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| ApplyError::UnsafePath(rel.to_string()))?;
+    std::fs::create_dir_all(parent).map_err(io_err("mkdir", parent))?;
+
+    // Before the first mutation (FR-902), as with apply_write.
+    suppress.register_write(rel, *whole_hash);
+
+    let stage_seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}{}.{}.{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("f"),
+        TMP_SUFFIX,
+        std::process::id(),
+        stage_seq
+    ));
+
+    let stage = || -> Result<(), ApplyError> {
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(io_err("create", &tmp))?;
+            // Streams chunks (each re-verified by Cas::read) and returns the
+            // whole-file hash of what was actually written.
+            let written = crate::chunk::assemble_from_cas(manifest, cas, &mut f)?;
+            // THE whole-file verify, before anything is published (reviewer
+            // gate: assembled files verified whole-file before the rename).
+            if &written != whole_hash {
+                return Err(ApplyError::HashMismatch(rel.to_string()));
+            }
+            f.sync_all().map_err(io_err("fsync", &tmp))?;
+            let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+            f.set_permissions(perms).map_err(io_err("chmod", &tmp))?;
+        }
+
+        // Independent readback (torn-write check), as in apply_write.
+        verify_on_disk(&tmp, whole_hash, rel)?;
+
+        std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+        Ok(())
+    };
+
+    stage().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Re-read a staged file and require its BLAKE3 to equal `hash`.
+fn verify_on_disk(path: &Path, hash: &[u8; 32], rel: &str) -> Result<(), ApplyError> {
+    let mut staged = std::fs::File::open(path).map_err(io_err("reopen", path))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = staged.read(&mut buf).map_err(io_err("readback", path))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    if hasher.finalize().as_bytes() != hash {
+        return Err(ApplyError::HashMismatch(rel.to_string()));
+    }
+    Ok(())
 }
 
 /// Unlink `root/rel` for a remote delete (tombstone). A missing file is
@@ -215,6 +296,110 @@ mod tests {
         assert!(matches!(err, ApplyError::HashMismatch(_)));
         assert!(!dir.path().join("f").exists());
         assert!(s.is_empty()); // verified before registration
+    }
+
+    /// Build a CAS + manifest for `data` split into fixed test chunks.
+    fn cas_with(
+        data: &[u8],
+        chunk_size: usize,
+    ) -> (tempfile::TempDir, crate::chunk::Cas, crate::chunk::Manifest) {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = crate::chunk::Cas::open(&dir.path().join("cas")).unwrap();
+        let mut chunks = Vec::new();
+        for piece in data.chunks(chunk_size.max(1)) {
+            let h = *blake3::hash(piece).as_bytes();
+            cas.put_verified(&h, piece).unwrap();
+            chunks.push(crate::proto::ChunkEntry {
+                hash: h,
+                len: piece.len() as u32,
+            });
+        }
+        let manifest = crate::chunk::Manifest {
+            content_hash: *blake3::hash(data).as_bytes(),
+            chunks,
+        };
+        (dir, cas, manifest)
+    }
+
+    #[test]
+    fn assembled_publish_round_trips_with_mode() {
+        let data: Vec<u8> = (0u32..40_000).map(|i| (i % 251) as u8).collect();
+        let (dir, cas, manifest) = cas_with(&data, 7000);
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let s = Suppressor::new();
+
+        apply_assembled(
+            &share,
+            "a/big.bin",
+            0o640,
+            &manifest.content_hash,
+            &manifest,
+            &cas,
+            &s,
+        )
+        .unwrap();
+        let dest = share.join("a/big.bin");
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert!(s.check_write("a/big.bin", &manifest.content_hash));
+        // Idempotent re-assembly (the crash-redelivery path).
+        apply_assembled(
+            &share,
+            "a/big.bin",
+            0o640,
+            &manifest.content_hash,
+            &manifest,
+            &cas,
+            &s,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), data);
+    }
+
+    #[test]
+    fn assembled_whole_file_mismatch_publishes_nothing() {
+        let data = b"some data".to_vec();
+        let (dir, cas, mut manifest) = cas_with(&data, 4);
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let s = Suppressor::new();
+
+        // Manifest lies about the whole-file hash: rejected BEFORE any fs work.
+        manifest.content_hash = [0xee; 32];
+        let err =
+            apply_assembled(&share, "f", 0o644, &[0xee; 32], &manifest, &cas, &s).unwrap_err();
+        assert!(matches!(err, ApplyError::HashMismatch(_)));
+        assert!(!share.join("f").exists());
+        assert!(!walk_has_tmp(&share));
+    }
+
+    #[test]
+    fn assembled_missing_chunk_cleans_up_temp() {
+        let data: Vec<u8> = vec![7; 10_000];
+        let (dir, cas, manifest) = cas_with(&data, 3000);
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let s = Suppressor::new();
+
+        // Lose a chunk from the CAS (simulates an interrupted fetch).
+        std::fs::remove_file(cas.path_for(&manifest.chunks[1].hash)).unwrap();
+        let err = apply_assembled(
+            &share,
+            "g",
+            0o644,
+            &manifest.content_hash,
+            &manifest,
+            &cas,
+            &s,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApplyError::Cas(_)), "{err:?}");
+        assert!(!share.join("g").exists());
+        assert!(!walk_has_tmp(&share)); // staged temp removed on failure
     }
 
     #[test]

@@ -112,6 +112,111 @@ async fn crash_between_rename_and_commit_recovers_exactly_once() {
     assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 1);
 }
 
+/// M2 chunked-plane variant of the rename-vs-commit window: all chunks landed
+/// in the CAS and the file was assembled+renamed, but the store commit never
+/// happened. Redelivery must re-assemble purely from the CAS (zero refetched
+/// chunks — FR-404) and converge to exactly-once.
+#[tokio::test]
+async fn crash_between_assemble_and_commit_resumes_from_cas() {
+    use replicore::apply::apply_assembled;
+    use replicore::chunk::{Cas, Manifest};
+    use replicore::proto::ChunkEntry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let share = dir.path().join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let db = dir.path().join("state.db");
+    let cas = Cas::open(&dir.path().join("cas")).unwrap();
+
+    // A 3-chunk file, chunks already fetched+verified into the CAS.
+    let data: Vec<u8> = (0u32..30_000).map(|i| (i % 241) as u8).collect();
+    let mut chunks = Vec::new();
+    for piece in data.chunks(10_000) {
+        let h = *blake3::hash(piece).as_bytes();
+        cas.put_verified(&h, piece).unwrap();
+        chunks.push(ChunkEntry {
+            hash: h,
+            len: piece.len() as u32,
+        });
+    }
+    let manifest = Manifest {
+        content_hash: *blake3::hash(&data).as_bytes(),
+        chunks,
+    };
+    let op = OpRecord {
+        op_id: op_id(&NODE_B, 1),
+        origin: NODE_B,
+        origin_seq: 1,
+        op_type: OpType::Write,
+        path: "b/chunked.bin".into(),
+        mode: 0o644,
+        size: data.len() as u64,
+        content_hash: Some(manifest.content_hash),
+        vv: [(NODE_B, 1u64)].into_iter().collect(),
+    };
+
+    // First delivery: manifest durable, chunks in CAS, file assembled and
+    // RENAMED... and the process dies before apply_remote's COMMIT.
+    {
+        let store = Store::open(&db, NODE_A).unwrap();
+        store.put_manifest(manifest.clone()).await.unwrap();
+        let suppress = Suppressor::new();
+        apply_assembled(
+            &share,
+            &op.path,
+            op.mode,
+            &manifest.content_hash,
+            &manifest,
+            &cas,
+            &suppress,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(share.join("b/chunked.bin")).unwrap(), data);
+        drop(store); // kill -9 here
+    }
+
+    // Restart: op un-acked, store knows nothing about it — but the manifest
+    // row and every chunk survived (their inserts are atomic).
+    let store = Store::open(&db, NODE_A).unwrap();
+    assert!(!store.has_applied(op.op_id).await.unwrap());
+    let recovered = store
+        .manifest_for(manifest.content_hash)
+        .await
+        .unwrap()
+        .expect("manifest survived the crash");
+    assert_eq!(recovered, manifest);
+    for c in &manifest.chunks {
+        assert!(cas.has(&c.hash), "chunk lost across the crash");
+    }
+
+    // Redelivery: decide=Apply, every chunk already present (the resume
+    // question is a stat), re-assemble idempotently, then THE commit.
+    let local = store.load_file(&op.path).await.unwrap();
+    assert_eq!(decide(local.as_ref(), &op.vv), Decision::Apply);
+    let suppress = Suppressor::new();
+    apply_assembled(
+        &share,
+        &op.path,
+        op.mode,
+        &manifest.content_hash,
+        &recovered,
+        &cas,
+        &suppress,
+    )
+    .unwrap();
+    store
+        .apply_remote(op.clone(), Decision::Apply)
+        .await
+        .unwrap();
+
+    // Exactly-once end state.
+    assert_eq!(std::fs::read(share.join("b/chunked.bin")).unwrap(), data);
+    assert_eq!(store.op_count().await.unwrap(), 1);
+    let local = store.load_file(&op.path).await.unwrap().unwrap();
+    assert_eq!(local.vv.get(&NODE_B), 1);
+    assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn crash_between_unlink_and_commit_recovers_tombstone() {
     let dir = tempfile::tempdir().unwrap();
