@@ -8,7 +8,9 @@ pub mod apply;
 pub mod config;
 pub mod decide;
 pub mod net;
+pub mod oplog;
 pub mod proto;
+pub mod state;
 pub mod vv;
 pub mod watch;
 
