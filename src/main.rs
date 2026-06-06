@@ -139,7 +139,7 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         peers = cfg.peers.len(),
         "replicored starting"
     );
-    Engine::new(cfg, store, suppress)
+    Engine::new(cfg, store, suppress, cas)
         .run()
         .await
         .context("transport engine")

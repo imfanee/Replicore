@@ -2,8 +2,9 @@
 //!
 //! Control stream: length-prefixed (`u32` big-endian) bincode frames, one
 //! long-lived bidirectional stream per connection carrying op-log records and
-//! acks. File bytes never ride the control stream — they go over ephemeral
-//! per-file bi-streams (`FetchReq` → `FetchResp` header → raw verified bytes).
+//! acks. Bulk bytes never ride the control stream — chunks, manifests, and
+//! reconcile sessions use ephemeral tagged bi-streams (header frames + raw
+//! verified chunk bytes).
 //!
 //! Hostile-input rules (CLAUDE.md invariant 5): every frame length is checked
 //! against a hard cap before allocation, decode failures are errors (never
@@ -205,21 +206,6 @@ pub enum ReconcileFrame {
     Done,
 }
 
-// -- M1 leftovers, deleted with the chunked receive-path swap ----------------
-
-/// SPIKE/M1-ONLY whole-file fetch; superseded by ChunkReq/ManifestReq.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct FetchReq {
-    pub hash: [u8; 32],
-}
-
-/// SPIKE/M1-ONLY.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
-pub struct FetchResp {
-    pub found: bool,
-    pub size: u64,
-}
-
 #[derive(thiserror::Error, Debug)]
 pub enum ProtoError {
     #[error("i/o: {0}")]
@@ -329,10 +315,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_round_trip() {
         let (mut a, mut b) = tokio::io::duplex(4096);
-        write_msg(&mut a, &FetchReq { hash: [3u8; 32] })
+        write_msg(&mut a, &ChunkReq { hash: [3u8; 32] })
             .await
             .unwrap();
-        let got: FetchReq = read_msg(&mut b).await.unwrap();
+        let got: ChunkReq = read_msg(&mut b).await.unwrap();
         assert_eq!(got.hash, [3u8; 32]);
     }
 

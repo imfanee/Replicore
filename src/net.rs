@@ -40,14 +40,16 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::apply::{apply_delete, apply_write, ApplyError};
+use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::chunk::Cas;
 use crate::config::{Config, Peer};
 use crate::decide::{decide, Decision};
+use crate::fetch::FetchError;
 use crate::oplog::{Store, StoreError};
 use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
-    read_msg, write_msg, FetchReq, FetchResp, Frame, OpRecord, OpType, ProtoError, ALPN,
-    PROTO_VERSION,
+    read_msg, write_msg, ChunkReq, ChunkResp, Frame, ManifestReq, ManifestResp, OpRecord, OpType,
+    ProtoError, ALPN, MANIFEST_PAGE, PROTO_VERSION, STREAM_TAG_CHUNK, STREAM_TAG_MANIFEST,
 };
 use crate::suppress::Suppressor;
 use crate::vv::NodeId;
@@ -95,6 +97,8 @@ pub enum NetError {
     ContentUnavailable,
     #[error("file size exceeds max_file_bytes")]
     TooBig,
+    #[error("fetch: {0}")]
+    Fetch(#[from] FetchError),
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +298,8 @@ pub struct Engine {
     cfg: Arc<Config>,
     store: Store,
     suppress: Suppressor,
+    /// The content-addressed chunk store (serves and receives chunks).
+    cas: Cas,
     /// Live connections (inbound AND outbound) for multi-source fetch.
     conns: ConnRegistry,
     /// Liveness/anti-entropy status for /healthz.
@@ -301,11 +307,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(cfg: Config, store: Store, suppress: Suppressor) -> Arc<Engine> {
+    pub fn new(cfg: Config, store: Store, suppress: Suppressor, cas: Cas) -> Arc<Engine> {
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
             suppress,
+            cas,
             conns: ConnRegistry::new(),
             peers_reg: PeerRegistry::new(),
         })
@@ -450,7 +457,7 @@ impl Engine {
 
         let push = self.push_ops(ctl_send, resume_from, sent_frontier.clone());
         let acks = self.absorb_acks(ctl_recv, peer.node_id, sent_frontier);
-        let fetches = self.serve_fetches(conn.clone());
+        let fetches = self.serve_streams(conn.clone());
         tokio::select! {
             r = push => r,
             r = acks => r,
@@ -523,66 +530,117 @@ impl Engine {
         }
     }
 
-    /// Serve ephemeral bi-stream content fetches on an inbound connection.
-    async fn serve_fetches(self: &Arc<Engine>, conn: quinn::Connection) -> Result<(), NetError> {
+    /// Serve ephemeral bi-streams (chunk / manifest / reconcile) on a
+    /// connection. The per-connection semaphore is the FR-1106 fix for M1's
+    /// unbounded spawn-per-stream: a peer hammering us with streams waits for
+    /// a slot instead of growing our task count without limit.
+    async fn serve_streams(self: &Arc<Engine>, conn: quinn::Connection) -> Result<(), NetError> {
+        let slots = Arc::new(tokio::sync::Semaphore::new(
+            self.cfg.serve_concurrency.max(1),
+        ));
         loop {
             let (send, recv) = conn.accept_bi().await?;
+            let permit = match slots.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return Ok(()), // semaphore closed: shutting down
+            };
             let engine = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = engine.serve_one_fetch(send, recv).await {
-                    tracing::debug!(error = %e, "fetch stream ended");
+                let _permit = permit; // held for the stream's lifetime
+                if let Err(e) = engine.serve_one_stream(send, recv).await {
+                    tracing::debug!(error = %e, "serve stream ended");
                 }
             });
         }
     }
 
-    async fn serve_one_fetch(
+    /// Dispatch one ephemeral stream by its leading tag byte.
+    async fn serve_one_stream(
+        &self,
+        send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) -> Result<(), NetError> {
+        let mut tag = [0u8; 1];
+        recv.read_exact(&mut tag).await?;
+        match tag[0] {
+            STREAM_TAG_CHUNK => self.serve_chunk(send, recv).await,
+            STREAM_TAG_MANIFEST => self.serve_manifest(send, recv).await,
+            // SEAM: STREAM_TAG_RECONCILE lands with the anti-entropy commit.
+            _ => Err(NetError::Violation("unknown stream tag")),
+        }
+    }
+
+    /// Stream one chunk out of the CAS in bounded copies (never a whole-chunk
+    /// buffer — serving memory is O(copy buffer) per stream, FR-1106). The
+    /// RECEIVER verifies; CAS files are immutable and were verified at insert.
+    async fn serve_chunk(
         &self,
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) -> Result<(), NetError> {
-        let req: FetchReq = read_msg(&mut recv).await?;
-        // Resolve hash -> live path -> bytes, re-verifying the hash: the file
-        // may have changed since it was indexed. Never serve unverified bytes.
-        let data = match self.store.path_for_hash(req.hash).await? {
-            Some(rel) => {
-                let abs = self.cfg.share_dir.join(&rel);
-                match tokio::fs::read(&abs).await {
-                    Ok(data)
-                        if data.len() as u64 <= self.cfg.max_file_bytes
-                            && *blake3::hash(&data).as_bytes() == req.hash =>
-                    {
-                        Some(data)
-                    }
-                    Ok(_) => None,  // changed underfoot or oversized
-                    Err(_) => None, // raced a delete
-                }
-            }
-            None => None,
+        let req: ChunkReq = read_msg(&mut recv).await?;
+        let opened = {
+            let cas = self.cas.clone();
+            tokio::task::spawn_blocking(move || cas.open_reader(&req.hash)).await?
         };
-        match data {
-            Some(data) => {
+        match opened {
+            Ok((file, len)) if len <= self.cfg.chunk_max_bytes as u64 => {
                 write_msg(
                     &mut send,
-                    &FetchResp {
+                    &ChunkResp {
                         found: true,
-                        size: data.len() as u64,
+                        len: len as u32,
                     },
                 )
                 .await?;
-                send.write_all(&data).await?;
+                let mut reader = tokio::fs::File::from_std(file);
+                tokio::io::copy(&mut reader, &mut send)
+                    .await
+                    .map_err(NetError::Io)?;
             }
-            None => {
+            _ => {
+                // Absent (or absurd on disk): the fetcher tries another peer.
                 write_msg(
                     &mut send,
-                    &FetchResp {
+                    &ChunkResp {
                         found: false,
-                        size: 0,
+                        len: 0,
                     },
                 )
                 .await?;
             }
         }
+        let _ = send.finish();
+        Ok(())
+    }
+
+    /// Serve one page of a manifest from the db (structure truth).
+    async fn serve_manifest(
+        &self,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) -> Result<(), NetError> {
+        let req: ManifestReq = read_msg(&mut recv).await?;
+        let resp = match self.store.manifest_for(req.content_hash).await? {
+            Some(m) => {
+                let total = m.chunks.len() as u32;
+                let start = (req.offset as usize).min(m.chunks.len());
+                let count = (req.count.min(MANIFEST_PAGE) as usize).min(m.chunks.len() - start);
+                ManifestResp {
+                    found: true,
+                    content_hash: req.content_hash,
+                    total,
+                    chunks: m.chunks[start..start + count].to_vec(),
+                }
+            }
+            None => ManifestResp {
+                found: false,
+                content_hash: req.content_hash,
+                total: 0,
+                chunks: Vec::new(),
+            },
+        };
+        write_msg(&mut send, &resp).await?;
         let _ = send.finish();
         Ok(())
     }
@@ -758,10 +816,12 @@ impl Engine {
         Ok(())
     }
 
-    /// Execute the filesystem side of a `Decision::Apply`.
+    /// Execute the filesystem side of a `Decision::Apply` over the chunked
+    /// data plane: manifest (db → origin → any peer) → missing-chunk fetch
+    /// into the CAS (parallel, resumable) → streamed atomic assembly.
     async fn materialize(
         &self,
-        conn: &quinn::Connection,
+        _conn: &quinn::Connection,
         op: &OpRecord,
         local: Option<&crate::decide::LocalFile>,
     ) -> Result<(), NetError> {
@@ -777,14 +837,33 @@ impl Engine {
                     if op.size > self.cfg.max_file_bytes {
                         return Err(NetError::TooBig);
                     }
-                    let data = fetch_bytes(conn, hash, self.cfg.max_file_bytes).await?;
+                    let limits = self.fetch_limits();
+                    // Multi-source: candidates come from the shared registry,
+                    // origin first — not just this subscription's connection.
+                    let manifest = crate::fetch::obtain_manifest(
+                        hash,
+                        &self.store,
+                        &self.conns,
+                        op.origin,
+                        &limits,
+                    )
+                    .await?;
+                    crate::fetch::fetch_file_chunks(
+                        &manifest,
+                        &self.cas,
+                        &self.conns,
+                        op.origin,
+                        &limits,
+                    )
+                    .await?;
                     let share = self.cfg.share_dir.clone();
                     let rel = op.path.clone();
                     let mode = op.mode;
                     let suppress = self.suppress.clone();
+                    let cas = self.cas.clone();
                     // fsync-heavy: keep it off the async runtime.
                     tokio::task::spawn_blocking(move || {
-                        apply_write(&share, &rel, mode, &hash, &data, &suppress)
+                        apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
                     })
                     .await??;
                 }
@@ -798,6 +877,14 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    fn fetch_limits(&self) -> crate::fetch::FetchLimits {
+        crate::fetch::FetchLimits {
+            per_file_chunk_concurrency: self.cfg.per_file_chunk_concurrency,
+            max_chunk_bytes: self.cfg.chunk_max_bytes,
+            max_file_bytes: self.cfg.max_file_bytes,
+        }
     }
 
     // -- helpers ------------------------------------------------------------
@@ -829,47 +916,29 @@ fn is_permanent(e: &NetError) -> bool {
         // Malformed/hostile op fields, or bytes that can never verify.
         NetError::Violation(_) => true,
         // The origin no longer holds this content — a superseding op for the
-        // path is behind it in the stream (or M2 anti-entropy repairs).
+        // path is behind it in the stream (or anti-entropy repairs).
         NetError::ContentUnavailable => true,
         // Exceeds OUR configured cap; redelivery cannot shrink it.
         NetError::TooBig => true,
         // Path escapes are rejected per CLAUDE.md invariant 5, permanently.
         NetError::Apply(ApplyError::UnsafePath(_)) => true,
+        // The chunks individually verified but their composition does not
+        // hash to the op's content: the manifest lied. Retrying re-fetches
+        // the same manifest.
+        NetError::Apply(ApplyError::HashMismatch(_)) => true,
+        // Fetch layer's own classification (unavailable-everywhere / hostile
+        // manifest are permanent; flaked peers are not).
+        NetError::Fetch(f) => f.is_permanent(),
         // Everything else (I/O, store, stream, join) is worth a retry.
         _ => false,
     }
-}
-
-/// Fetch `hash`'s bytes over an ephemeral bi-stream, verified before return.
-async fn fetch_bytes(
-    conn: &quinn::Connection,
-    hash: [u8; 32],
-    max_bytes: u64,
-) -> Result<Vec<u8>, NetError> {
-    let (mut send, mut recv) = conn.open_bi().await?;
-    write_msg(&mut send, &FetchReq { hash }).await?;
-    let _ = send.finish();
-    let resp: FetchResp = read_msg(&mut recv).await?;
-    if !resp.found {
-        return Err(NetError::ContentUnavailable);
-    }
-    if resp.size > max_bytes {
-        return Err(NetError::TooBig);
-    }
-    let mut data = vec![0u8; resp.size as usize];
-    recv.read_exact(&mut data).await?;
-    // Verify BEFORE the bytes are used anywhere (FR-403 spirit; apply_write
-    // re-verifies what lands on disk).
-    if *blake3::hash(&data).as_bytes() != hash {
-        return Err(NetError::Violation("fetched bytes do not match hash"));
-    }
-    Ok(data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::oplog::LocalChange;
     use std::net::SocketAddr;
 
     fn test_config(
@@ -921,7 +990,36 @@ mod tests {
     ) -> Arc<Engine> {
         let cfg = test_config(node_id, "127.0.0.1:0".parse().unwrap(), dir, ident, peers);
         let store = Store::open(Path::new(":memory:"), node_id).unwrap();
-        Engine::new(cfg, store, Suppressor::new())
+        let cas = Cas::open(&cfg.cas_dir.join(hex::encode(&node_id[..2]))).unwrap();
+        Engine::new(cfg, store, Suppressor::new(), cas)
+    }
+
+    /// Append a local write WITH its chunks in the engine's CAS and the
+    /// manifest in its store — what ingest does in production, so the chunked
+    /// fetch path can serve it.
+    async fn append_served(engine: &Arc<Engine>, rel: &str, data: &[u8]) -> OpRecord {
+        let hash = *blake3::hash(data).as_bytes();
+        engine.cas.put_verified(&hash, data).unwrap();
+        let manifest = crate::chunk::Manifest {
+            content_hash: hash,
+            chunks: vec![crate::proto::ChunkEntry {
+                hash,
+                len: data.len() as u32,
+            }],
+        };
+        engine
+            .store
+            .append_local(LocalChange {
+                path: rel.into(),
+                op_type: OpType::Write,
+                mode: 0o644,
+                size: data.len() as u64,
+                content_hash: Some(hash),
+                manifest: Some(manifest),
+            })
+            .await
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
@@ -1043,37 +1141,13 @@ mod tests {
             }
         });
 
-        // Op 1 is poison: the path escapes the share AND its content is not
-        // fetchable. Op 2 is a normal write queued right behind it — the
-        // liveness property under test is that op 2 still arrives.
-        use crate::oplog::LocalChange;
-        engine_a
-            .store
-            .append_local(LocalChange {
-                path: "../evil".into(),
-                op_type: OpType::Write,
-                mode: 0o644,
-                size: 6,
-                content_hash: Some(*blake3::hash(b"poison").as_bytes()),
-                manifest: None,
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        // Op 1 is poison: the path escapes the share — its chunks are served
+        // fine, but apply_assembled rejects the path (UnsafePath, permanent).
+        // Op 2 is a normal write queued right behind it — the liveness
+        // property under test is that op 2 still arrives.
+        append_served(&engine_a, "../evil", b"poison").await;
         std::fs::write(dir_a.path().join("good.txt"), b"fine").unwrap();
-        engine_a
-            .store
-            .append_local(LocalChange {
-                path: "good.txt".into(),
-                op_type: OpType::Write,
-                mode: 0o644,
-                size: 4,
-                content_hash: Some(*blake3::hash(b"fine").as_bytes()),
-                manifest: None,
-            })
-            .await
-            .unwrap()
-            .unwrap();
+        append_served(&engine_a, "good.txt", b"fine").await;
 
         // B subscribes for real.
         let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
@@ -1130,6 +1204,81 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(acked, "legitimate acks did not advance last_acked_seq");
+    }
+
+    #[tokio::test]
+    async fn fetch_survives_dead_peer_and_classifies_unavailable() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_b = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const B: NodeId = [0xb; 16];
+        const GHOST: NodeId = [0xd; 16]; // "origin" whose connection is dead
+
+        // A serves chunk/manifest streams (no subscription needed).
+        let engine_a = engine_on(
+            dir_a.path(),
+            A,
+            &id_a,
+            vec![(B, "127.0.0.1:1".parse().unwrap(), id_b.fingerprint)],
+        );
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+        tokio::spawn({
+            let ep = ep_a.clone();
+            let engine = engine_a.clone();
+            async move {
+                while let Some(incoming) = ep.accept().await {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        if let Ok(conn) = incoming.await {
+                            let _ = engine.serve_streams(conn).await;
+                        }
+                    });
+                }
+            }
+        });
+
+        // Content lives on A.
+        let data = b"multi-source chunk";
+        let op = append_served(&engine_a, "x.bin", data).await;
+        let hash = op.content_hash.unwrap();
+
+        // B holds TWO registry entries: a dead connection (the "origin",
+        // vanished mid-fetch) and the live one to A.
+        let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_b = engine_b.build_endpoint().unwrap();
+        let live = ep_b.connect(addr_a, "replicore").unwrap().await.unwrap();
+        let dead = ep_b.connect(addr_a, "replicore").unwrap().await.unwrap();
+        dead.close(0u32.into(), b"gone");
+        engine_b.conns.insert(GHOST, dead);
+        engine_b.conns.insert(A, live);
+
+        // Origin-first ordering hits the dead conn first; the fetch must
+        // fall through to A and land the chunk in B's CAS (FR-403).
+        let limits = engine_b.fetch_limits();
+        let manifest =
+            crate::fetch::obtain_manifest(hash, &engine_b.store, &engine_b.conns, GHOST, &limits)
+                .await
+                .expect("manifest via the surviving peer");
+        crate::fetch::fetch_file_chunks(&manifest, &engine_b.cas, &engine_b.conns, GHOST, &limits)
+            .await
+            .expect("chunks via the surviving peer");
+        assert!(engine_b.cas.has(&hash));
+
+        // A hash nobody holds: every live peer answers not-found, which is
+        // the PERMANENT classification (quarantine), not a retry loop.
+        let err = crate::fetch::obtain_manifest(
+            [0x42; 32],
+            &engine_b.store,
+            &engine_b.conns,
+            GHOST,
+            &limits,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is_permanent(), "expected permanent, got {err:?}");
     }
 
     #[tokio::test]

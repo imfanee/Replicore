@@ -8,6 +8,7 @@ pub mod apply;
 pub mod chunk;
 pub mod config;
 pub mod decide;
+pub mod fetch;
 pub mod ingest;
 pub mod net;
 pub mod oplog;
