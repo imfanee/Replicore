@@ -9,17 +9,10 @@
 //! This is one-directional by design for M0. Phase 1 makes it bidirectional with
 //! the op-log, version vectors, and apply-suppression (FR-201/301/902).
 
-mod apply;
-mod net;
-mod proto;
-mod watch;
-
 use anyhow::{bail, Context, Result};
+use replicore::{net, watch};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-
-/// Substring marking in-progress staged files so the watcher ignores them.
-pub const TMP_SUFFIX: &str = ".replicore-tmp";
 
 #[tokio::main]
 async fn main() -> Result<()> {
