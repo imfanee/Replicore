@@ -10,6 +10,7 @@ pub mod config;
 pub mod decide;
 pub mod fetch;
 pub mod ingest;
+pub mod merkle;
 pub mod net;
 pub mod oplog;
 pub mod peer;

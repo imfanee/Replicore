@@ -45,11 +45,16 @@ use crate::chunk::Cas;
 use crate::config::{Config, Peer};
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
+use crate::merkle::{
+    reconcile_pull, MerkleTree, ReconcileCtx, ReconcileError, ReconcileReport, ReconcileTransport,
+    RemoteLeaf,
+};
 use crate::oplog::{Store, StoreError};
 use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
     read_msg, write_msg, ChunkReq, ChunkResp, Frame, ManifestReq, ManifestResp, OpRecord, OpType,
-    ProtoError, ALPN, MANIFEST_PAGE, PROTO_VERSION, STREAM_TAG_CHUNK, STREAM_TAG_MANIFEST,
+    ProtoError, ReconcileFrame, ALPN, MANIFEST_PAGE, PROTO_VERSION, STREAM_TAG_CHUNK,
+    STREAM_TAG_MANIFEST, STREAM_TAG_RECONCILE, TREE_PAGE,
 };
 use crate::suppress::Suppressor;
 use crate::vv::NodeId;
@@ -99,6 +104,8 @@ pub enum NetError {
     TooBig,
     #[error("fetch: {0}")]
     Fetch(#[from] FetchError),
+    #[error("reconcile: {0}")]
+    Reconcile(#[from] ReconcileError),
 }
 
 // ---------------------------------------------------------------------------
@@ -443,16 +450,42 @@ impl Engine {
             },
         )
         .await?;
+        // THE responder side of the anti-entropy gate (FR-702): serve
+        // ephemeral streams NOW — the dialer's gating reconcile session
+        // arrives on one — but push NO ops until SubscribeOps.
+        {
+            let serve = self.serve_streams(conn.clone());
+            tokio::pin!(serve);
+            let gate = async {
+                loop {
+                    match read_msg::<_, Frame>(&mut ctl_recv).await {
+                        Ok(Frame::SubscribeOps) => return Ok(()),
+                        Ok(Frame::Ping { nonce: _ }) => {}
+                        Ok(_) => {
+                            return Err(NetError::Violation("control frame before SubscribeOps"))
+                        }
+                        Err(ProtoError::Closed) => {
+                            return Err(NetError::Violation("closed before SubscribeOps"))
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            };
+            tokio::select! {
+                r = &mut serve => return r, // connection ended during the gate
+                g = gate => g?,
+            }
+        }
         tracing::info!(
             peer = %hex::encode(&peer.node_id[..4]),
             resume_from,
-            "peer subscribed to our ops"
+            "peer reconciled and subscribed to our ops"
         );
 
         // The pushed frontier: highest origin_seq actually streamed on THIS
         // connection. Acks are validated against it — a peer must not be able
         // to ack ops it was never sent (last_acked_seq feeds tombstone GC in
-        // M2; an inflated ack there means premature GC and resurrection risk).
+        // M3; an inflated ack there means premature GC and resurrection risk).
         let sent_frontier = Arc::new(AtomicI64::new(resume_from));
 
         let push = self.push_ops(ctl_send, resume_from, sent_frontier.clone());
@@ -565,8 +598,60 @@ impl Engine {
         match tag[0] {
             STREAM_TAG_CHUNK => self.serve_chunk(send, recv).await,
             STREAM_TAG_MANIFEST => self.serve_manifest(send, recv).await,
-            // SEAM: STREAM_TAG_RECONCILE lands with the anti-entropy commit.
+            STREAM_TAG_RECONCILE => self.serve_reconcile(send, recv).await,
             _ => Err(NetError::Violation("unknown stream tag")),
+        }
+    }
+
+    /// Responder side of an anti-entropy session: answer root/tree/leaf
+    /// queries from a per-session snapshot of the index. Mutates nothing —
+    /// the puller does all applying on its own side.
+    async fn serve_reconcile(
+        &self,
+        mut send: quinn::SendStream,
+        mut recv: quinn::RecvStream,
+    ) -> Result<(), NetError> {
+        let rows = self.store.all_files().await?;
+        let tree = MerkleTree::build(rows);
+        loop {
+            match read_msg::<_, ReconcileFrame>(&mut recv).await {
+                Ok(ReconcileFrame::Begin) => {
+                    write_msg(&mut send, &ReconcileFrame::RootIs { hash: tree.root() }).await?;
+                }
+                Ok(ReconcileFrame::TreeReq {
+                    prefix,
+                    after_name,
+                    limit,
+                }) => {
+                    let (children, more) =
+                        tree.children_page(&prefix, &after_name, limit.min(TREE_PAGE) as usize);
+                    write_msg(&mut send, &ReconcileFrame::TreeResp { children, more }).await?;
+                }
+                Ok(ReconcileFrame::LeafReq { path }) => {
+                    let resp = match tree.leaf(&path) {
+                        Some(row) => ReconcileFrame::LeafResp {
+                            found: true,
+                            tombstone: row.tombstone,
+                            content_hash: row.content_hash,
+                            vv: row.vv.clone(),
+                            mode: row.mode,
+                            size: row.size,
+                        },
+                        None => ReconcileFrame::LeafResp {
+                            found: false,
+                            tombstone: false,
+                            content_hash: None,
+                            vv: crate::vv::VersionVector::new(),
+                            mode: 0,
+                            size: 0,
+                        },
+                    };
+                    write_msg(&mut send, &resp).await?;
+                }
+                Ok(ReconcileFrame::Done) | Err(ProtoError::Closed) => return Ok(()),
+                Ok(_) => return Err(NetError::Violation("unexpected reconcile frame")),
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 
@@ -665,10 +750,10 @@ impl Engine {
         }
     }
 
-    /// One subscription session: connect, Hello/HelloAck, then apply pushed
-    /// ops in order, acking after each durable commit.
+    /// One subscription session: connect, Hello/HelloAck, the anti-entropy
+    /// gate, then apply pushed ops in order, acking after each durable commit.
     async fn subscribe_once(
-        &self,
+        self: &Arc<Engine>,
         endpoint: &quinn::Endpoint,
         peer: &Peer,
         attempt: &mut u32,
@@ -694,7 +779,7 @@ impl Engine {
     }
 
     async fn subscription_io(
-        &self,
+        self: &Arc<Engine>,
         conn: &quinn::Connection,
         peer: &Peer,
         attempt: &mut u32,
@@ -726,42 +811,107 @@ impl Engine {
             }
             _ => return Err(NetError::Violation("expected HelloAck")),
         }
+        *attempt = 0; // handshake succeeded: reset the backoff schedule
+
+        // THE anti-entropy gate (FR-702, reviewer item): a (re)started node
+        // reconciles with the peer BEFORE trusting its live op stream. The
+        // responder pushes nothing until it sees SubscribeOps.
+        self.peers_reg
+            .set_state(peer.node_id, PeerState::Reconciling);
+        match self.reconcile_with(conn, peer).await {
+            Ok(report) => {
+                self.peers_reg.note_reconcile(peer.node_id, true);
+                tracing::info!(
+                    peer = %hex::encode(&peer.node_id[..4]),
+                    tree_reqs = report.tree_reqs,
+                    applied = report.applied,
+                    concurrent = report.skipped_concurrent,
+                    damaged = report.skipped_damaged,
+                    "reconcile session complete"
+                );
+            }
+            Err(e) => {
+                self.peers_reg.note_reconcile(peer.node_id, false);
+                return Err(e);
+            }
+        }
+        write_msg(&mut ctl_send, &Frame::SubscribeOps).await?;
+        self.peers_reg.set_state(peer.node_id, PeerState::Live);
         tracing::info!(
             peer = %hex::encode(&peer.node_id[..4]),
             resume_from,
             "subscribed to peer ops"
         );
-        *attempt = 0; // handshake succeeded: reset the backoff schedule
-        self.peers_reg.set_state(peer.node_id, PeerState::Live);
 
-        loop {
-            match read_msg::<_, Frame>(&mut ctl_recv).await {
-                Ok(Frame::OplogPush(op)) => {
-                    let seq = op.origin_seq;
-                    if op.origin != peer.node_id {
-                        // Full-mesh peers push only their own ops; forwarding
-                        // arrives with the relay policy (FR-603 seam).
-                        return Err(NetError::Violation("op origin is not the pushing peer"));
+        // Periodic anti-entropy on this link (FR-702 timer); aborted with
+        // the subscription.
+        let periodic = tokio::spawn({
+            let engine = self.clone();
+            let conn = conn.clone();
+            let peer = peer.clone();
+            let interval = Duration::from_secs(engine.cfg.reconcile_interval_secs.max(1));
+            async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    if conn.close_reason().is_some() {
+                        return;
                     }
-                    self.process_remote_op(conn, op).await?;
-                    // Durably handled (COMMIT above) — only now may we ack.
-                    write_msg(
-                        &mut ctl_send,
-                        &Frame::OplogAck {
-                            origin: peer.node_id,
-                            up_to_seq: seq,
-                        },
-                    )
-                    .await?;
+                    match engine.reconcile_with(&conn, &peer).await {
+                        Ok(report) => {
+                            engine.peers_reg.note_reconcile(peer.node_id, true);
+                            tracing::debug!(
+                                peer = %hex::encode(&peer.node_id[..4]),
+                                applied = report.applied,
+                                "periodic reconcile complete"
+                            );
+                        }
+                        Err(e) => {
+                            engine.peers_reg.note_reconcile(peer.node_id, false);
+                            tracing::warn!(
+                                peer = %hex::encode(&peer.node_id[..4]),
+                                error = %e,
+                                "periodic reconcile failed"
+                            );
+                        }
+                    }
                 }
-                Ok(Frame::Ping { nonce }) => {
-                    write_msg(&mut ctl_send, &Frame::Pong { nonce }).await?;
+            }
+        });
+
+        let result = async {
+            loop {
+                match read_msg::<_, Frame>(&mut ctl_recv).await {
+                    Ok(Frame::OplogPush(op)) => {
+                        let seq = op.origin_seq;
+                        if op.origin != peer.node_id {
+                            // Full-mesh peers push only their own ops;
+                            // forwarding arrives with the relay policy
+                            // (FR-603 seam).
+                            return Err(NetError::Violation("op origin is not the pushing peer"));
+                        }
+                        self.process_remote_op(conn, op).await?;
+                        // Durably handled (COMMIT above) — only now may we ack.
+                        write_msg(
+                            &mut ctl_send,
+                            &Frame::OplogAck {
+                                origin: peer.node_id,
+                                up_to_seq: seq,
+                            },
+                        )
+                        .await?;
+                    }
+                    Ok(Frame::Ping { nonce }) => {
+                        write_msg(&mut ctl_send, &Frame::Pong { nonce }).await?;
+                    }
+                    Ok(_) => return Err(NetError::Violation("unexpected frame on op stream")),
+                    Err(ProtoError::Closed) => return Ok(()),
+                    Err(e) => return Err(e.into()),
                 }
-                Ok(_) => return Err(NetError::Violation("unexpected frame on op stream")),
-                Err(ProtoError::Closed) => return Ok(()),
-                Err(e) => return Err(e.into()),
             }
         }
+        .await;
+        periodic.abort();
+        result
     }
 
     /// The receive path for one pushed op. Order is load-bearing (crash
@@ -887,6 +1037,35 @@ impl Engine {
         }
     }
 
+    /// Run one pull-based anti-entropy session against `peer` over a fresh
+    /// tagged bi-stream on `conn` (FR-701/703).
+    async fn reconcile_with(
+        &self,
+        conn: &quinn::Connection,
+        peer: &Peer,
+    ) -> Result<ReconcileReport, NetError> {
+        let rows = self.store.all_files().await?;
+        let local = MerkleTree::build(rows);
+        let (mut send, recv) = conn.open_bi().await?;
+        send.write_all(&[STREAM_TAG_RECONCILE]).await?;
+        let mut transport = QuicReconcile {
+            send,
+            recv,
+            engine: self,
+            peer: peer.node_id,
+        };
+        let ctx = ReconcileCtx {
+            store: &self.store,
+            cas: &self.cas,
+            share: &self.cfg.share_dir,
+            suppress: &self.suppress,
+        };
+        let report = reconcile_pull(&local, &mut transport, &ctx).await?;
+        let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
+        let _ = transport.send.finish();
+        Ok(report)
+    }
+
     // -- helpers ------------------------------------------------------------
 
     fn peer_fingerprint(&self, conn: &quinn::Connection) -> Result<[u8; 32], NetError> {
@@ -905,6 +1084,117 @@ impl Engine {
             .peer_by_fingerprint(&fp)
             .cloned()
             .ok_or(NetError::UnknownPeer)
+    }
+}
+
+/// QUIC implementation of the reconcile transport: framed RPCs on one tagged
+/// bi-stream. Content fetches go MULTI-SOURCE through the engine's registry
+/// (the session peer is just the origin hint) — a big file discovered via
+/// reconcile still fans its chunks out across every live connection.
+struct QuicReconcile<'a> {
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+    engine: &'a Engine,
+    peer: NodeId,
+}
+
+impl QuicReconcile<'_> {
+    async fn rpc(&mut self, req: &ReconcileFrame) -> Result<ReconcileFrame, ReconcileError> {
+        write_msg(&mut self.send, req).await?;
+        read_msg(&mut self.recv).await.map_err(Into::into)
+    }
+}
+
+impl ReconcileTransport for QuicReconcile<'_> {
+    async fn root(&mut self) -> Result<[u8; 32], ReconcileError> {
+        match self.rpc(&ReconcileFrame::Begin).await? {
+            ReconcileFrame::RootIs { hash } => Ok(hash),
+            _ => Err(ReconcileError::Violation("expected RootIs")),
+        }
+    }
+
+    async fn children(
+        &mut self,
+        prefix: &str,
+    ) -> Result<Vec<crate::proto::WireChild>, ReconcileError> {
+        let mut out = Vec::new();
+        let mut after = String::new();
+        loop {
+            let resp = self
+                .rpc(&ReconcileFrame::TreeReq {
+                    prefix: prefix.to_string(),
+                    after_name: after.clone(),
+                    limit: TREE_PAGE,
+                })
+                .await?;
+            match resp {
+                ReconcileFrame::TreeResp { children, more } => {
+                    if children.len() as u32 > TREE_PAGE {
+                        return Err(ReconcileError::Violation("oversized tree page"));
+                    }
+                    if more && children.is_empty() {
+                        return Err(ReconcileError::Violation("empty page with more=true"));
+                    }
+                    if let Some(last) = children.last() {
+                        after = last.name.clone();
+                    }
+                    out.extend(children);
+                    // Bound a hostile responder paging forever.
+                    if out.len() > 1_000_000 {
+                        return Err(ReconcileError::Violation("absurd directory fan-out"));
+                    }
+                    if !more {
+                        return Ok(out);
+                    }
+                }
+                _ => return Err(ReconcileError::Violation("expected TreeResp")),
+            }
+        }
+    }
+
+    async fn leaf(&mut self, path: &str) -> Result<Option<RemoteLeaf>, ReconcileError> {
+        match self
+            .rpc(&ReconcileFrame::LeafReq {
+                path: path.to_string(),
+            })
+            .await?
+        {
+            ReconcileFrame::LeafResp { found: false, .. } => Ok(None),
+            ReconcileFrame::LeafResp {
+                found: true,
+                tombstone,
+                content_hash,
+                vv,
+                mode,
+                size,
+            } => Ok(Some(RemoteLeaf {
+                tombstone,
+                content_hash,
+                vv,
+                mode,
+                size,
+            })),
+            _ => Err(ReconcileError::Violation("expected LeafResp")),
+        }
+    }
+
+    async fn ensure_content(
+        &mut self,
+        content_hash: [u8; 32],
+        cas: &Cas,
+    ) -> Result<crate::chunk::Manifest, ReconcileError> {
+        let limits = self.engine.fetch_limits();
+        let manifest = crate::fetch::obtain_manifest(
+            content_hash,
+            &self.engine.store,
+            &self.engine.conns,
+            self.peer,
+            &limits,
+        )
+        .await?;
+        crate::fetch::fetch_file_chunks(&manifest, cas, &self.engine.conns, self.peer, &limits)
+            .await?;
+        Ok(manifest)
     }
 }
 
@@ -1328,6 +1618,9 @@ mod tests {
         .await
         .unwrap();
         let _hello_ack: Frame = read_msg(&mut recv).await.unwrap();
+        // Pass the reconcile gate (a lying peer can skip the session and
+        // claim it is done — that is fine, the gate protects the DIALER).
+        write_msg(&mut send, &Frame::SubscribeOps).await.unwrap();
         write_msg(
             &mut send,
             &Frame::OplogAck {

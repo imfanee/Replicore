@@ -1,0 +1,497 @@
+//! merkle.rs — Merkle-tree anti-entropy (FR-701/702/703).
+//!
+//! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ vv)` — metadata
+//! beyond the tombstone flag is deliberately EXCLUDED (mode/size fidelity is
+//! M3; hashing fields we do not reconcile would make trees differ forever).
+//! Directory nodes hash their sorted children. Two replicas in the same
+//! causal state therefore have identical roots, tombstones included.
+//!
+//! The tree is built per session from the `files` index (db rows only — no
+//! file I/O), O(files) locally; **network descent is O(differences)**: a
+//! subtree whose hash matches is pruned, never entered. `ReconcileReport`
+//! counts the descent so tests can PROVE the pruning (reviewer item).
+//! // SEAM(M3): persistent incremental subtree hashes make local build
+//! O(changes) too.
+//!
+//! Sessions are pull-based and one-directional: the initiator fetches what it
+//! lacks; the responder mutates nothing. Both sides of a link each run their
+//! own pull, which converges the pair (the dominated side adopts; Equal
+//! no-ops; Concurrent is detected and skipped — resolution is M3). Applies go
+//! through `decide()` + `Store::reconcile_upsert` (state plane: files row
+//! only, never op cursors) with suppression registered like any apply, so a
+//! reconcile session can run concurrently with the live op stream: the single
+//! store thread linearizes, VV merges are idempotent, and whichever path
+//! lands a dominating vector first turns the other into an Ignore.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::chunk::{Cas, Manifest};
+use crate::decide::{decide, Decision};
+use crate::fetch::FetchError;
+use crate::oplog::{ReconciledRow, Store, StoreError};
+use crate::proto::{ProtoError, WireChild};
+use crate::state::FileRow;
+use crate::suppress::Suppressor;
+use crate::vv::VersionVector;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ReconcileError {
+    #[error("protocol: {0}")]
+    Proto(#[from] ProtoError),
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
+    #[error("apply: {0}")]
+    Apply(#[from] ApplyError),
+    #[error("fetch: {0}")]
+    Fetch(#[from] FetchError),
+    #[error("task join: {0}")]
+    Join(#[from] tokio::task::JoinError),
+    #[error("session violation: {0}")]
+    Violation(&'static str),
+    #[error("session closed")]
+    Closed,
+}
+
+/// A leaf failure that retrying THIS session cannot fix (hostile path,
+/// content gone everywhere, lying manifest): skip the leaf, keep the session.
+/// Everything else aborts the session (a later session resumes).
+fn leaf_error_is_skippable(e: &ReconcileError) -> bool {
+    match e {
+        ReconcileError::Apply(ApplyError::UnsafePath(_)) => true,
+        ReconcileError::Apply(ApplyError::HashMismatch(_)) => true,
+        ReconcileError::Fetch(f) => f.is_permanent(),
+        ReconcileError::Violation(_) => true,
+        _ => false,
+    }
+}
+
+/// Merkle leaf hash. Pure; field-sensitivity is unit-tested.
+pub fn leaf_hash(row: &FileRow) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(row.path.as_bytes());
+    h.update(&[0x00]);
+    h.update(&[row.tombstone as u8]);
+    h.update(row.content_hash.as_ref().unwrap_or(&[0u8; 32]));
+    // BTreeMap-backed VV: bincode encoding is deterministic.
+    if let Ok(vv) = bincode::serialize(&row.vv) {
+        h.update(&vv);
+    }
+    *h.finalize().as_bytes()
+}
+
+type Children = BTreeMap<String, ([u8; 32], bool)>;
+
+/// Prefix tree over '/'-separated paths with bottom-up directory hashes.
+pub struct MerkleTree {
+    /// dir prefix ("" = root) → sorted children (name → (hash, is_dir)).
+    dirs: BTreeMap<String, Children>,
+    leaves: BTreeMap<String, FileRow>,
+    root: [u8; 32],
+}
+
+fn split_parent(path: &str) -> (&str, &str) {
+    path.rsplit_once('/').unwrap_or(("", path))
+}
+
+fn join_prefix(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+impl MerkleTree {
+    /// Build from index rows (any order; `all_files` happens to sort).
+    pub fn build(rows: Vec<FileRow>) -> MerkleTree {
+        let mut dirs: BTreeMap<String, Children> = BTreeMap::new();
+        dirs.insert(String::new(), Children::new());
+        let mut leaves = BTreeMap::new();
+
+        for row in rows {
+            let lh = leaf_hash(&row);
+            let (parent, name) = split_parent(&row.path);
+            dirs.entry(parent.to_string())
+                .or_default()
+                .insert(name.to_string(), (lh, false));
+            // Ensure the ancestor chain exists with dir placeholders.
+            let mut dir = parent.to_string();
+            while !dir.is_empty() {
+                let (up, name) = split_parent(&dir);
+                let entry = dirs
+                    .entry(up.to_string())
+                    .or_default()
+                    .entry(name.to_string())
+                    .or_insert(([0u8; 32], true));
+                entry.1 = true;
+                dir = up.to_string();
+            }
+            leaves.insert(row.path.clone(), row);
+        }
+
+        // Bottom-up: reverse-lexicographic visits "a/b" before "a" before "".
+        let prefixes: Vec<String> = dirs.keys().cloned().collect();
+        for prefix in prefixes.iter().rev() {
+            let hash = Self::hash_children(&dirs[prefix.as_str()]);
+            if prefix.is_empty() {
+                let mut tree = MerkleTree {
+                    dirs,
+                    leaves,
+                    root: hash,
+                };
+                tree.root = hash;
+                return tree;
+            }
+            let (up, name) = split_parent(prefix);
+            if let Some(entry) = dirs.get_mut(up).and_then(|c| c.get_mut(name)) {
+                entry.0 = hash;
+            }
+        }
+        // rows was empty: only the root exists.
+        let root = Self::hash_children(&dirs[""]);
+        MerkleTree { dirs, leaves, root }
+    }
+
+    fn hash_children(children: &Children) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        for (name, (hash, is_dir)) in children {
+            h.update(name.as_bytes());
+            h.update(&[0x01, *is_dir as u8]);
+            h.update(hash);
+        }
+        *h.finalize().as_bytes()
+    }
+
+    pub fn root(&self) -> [u8; 32] {
+        self.root
+    }
+
+    pub fn leaf(&self, path: &str) -> Option<&FileRow> {
+        self.leaves.get(path)
+    }
+
+    pub fn children(&self, prefix: &str) -> Option<&Children> {
+        self.dirs.get(prefix)
+    }
+
+    /// One page of a directory's children, sorted, strictly after
+    /// `after_name`. Returns `(page, more)`.
+    pub fn children_page(
+        &self,
+        prefix: &str,
+        after_name: &str,
+        limit: usize,
+    ) -> (Vec<WireChild>, bool) {
+        let Some(children) = self.dirs.get(prefix) else {
+            return (Vec::new(), false);
+        };
+        let mut page = Vec::with_capacity(limit.min(children.len()));
+        let mut iter = children
+            .range::<String, _>((
+                std::ops::Bound::Excluded(after_name.to_string()),
+                std::ops::Bound::Unbounded,
+            ))
+            .peekable();
+        while page.len() < limit {
+            let Some((name, (hash, is_dir))) = iter.next() else {
+                return (page, false);
+            };
+            page.push(WireChild {
+                name: name.clone(),
+                hash: *hash,
+                is_dir: *is_dir,
+            });
+        }
+        (page, iter.peek().is_some())
+    }
+}
+
+/// What the puller learns about one remote leaf.
+#[derive(Clone, Debug)]
+pub struct RemoteLeaf {
+    pub tombstone: bool,
+    pub content_hash: Option<[u8; 32]>,
+    pub vv: VersionVector,
+    pub mode: u32,
+    pub size: u64,
+}
+
+/// Session transport, abstracted so the convergence property test can drive
+/// `reconcile_pull` with two in-memory replicas and no QUIC. Stable since
+/// 1.75 (async fn in trait); used generically only.
+#[allow(async_fn_in_trait)]
+pub trait ReconcileTransport {
+    async fn root(&mut self) -> Result<[u8; 32], ReconcileError>;
+    /// FULL child list of a remote directory (impl paginates internally).
+    async fn children(&mut self, prefix: &str) -> Result<Vec<WireChild>, ReconcileError>;
+    async fn leaf(&mut self, path: &str) -> Result<Option<RemoteLeaf>, ReconcileError>;
+    /// Make `content_hash`'s chunks present in `cas` and return the manifest
+    /// (QUIC impl: multi-source fetch; test impl: copy across).
+    async fn ensure_content(
+        &mut self,
+        content_hash: [u8; 32],
+        cas: &Cas,
+    ) -> Result<Manifest, ReconcileError>;
+}
+
+/// Everything a leaf apply needs.
+pub struct ReconcileCtx<'a> {
+    pub store: &'a Store,
+    pub cas: &'a Cas,
+    pub share: &'a Path,
+    pub suppress: &'a Suppressor,
+}
+
+#[derive(Default, Debug, Clone, Copy)]
+pub struct ReconcileReport {
+    /// Remote directory listings requested — THE O(diff) descent metric.
+    pub tree_reqs: u64,
+    pub leaves_compared: u64,
+    pub applied: u64,
+    pub skipped_concurrent: u64,
+    /// Permanently unmaterializable leaves (hostile path / content gone):
+    /// logged, skipped, left for a superseding op or a later session.
+    pub skipped_damaged: u64,
+}
+
+/// The pull driver: descend differing subtrees of the remote tree, decide
+/// each differing leaf, fetch+apply where the remote dominates. Serial
+/// descent (bounded by definition); chunk parallelism lives inside
+/// `ensure_content`.
+pub async fn reconcile_pull<T: ReconcileTransport>(
+    local: &MerkleTree,
+    remote: &mut T,
+    ctx: &ReconcileCtx<'_>,
+) -> Result<ReconcileReport, ReconcileError> {
+    let mut report = ReconcileReport::default();
+
+    let remote_root = remote.root().await?;
+    if remote_root == local.root() {
+        return Ok(report); // O(1): in sync, descend nowhere
+    }
+
+    let empty = Children::new();
+    let mut queue: Vec<String> = vec![String::new()];
+    while let Some(prefix) = queue.pop() {
+        report.tree_reqs += 1;
+        let remote_children = remote.children(&prefix).await?;
+        let local_children = local.children(&prefix).unwrap_or(&empty);
+        for child in remote_children {
+            match local_children.get(&child.name) {
+                // THE pruning rule: identical hash = identical subtree/leaf.
+                Some((local_hash, _)) if *local_hash == child.hash => {}
+                _ if child.is_dir => queue.push(join_prefix(&prefix, &child.name)),
+                _ => {
+                    let path = join_prefix(&prefix, &child.name);
+                    handle_leaf(&path, remote, ctx, &mut report).await?;
+                }
+            }
+        }
+        // Children we have that the remote lacks: nothing to PULL — if our
+        // copy is genuinely newer the peer's own pull (other direction)
+        // fetches it; if it was deleted there, a tombstone leaf exists and
+        // was handled above.
+    }
+    Ok(report)
+}
+
+async fn handle_leaf<T: ReconcileTransport>(
+    path: &str,
+    remote: &mut T,
+    ctx: &ReconcileCtx<'_>,
+    report: &mut ReconcileReport,
+) -> Result<(), ReconcileError> {
+    report.leaves_compared += 1;
+    let Some(rleaf) = remote.leaf(path).await? else {
+        return Ok(()); // raced away under the responder's snapshot
+    };
+    let local_row = ctx.store.load_file(path).await?;
+    match decide(local_row.as_ref(), &rleaf.vv) {
+        Decision::Ignore | Decision::Quarantined => Ok(()),
+        Decision::Concurrent => {
+            report.skipped_concurrent += 1;
+            tracing::warn!(
+                path,
+                "reconcile: concurrent versions; keeping local (M3 resolves)"
+            );
+            Ok(())
+        }
+        Decision::Apply => match apply_remote_leaf(path, &rleaf, remote, ctx).await {
+            Ok(()) => {
+                report.applied += 1;
+                Ok(())
+            }
+            Err(e) if leaf_error_is_skippable(&e) => {
+                report.skipped_damaged += 1;
+                tracing::error!(path, error = %e,
+                        "reconcile: leaf permanently unmaterializable; skipping");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+    }
+}
+
+async fn apply_remote_leaf<T: ReconcileTransport>(
+    path: &str,
+    rleaf: &RemoteLeaf,
+    remote: &mut T,
+    ctx: &ReconcileCtx<'_>,
+) -> Result<(), ReconcileError> {
+    if rleaf.tombstone {
+        let share = ctx.share.to_path_buf();
+        let rel = path.to_string();
+        let suppress = ctx.suppress.clone();
+        tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
+        ctx.store
+            .reconcile_upsert(ReconciledRow {
+                path: path.to_string(),
+                content_hash: None,
+                mode: rleaf.mode,
+                size: 0,
+                vv: rleaf.vv.clone(),
+                tombstone: true,
+            })
+            .await?;
+        return Ok(());
+    }
+
+    let hash = rleaf
+        .content_hash
+        .ok_or(ReconcileError::Violation("live leaf without content hash"))?;
+    let manifest = remote.ensure_content(hash, ctx.cas).await?;
+    {
+        let share = ctx.share.to_path_buf();
+        let rel = path.to_string();
+        let mode = rleaf.mode;
+        let suppress = ctx.suppress.clone();
+        let cas = ctx.cas.clone();
+        tokio::task::spawn_blocking(move || {
+            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+        })
+        .await??;
+    }
+    ctx.store
+        .reconcile_upsert(ReconciledRow {
+            path: path.to_string(),
+            content_hash: Some(hash),
+            mode: rleaf.mode,
+            size: rleaf.size,
+            vv: rleaf.vv.clone(),
+            tombstone: false,
+        })
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vv::NodeId;
+
+    fn nid(b: u8) -> NodeId {
+        let mut id = [0u8; 16];
+        id[0] = b;
+        id
+    }
+
+    fn row(path: &str, hash: u8, tombstone: bool, vva: u64) -> FileRow {
+        FileRow {
+            path: path.into(),
+            content_hash: if tombstone { None } else { Some([hash; 32]) },
+            mode: 0o644,
+            size: 1,
+            tombstone,
+            vv: [(nid(1), vva)].into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn leaf_hash_is_sensitive_to_every_causal_field_only() {
+        let base = row("a/b", 1, false, 1);
+        assert_eq!(leaf_hash(&base), leaf_hash(&base.clone()));
+        let mut other = base.clone();
+        other.path = "a/c".into();
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        let mut other = base.clone();
+        other.content_hash = Some([2; 32]);
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        let mut other = base.clone();
+        other.tombstone = true;
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        let mut other = base.clone();
+        other.vv = [(nid(1), 2u64)].into_iter().collect();
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        // Mode/size are NOT hashed (M3 fidelity — no reconcile flap).
+        let mut other = base.clone();
+        other.mode = 0o600;
+        other.size = 999;
+        assert_eq!(leaf_hash(&base), leaf_hash(&other));
+    }
+
+    #[test]
+    fn identical_states_have_identical_roots() {
+        let rows = vec![
+            row("a/x", 1, false, 1),
+            row("a/y", 2, true, 2),
+            row("z", 3, false, 1),
+        ];
+        let t1 = MerkleTree::build(rows.clone());
+        let t2 = MerkleTree::build(rows);
+        assert_eq!(t1.root(), t2.root());
+    }
+
+    #[test]
+    fn any_leaf_change_changes_the_root_and_only_its_subtree() {
+        let mut rows = vec![
+            row("a/x", 1, false, 1),
+            row("a/y", 2, false, 1),
+            row("b/z", 3, false, 1),
+        ];
+        let before = MerkleTree::build(rows.clone());
+        rows[0] = row("a/x", 9, false, 2);
+        let after = MerkleTree::build(rows);
+
+        assert_ne!(before.root(), after.root());
+        // Subtree "b" untouched: its hash is identical (the pruning basis).
+        let b_before = before.children("").unwrap().get("b").unwrap();
+        let b_after = after.children("").unwrap().get("b").unwrap();
+        assert_eq!(b_before, b_after);
+        // Subtree "a" differs.
+        let a_before = before.children("").unwrap().get("a").unwrap();
+        let a_after = after.children("").unwrap().get("a").unwrap();
+        assert_ne!(a_before.0, a_after.0);
+    }
+
+    #[test]
+    fn children_pagination_walks_everything() {
+        let rows: Vec<FileRow> = (0..25)
+            .map(|i| row(&format!("d/f{i:02}"), i, false, 1))
+            .collect();
+        let tree = MerkleTree::build(rows);
+        let mut all = Vec::new();
+        let mut after = String::new();
+        loop {
+            let (page, more) = tree.children_page("d", &after, 7);
+            assert!(page.len() <= 7);
+            all.extend(page.iter().map(|c| c.name.clone()));
+            if !more {
+                break;
+            }
+            after = all.last().expect("non-empty page").clone();
+        }
+        assert_eq!(all.len(), 25);
+        let mut sorted = all.clone();
+        sorted.sort();
+        assert_eq!(all, sorted);
+    }
+
+    #[test]
+    fn empty_tree_has_a_root() {
+        let t = MerkleTree::build(Vec::new());
+        let t2 = MerkleTree::build(Vec::new());
+        assert_eq!(t.root(), t2.root());
+    }
+}
