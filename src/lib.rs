@@ -10,6 +10,7 @@ pub mod decide;
 pub mod net;
 pub mod oplog;
 pub mod proto;
+pub mod replica;
 pub mod state;
 pub mod suppress;
 pub mod vv;

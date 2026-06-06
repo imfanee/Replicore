@@ -114,6 +114,41 @@ pub(crate) fn live_files(conn: &Connection) -> Result<Vec<LiveFile>, StoreError>
     Ok(out)
 }
 
+/// One row of the full index, tombstones included — the reconciliation /
+/// snapshot view. // SEAM(M2): Merkle subtree hashes hang off this.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FileRow {
+    pub path: String,
+    pub content_hash: Option<[u8; 32]>,
+    pub tombstone: bool,
+    pub vv: VersionVector,
+}
+
+/// Every row, live and tombstoned, ordered by path.
+pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
+    let mut stmt =
+        conn.prepare("SELECT path, content_hash, tombstone, vv FROM files ORDER BY path")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<Vec<u8>>>(1)?,
+            row.get::<_, bool>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (path, hash, tombstone, vv_blob) = row?;
+        out.push(FileRow {
+            path,
+            content_hash: hash.map(|h| blob32(h, "files.content_hash")).transpose()?,
+            tombstone,
+            vv: decode_vv(&vv_blob)?,
+        });
+    }
+    Ok(out)
+}
+
 /// Resolve a content hash to some live path holding it (serves peer fetches,
 /// FR-401: transfer is content-addressed).
 pub(crate) fn path_for_hash(

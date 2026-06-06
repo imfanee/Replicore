@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::decide::{Decision, LocalFile};
 use crate::proto::{op_id, OpRecord, OpType};
-use crate::state::{self, LiveFile};
+use crate::state::{self, FileRow, LiveFile};
 use crate::vv::NodeId;
 
 #[derive(thiserror::Error, Debug)]
@@ -85,6 +85,9 @@ enum StoreCmd {
     },
     LiveFiles {
         reply: oneshot::Sender<Result<Vec<LiveFile>, StoreError>>,
+    },
+    AllFiles {
+        reply: oneshot::Sender<Result<Vec<FileRow>, StoreError>>,
     },
     PathForHash {
         hash: [u8; 32],
@@ -253,6 +256,12 @@ impl Store {
         self.call(|reply| StoreCmd::LiveFiles { reply }).await
     }
 
+    /// Full index, tombstones included, ordered by path — the convergence
+    /// snapshot for tests and the M2 reconciliation seam.
+    pub async fn all_files(&self) -> Result<Vec<FileRow>, StoreError> {
+        self.call(|reply| StoreCmd::AllFiles { reply }).await
+    }
+
     /// Serve a content-addressed fetch: a live path holding `hash`, if any.
     pub async fn path_for_hash(&self, hash: [u8; 32]) -> Result<Option<String>, StoreError> {
         self.call(|reply| StoreCmd::PathForHash { hash, reply })
@@ -321,6 +330,9 @@ fn run_store(
             }
             StoreCmd::LiveFiles { reply } => {
                 let _ = reply.send(state::live_files(&conn));
+            }
+            StoreCmd::AllFiles { reply } => {
+                let _ = reply.send(state::all_files(&conn));
             }
             StoreCmd::PathForHash { hash, reply } => {
                 let _ = reply.send(state::path_for_hash(&conn, &hash));
