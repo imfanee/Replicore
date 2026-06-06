@@ -71,6 +71,7 @@ impl Replica {
                 mode: 0o644,
                 size: content.len() as u64,
                 content_hash: Some(hash),
+                manifest: None,
             })
             .await
     }
@@ -85,6 +86,7 @@ impl Replica {
                 mode: 0o644,
                 size: 0,
                 content_hash: None,
+                manifest: None,
             })
             .await
     }

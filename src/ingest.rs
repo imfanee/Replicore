@@ -181,6 +181,7 @@ impl Ingest {
                 mode,
                 size,
                 content_hash: Some(hash),
+                manifest: None,
             })
             .await
         {
@@ -223,6 +224,7 @@ impl Ingest {
                 mode: 0,
                 size: 0,
                 content_hash: None,
+                manifest: None,
             })
             .await
         {

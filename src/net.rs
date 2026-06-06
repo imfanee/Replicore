@@ -1018,6 +1018,7 @@ mod tests {
                 mode: 0o644,
                 size: 6,
                 content_hash: Some(*blake3::hash(b"poison").as_bytes()),
+                manifest: None,
             })
             .await
             .unwrap()
@@ -1031,6 +1032,7 @@ mod tests {
                 mode: 0o644,
                 size: 4,
                 content_hash: Some(*blake3::hash(b"fine").as_bytes()),
+                manifest: None,
             })
             .await
             .unwrap()

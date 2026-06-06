@@ -18,6 +18,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::chunk::Manifest;
 use crate::decide::{Decision, LocalFile};
 use crate::proto::{op_id, OpRecord, OpType};
 use crate::state::{self, FileRow, LiveFile};
@@ -44,6 +45,26 @@ pub struct LocalChange {
     pub size: u64,
     /// BLAKE3 of the new content; `None` for deletes.
     pub content_hash: Option<[u8; 32]>,
+    /// Chunk manifest built while hashing (FR-402); persisted in the SAME
+    /// transaction as the op so a local op and its manifest are atomically
+    /// durable. `None` for deletes.
+    pub manifest: Option<Manifest>,
+}
+
+/// A row learned via anti-entropy (state plane). Applying one merges the VV
+/// and upserts `files` ONLY — no oplog row, no `applied` entry, no cursor
+/// movement. That separation is what keeps reconcile from ever disturbing
+/// the live-op resume/ack machinery.
+#[derive(Clone, Debug)]
+pub struct ReconciledRow {
+    pub path: String,
+    pub content_hash: Option<[u8; 32]>,
+    pub mode: u32,
+    pub size: u64,
+    /// The REMOTE vector; the store merges it with the local row's inside
+    /// the transaction (no TOCTOU).
+    pub vv: crate::vv::VersionVector,
+    pub tombstone: bool,
 }
 
 enum StoreCmd {
@@ -96,6 +117,18 @@ enum StoreCmd {
     OpCount {
         reply: oneshot::Sender<Result<i64, StoreError>>,
     },
+    PutManifest {
+        manifest: Box<Manifest>,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    ManifestFor {
+        content_hash: [u8; 32],
+        reply: oneshot::Sender<Result<Option<Manifest>, StoreError>>,
+    },
+    ReconcileUpsert {
+        row: Box<ReconciledRow>,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
 }
 
 /// Async handle to the store thread. Cheap to clone.
@@ -145,7 +178,42 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS applied (
                op_id BLOB PRIMARY KEY
+             );
+             CREATE TABLE IF NOT EXISTS manifests (
+               content_hash BLOB PRIMARY KEY,
+               chunk_count  INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS manifest_chunks (
+               content_hash BLOB NOT NULL,
+               idx          INTEGER NOT NULL,
+               chunk_hash   BLOB NOT NULL,
+               len          INTEGER NOT NULL,
+               PRIMARY KEY (content_hash, idx)
+             );
+             CREATE INDEX IF NOT EXISTS manifest_chunks_by_chunk
+               ON manifest_chunks(chunk_hash); -- SEAM(M3): CAS GC refcounts
+             CREATE TABLE IF NOT EXISTS peer_cursors (
+               peer           BLOB NOT NULL,
+               origin         BLOB NOT NULL,
+               recv_cursor    INTEGER NOT NULL DEFAULT 0,
+               last_acked_seq INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (peer, origin)
              );",
+        )?;
+
+        // One-time idempotent backfill from the M1 single-cursor layout.
+        // recv_cursor was keyed (peer == origin); last_acked was "this peer
+        // acked OUR ops", i.e. (peer, our node id).
+        conn.execute(
+            "INSERT OR IGNORE INTO peer_cursors (peer, origin, recv_cursor)
+             SELECT node_id, node_id, recv_cursor FROM peers WHERE recv_cursor > 0",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO peer_cursors (peer, origin, last_acked_seq)
+             SELECT node_id, ?1, last_acked_seq FROM peers
+             WHERE last_acked_seq > 0 AND node_id != ?1",
+            [node_id.as_slice()],
         )?;
 
         let initial_latest = latest_origin_seq(&conn, &node_id)?;
@@ -272,6 +340,37 @@ impl Store {
     pub async fn op_count(&self) -> Result<i64, StoreError> {
         self.call(|reply| StoreCmd::OpCount { reply }).await
     }
+
+    /// Durably record a manifest's structure (idempotent). The receive path
+    /// calls this BEFORE fetching chunks so a crash mid-transfer resumes with
+    /// the structure already known.
+    pub async fn put_manifest(&self, manifest: Manifest) -> Result<(), StoreError> {
+        self.call(|reply| StoreCmd::PutManifest {
+            manifest: Box::new(manifest),
+            reply,
+        })
+        .await
+    }
+
+    pub async fn manifest_for(
+        &self,
+        content_hash: [u8; 32],
+    ) -> Result<Option<Manifest>, StoreError> {
+        self.call(|reply| StoreCmd::ManifestFor {
+            content_hash,
+            reply,
+        })
+        .await
+    }
+
+    /// Anti-entropy state apply — see [`ReconciledRow`] for the contract.
+    pub async fn reconcile_upsert(&self, row: ReconciledRow) -> Result<(), StoreError> {
+        self.call(|reply| StoreCmd::ReconcileUpsert {
+            row: Box::new(row),
+            reply,
+        })
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,17 +415,29 @@ fn run_store(
                 let _ = reply.send(ops_since(&conn, &origin, after_seq, limit));
             }
             StoreCmd::RecvCursor { peer, reply } => {
-                let _ = reply.send(peer_cursor(&conn, &peer, "recv_cursor"));
+                let _ = reply.send(cursor_value(&conn, &peer, &peer, "recv_cursor"));
             }
             StoreCmd::AdvanceAck {
                 peer,
                 up_to_seq,
                 reply,
             } => {
-                let _ = reply.send(advance_ack(&conn, &peer, up_to_seq));
+                let _ = reply.send(advance_ack(&conn, &peer, &node_id, up_to_seq));
             }
             StoreCmd::LastAcked { peer, reply } => {
-                let _ = reply.send(peer_cursor(&conn, &peer, "last_acked_seq"));
+                let _ = reply.send(cursor_value(&conn, &peer, &node_id, "last_acked_seq"));
+            }
+            StoreCmd::PutManifest { manifest, reply } => {
+                let _ = reply.send(state::put_manifest(&conn, &manifest));
+            }
+            StoreCmd::ManifestFor {
+                content_hash,
+                reply,
+            } => {
+                let _ = reply.send(state::manifest_for(&conn, &content_hash));
+            }
+            StoreCmd::ReconcileUpsert { row, reply } => {
+                let _ = reply.send(reconcile_upsert(&mut conn, &row));
             }
             StoreCmd::LiveFiles { reply } => {
                 let _ = reply.send(state::live_files(&conn));
@@ -441,6 +552,14 @@ fn append_local(
         &vv,
         tombstone,
     )?;
+    // The op and the manifest describing its content are atomically durable
+    // together (FR-402: we must be able to serve chunks for our own ops).
+    if let Some(manifest) = &change.manifest {
+        if Some(manifest.content_hash) != change.content_hash {
+            return Err(StoreError::Corrupt("manifest/content_hash mismatch"));
+        }
+        state::put_manifest(&tx, manifest)?;
+    }
     tx.commit()?; // durable before anything is pushed
     Ok(Some(op))
 }
@@ -491,11 +610,13 @@ fn apply_remote(
         )?;
     }
 
-    ensure_peer(&tx, &op.origin)?;
+    ensure_cursor_row(&tx, &op.origin, &op.origin)?;
     // The sender streams in ascending origin_seq, so max() tracks the
-    // contiguous frontier of what we durably handled.
+    // contiguous frontier of what we durably handled. Keyed (peer, origin) —
+    // in the full mesh ops arrive from their origin (peer == origin).
     tx.execute(
-        "UPDATE peers SET recv_cursor = MAX(recv_cursor, ?1) WHERE node_id = ?2",
+        "UPDATE peer_cursors SET recv_cursor = MAX(recv_cursor, ?1)
+         WHERE peer = ?2 AND origin = ?2",
         params![op.origin_seq, op.origin.as_slice()],
     )?;
     tx.commit()?; // THE durability point — the ack may only be sent after this
@@ -564,32 +685,67 @@ fn ops_since(
     Ok(out)
 }
 
-fn ensure_peer(conn: &Connection, peer: &NodeId) -> Result<(), StoreError> {
+// Per-(peer, origin) cursor rows (relay seam; reconcile never touches these).
+// recv_cursor lives at (peer, peer) in the M2 full mesh; a peer's acks of OUR
+// ops live at (peer, our node id).
+
+fn ensure_cursor_row(conn: &Connection, peer: &NodeId, origin: &NodeId) -> Result<(), StoreError> {
     conn.execute(
-        "INSERT OR IGNORE INTO peers (node_id) VALUES (?1)",
-        [peer.as_slice()],
+        "INSERT OR IGNORE INTO peer_cursors (peer, origin) VALUES (?1, ?2)",
+        params![peer.as_slice(), origin.as_slice()],
     )?;
     Ok(())
 }
 
-fn peer_cursor(conn: &Connection, peer: &NodeId, column: &str) -> Result<i64, StoreError> {
+fn cursor_value(
+    conn: &Connection,
+    peer: &NodeId,
+    origin: &NodeId,
+    column: &str,
+) -> Result<i64, StoreError> {
     // `column` is a compile-time constant from this module, never user input.
-    let sql = format!("SELECT {column} FROM peers WHERE node_id = ?1");
+    let sql = format!("SELECT {column} FROM peer_cursors WHERE peer = ?1 AND origin = ?2");
     Ok(conn
-        .query_row(&sql, [peer.as_slice()], |row| row.get(0))
+        .query_row(&sql, params![peer.as_slice(), origin.as_slice()], |row| {
+            row.get(0)
+        })
         .optional()?
         .unwrap_or(0))
 }
 
-fn advance_ack(conn: &Connection, peer: &NodeId, up_to_seq: i64) -> Result<(), StoreError> {
-    ensure_peer(conn, peer)?;
+fn advance_ack(
+    conn: &Connection,
+    peer: &NodeId,
+    our_id: &NodeId,
+    up_to_seq: i64,
+) -> Result<(), StoreError> {
+    ensure_cursor_row(conn, peer, our_id)?;
     conn.execute(
-        "UPDATE peers
-         SET last_acked_seq = MAX(last_acked_seq, ?1),
-             last_sent_seq  = MAX(last_sent_seq,  ?1)
-         WHERE node_id = ?2",
-        params![up_to_seq, peer.as_slice()],
+        "UPDATE peer_cursors SET last_acked_seq = MAX(last_acked_seq, ?1)
+         WHERE peer = ?2 AND origin = ?3",
+        params![up_to_seq, peer.as_slice(), our_id.as_slice()],
     )?;
+    Ok(())
+}
+
+/// State-plane apply for anti-entropy (see [`ReconciledRow`]). One tx: merge
+/// the remote VV with the current local row's and upsert `files`. Nothing
+/// else — structurally incapable of disturbing op cursors or idempotency.
+fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    let local = state::load_file(&tx, &row.path)?;
+    let mut vv = local.map(|l| l.vv).unwrap_or_default();
+    vv.merge(&row.vv);
+    state::upsert_file(
+        &tx,
+        &row.path,
+        row.content_hash.as_ref(),
+        row.mode,
+        row.size,
+        &vv,
+        row.tombstone,
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -616,6 +772,7 @@ mod tests {
             mode: 0o644,
             size: 3,
             content_hash: Some(hash),
+            manifest: None,
         }
     }
 
@@ -626,6 +783,7 @@ mod tests {
             mode: 0o644,
             size: 0,
             content_hash: None,
+            manifest: None,
         }
     }
 
@@ -842,6 +1000,113 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*rx.borrow(), 2);
+    }
+
+    fn sample_manifest(content: [u8; 32]) -> Manifest {
+        Manifest {
+            content_hash: content,
+            chunks: vec![
+                crate::proto::ChunkEntry {
+                    hash: [1; 32],
+                    len: 100,
+                },
+                crate::proto::ChunkEntry {
+                    hash: [2; 32],
+                    len: 50,
+                },
+            ],
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_round_trips_and_is_idempotent() {
+        let store = mem_store(NODE_A);
+        let m = sample_manifest([9; 32]);
+        store.put_manifest(m.clone()).await.unwrap();
+        store.put_manifest(m.clone()).await.unwrap(); // immutable: no-op
+        assert_eq!(store.manifest_for([9; 32]).await.unwrap(), Some(m));
+        assert_eq!(store.manifest_for([8; 32]).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn append_local_persists_manifest_atomically() {
+        let store = mem_store(NODE_A);
+        let m = sample_manifest([7; 32]);
+        let mut change = write_change("x/file", [7; 32]);
+        change.manifest = Some(m.clone());
+        store.append_local(change).await.unwrap().unwrap();
+        assert_eq!(store.manifest_for([7; 32]).await.unwrap(), Some(m));
+
+        // A manifest that does not match the op's content hash is a caller
+        // bug and must poison the whole tx, not half-commit.
+        let mut bad = write_change("x/other", [1; 32]);
+        bad.manifest = Some(sample_manifest([2; 32]));
+        assert!(store.append_local(bad).await.is_err());
+        assert!(store.load_file("x/other").await.unwrap().is_none()); // rolled back
+    }
+
+    #[tokio::test]
+    async fn reconcile_upsert_touches_files_only() {
+        let store = mem_store(NODE_A);
+        let row = ReconciledRow {
+            path: "healed/f".into(),
+            content_hash: Some([3; 32]),
+            mode: 0o644,
+            size: 10,
+            vv: [(NODE_B, 2u64)].into_iter().collect(),
+            tombstone: false,
+        };
+        store.reconcile_upsert(row.clone()).await.unwrap();
+        store.reconcile_upsert(row.clone()).await.unwrap(); // idempotent merge
+
+        let local = store.load_file("healed/f").await.unwrap().unwrap();
+        assert_eq!(local.content_hash, Some([3; 32]));
+        assert_eq!(local.vv.get(&NODE_B), 2);
+        // The state plane NEVER disturbs the op machinery:
+        assert_eq!(store.op_count().await.unwrap(), 0); // no oplog row
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 0); // no cursor
+                                                                 // VV merge with an existing row, not replace:
+        store
+            .reconcile_upsert(ReconciledRow {
+                vv: [(NODE_A, 1u64)].into_iter().collect(),
+                tombstone: true,
+                content_hash: None,
+                ..row
+            })
+            .await
+            .unwrap();
+        let local = store.load_file("healed/f").await.unwrap().unwrap();
+        assert!(local.tombstone);
+        assert_eq!(local.vv.get(&NODE_A), 1);
+        assert_eq!(local.vv.get(&NODE_B), 2); // merged, not lost
+    }
+
+    #[tokio::test]
+    async fn m1_cursor_layout_backfills_into_peer_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            // Forge an M1-era database: only the old `peers` single-cursor row.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE peers (
+                   node_id BLOB PRIMARY KEY,
+                   last_sent_seq INTEGER NOT NULL DEFAULT 0,
+                   last_acked_seq INTEGER NOT NULL DEFAULT 0,
+                   recv_cursor INTEGER NOT NULL DEFAULT 0
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO peers (node_id, last_acked_seq, recv_cursor) VALUES (?1, 7, 9)",
+                [NODE_B.as_slice()],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&db, NODE_A).unwrap();
+        // recv cursor of B's ops migrated to (B, B); B's acks of OUR ops to (B, A).
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 9);
+        assert_eq!(store.last_acked(NODE_B).await.unwrap(), 7);
     }
 
     #[tokio::test]

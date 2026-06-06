@@ -11,8 +11,10 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::chunk::Manifest;
 use crate::decide::LocalFile;
 use crate::oplog::StoreError;
+use crate::proto::ChunkEntry;
 use crate::vv::VersionVector;
 
 /// A live (non-tombstoned) row, as the scanner sees the index.
@@ -147,6 +149,66 @@ pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
         });
     }
     Ok(out)
+}
+
+/// Persist a manifest's structure (idempotent — manifests are immutable,
+/// keyed by the whole-file hash they reconstruct).
+pub(crate) fn put_manifest(conn: &Connection, m: &Manifest) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT OR IGNORE INTO manifests (content_hash, chunk_count) VALUES (?1, ?2)",
+        params![m.content_hash.as_slice(), m.chunks.len() as i64],
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO manifest_chunks (content_hash, idx, chunk_hash, len)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (idx, c) in m.chunks.iter().enumerate() {
+        stmt.execute(params![
+            m.content_hash.as_slice(),
+            idx as i64,
+            c.hash.as_slice(),
+            c.len as i64,
+        ])?;
+    }
+    Ok(())
+}
+
+/// Load a manifest's structure; verifies the row count is complete.
+pub(crate) fn manifest_for(
+    conn: &Connection,
+    content_hash: &[u8; 32],
+) -> Result<Option<Manifest>, StoreError> {
+    let count: Option<i64> = conn
+        .query_row(
+            "SELECT chunk_count FROM manifests WHERE content_hash = ?1",
+            [content_hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(count) = count else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare_cached(
+        "SELECT chunk_hash, len FROM manifest_chunks WHERE content_hash = ?1 ORDER BY idx",
+    )?;
+    let rows = stmt.query_map([content_hash.as_slice()], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut chunks = Vec::with_capacity(count as usize);
+    for row in rows {
+        let (hash, len) = row?;
+        chunks.push(ChunkEntry {
+            hash: blob32(hash, "manifest_chunks.chunk_hash")?,
+            len: len as u32,
+        });
+    }
+    if chunks.len() as i64 != count {
+        return Err(StoreError::Corrupt("manifest_chunks row count"));
+    }
+    Ok(Some(Manifest {
+        content_hash: *content_hash,
+        chunks,
+    }))
 }
 
 /// Resolve a content hash to some live path holding it (serves peer fetches,

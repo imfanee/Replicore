@@ -238,6 +238,7 @@ mod tests {
                 mode: 0o644,
                 size: 1,
                 content_hash: Some(*blake3::hash(b"a").as_bytes()),
+                manifest: None,
             })
             .await
             .unwrap();
@@ -262,6 +263,7 @@ mod tests {
                 mode: 0,
                 size: 0,
                 content_hash: None,
+                manifest: None,
             })
             .await
             .unwrap();
