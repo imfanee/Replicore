@@ -30,6 +30,18 @@ pub enum PeerState {
     Backoff,
 }
 
+impl PeerState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PeerState::Disconnected => "disconnected",
+            PeerState::Dialing => "dialing",
+            PeerState::Reconciling => "reconciling",
+            PeerState::Live => "live",
+            PeerState::Backoff => "backoff",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PeerStatus {
     pub state: PeerState,

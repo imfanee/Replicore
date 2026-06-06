@@ -9,6 +9,7 @@ pub mod chunk;
 pub mod config;
 pub mod decide;
 pub mod fetch;
+pub mod health;
 pub mod ingest;
 pub mod merkle;
 pub mod net;

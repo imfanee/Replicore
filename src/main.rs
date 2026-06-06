@@ -70,6 +70,8 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
     let store = Store::open(&cfg.db_path, cfg.node_id).context("open state store")?;
     let suppress = Suppressor::new();
     let (events_tx, events_rx) = tokio::sync::mpsc::channel::<LocalEvent>(1024);
+    // Clone kept only so /healthz can gauge the queue depth.
+    let events_tx_gauge = events_tx.clone();
 
     // Remove staging temps orphaned by a previous kill -9, BEFORE anything
     // that could stage a new one is running (the sweep must never race a
@@ -139,10 +141,28 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         peers = cfg.peers.len(),
         "replicored starting"
     );
-    Engine::new(cfg, store, suppress, cas)
-        .run()
-        .await
-        .context("transport engine")
+    let engine = Engine::new(cfg.clone(), store.clone(), suppress, cas.clone());
+
+    // Health endpoint (FR-1102), if configured.
+    if let Some(addr) = cfg.health_listen {
+        let ctx = replicore::health::HealthCtx {
+            node_id: cfg.node_id,
+            stats: engine.stats(),
+            peers: engine.peer_registry(),
+            conns: engine.conn_registry(),
+            cas,
+            store,
+            configured_peers: cfg.peers.iter().map(|p| p.node_id).collect(),
+            events_tx: events_tx_gauge,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = replicore::health::serve(addr, ctx).await {
+                tracing::error!(error = %e, "health endpoint died");
+            }
+        });
+    }
+
+    engine.run().await.context("transport engine")
 }
 
 fn gen_cert(mut args: impl Iterator<Item = String>) -> Result<()> {
