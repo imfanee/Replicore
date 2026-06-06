@@ -5,9 +5,9 @@
 //!
 //! Why a MOUNT mark and FAN_CLOSE_WRITE: classic fd-style fanotify events do not
 //! report create/delete/rename — those require FID reporting (FAN_REPORT_FID /
-//! FAN_REPORT_DFID_NAME, kernel >= 5.1/5.9), which is the Phase 1 upgrade
-//! (FR-102). For write-once IVR recordings, close-after-write is exactly the
-//! signal we want, so M0 leans on it deliberately.
+//! FAN_REPORT_DFID_NAME, kernel >= 5.1/5.9). // SEAM(M2): FID watcher (FR-102).
+//! In M1 the periodic scanner is the authoritative source for deletes and
+//! missed events (FR-103/104); this watcher is the low-latency write path.
 //!
 //! Requires CAP_SYS_ADMIN. Runs a blocking read loop; call it on its own thread.
 
@@ -17,9 +17,10 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
+use crate::ingest::LocalEvent;
 use crate::TMP_SUFFIX;
 
-pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<PathBuf>) -> Result<()> {
+pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<LocalEvent>) -> Result<()> {
     // Initialize fanotify in notification class; events carry an fd to the object.
     let fan = unsafe {
         libc::fanotify_init(
@@ -49,7 +50,7 @@ pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<PathBuf>) -> Result<()> {
         return Err(std::io::Error::last_os_error()).context("fanotify_mark failed");
     }
 
-    eprintln!("[watch] fanotify armed on mount of {}", dir.display());
+    tracing::info!(dir = %dir.display(), "fanotify armed on mount");
 
     let mut buf = [0u8; 8192];
     loop {
@@ -82,7 +83,7 @@ pub fn run(dir: &Path, tx: tokio::sync::mpsc::Sender<PathBuf>) -> Result<()> {
                     if path.starts_with(dir) && !is_tmp(&path) {
                         // blocking_send applies backpressure (FR-1106) onto the
                         // kernel read loop, which is the behavior we want.
-                        if tx.blocking_send(path).is_err() {
+                        if tx.blocking_send(LocalEvent::Write(path)).is_err() {
                             unsafe { libc::close(meta.fd) };
                             unsafe { libc::close(fan) };
                             return Ok(()); // receiver gone; shut down

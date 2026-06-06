@@ -7,10 +7,12 @@
 pub mod apply;
 pub mod config;
 pub mod decide;
+pub mod ingest;
 pub mod net;
 pub mod oplog;
 pub mod proto;
 pub mod replica;
+pub mod scanner;
 pub mod state;
 pub mod suppress;
 pub mod vv;
