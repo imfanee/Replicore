@@ -1,0 +1,26 @@
+# replicore.example.toml — declarative node configuration (FR-1201).
+#
+# One file per node. Generate each node's identity first:
+#   replicored gen-cert --out-dir /etc/replicore --name node-a
+# then pin the printed fingerprint in every peer's [[peers]] entry.
+#
+# Keep db_path/cert_path/key_path OUTSIDE share_dir — config load rejects
+# them inside (they would be watched, hashed every scan, and replicated).
+
+node_id   = "000102030405060708090a0b0c0d0e0f"  # 16 bytes, hex; stable forever
+listen    = "10.123.0.1:7000"                   # QUIC/UDP
+share_dir = "/srv/replicore/a"                  # the replicated tree
+db_path   = "/var/lib/replicore/a.db"           # WAL-backed op-log + index
+cert_path = "/etc/replicore/node-a.cert.pem"
+key_path  = "/etc/replicore/node-a.key.pem"
+
+# Optional tuning (defaults shown):
+# quiesce_ms         = 300    # per-path settle window before a write becomes an op (FR-105)
+# scan_interval_secs = 5      # authoritative rescan cadence (FR-103)
+# max_file_bytes     = 67108864  # whole-file transfer cap; chunking is M2 (FR-402)
+
+[[peers]]
+node_id     = "101112131415161718191a1b1c1d1e1f"
+addr        = "10.123.0.2:7000"
+# SHA-256 of the peer's certificate DER, as printed by its gen-cert (FR-1002):
+fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"

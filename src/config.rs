@@ -43,6 +43,8 @@ pub enum ConfigError {
     DuplicateNode(String),
     #[error("share_dir is not an existing directory: {0}")]
     BadShareDir(PathBuf),
+    #[error("{what} must not live inside share_dir (it would be watched, hashed every scan, and replicated): {path}")]
+    PathInsideShare { what: &'static str, path: PathBuf },
 }
 
 /// Validated runtime configuration.
@@ -181,6 +183,22 @@ impl Config {
                 path: cfg.share_dir.clone(),
                 source,
             })?;
+        // The state db, cert, and key must not live inside the share: they
+        // would be scanned, hashed every cycle, and replicated to peers
+        // (the key!). Fail fast (FR-1202).
+        for (what, path) in [
+            ("db_path", &cfg.db_path),
+            ("cert_path", &cfg.cert_path),
+            ("key_path", &cfg.key_path),
+        ] {
+            let effective = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if effective.starts_with(&cfg.share_dir) {
+                return Err(ConfigError::PathInsideShare {
+                    what,
+                    path: path.clone(),
+                });
+            }
+        }
         Ok(cfg)
     }
 
@@ -267,6 +285,33 @@ mod tests {
         assert!(matches!(
             Config::from_toml_str(&text),
             Err(ConfigError::Toml(_))
+        ));
+    }
+
+    #[test]
+    fn load_rejects_db_inside_share() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("share");
+        std::fs::create_dir_all(&share).unwrap();
+        let text = format!(
+            r#"
+            node_id   = "000102030405060708090a0b0c0d0e0f"
+            listen    = "10.0.0.1:7000"
+            share_dir = "{share}"
+            db_path   = "{share}/state.db"
+            cert_path = "/etc/replicore/a.cert.pem"
+            key_path  = "/etc/replicore/a.key.pem"
+            "#,
+            share = share.display()
+        );
+        let cfg_path = dir.path().join("replicore.toml");
+        std::fs::write(&cfg_path, text).unwrap();
+        assert!(matches!(
+            Config::load(&cfg_path),
+            Err(ConfigError::PathInsideShare {
+                what: "db_path",
+                ..
+            })
         ));
     }
 
