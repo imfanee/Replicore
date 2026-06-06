@@ -37,6 +37,14 @@ pub enum Decision {
     /// recording that the op was seen so it is never re-fetched.
     /// TODO(M3): deterministic winner + conflict copy (FR-303/304).
     Concurrent,
+    /// The engine could not materialize the op for a PERMANENT reason
+    /// (hostile path, missing/unfetchable/corrupt content, oversized): the op
+    /// is durably recorded as handled WITHOUT touching the file index, so the
+    /// stream advances instead of reconnect-looping on a poison op. The
+    /// local VV is left behind the origin's, so a later superseding op (or
+    /// M2 anti-entropy) repairs the path. Never returned by [`decide`] —
+    /// only the engine downgrades Apply to this.
+    Quarantined,
 }
 
 /// Decide the fate of a remote op carrying `remote_vv` for a path whose local

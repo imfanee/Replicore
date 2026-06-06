@@ -480,9 +480,11 @@ fn apply_remote(
                 OpType::Delete => state::upsert_file(&tx, &op.path, None, op.mode, 0, &vv, true)?,
             }
         }
-        // Decision::Ignore / ::Concurrent: the op is recorded (oplog +
-        // applied + cursor) but files is untouched — the skip *decision*
-        // is what's durable, so restart never re-fetches the op.
+        // Decision::Ignore / ::Concurrent / ::Quarantined: the op is recorded
+        // (oplog + applied + cursor) but files is untouched — the skip
+        // *decision* is what's durable, so restart never re-fetches the op.
+        // Quarantined ops leave the local VV behind the origin's, which is
+        // exactly what lets a later superseding op apply normally.
         tx.execute(
             "INSERT OR IGNORE INTO applied (op_id) VALUES (?1)",
             [op.op_id.as_slice()],

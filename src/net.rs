@@ -29,6 +29,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -417,8 +418,14 @@ impl Engine {
             "peer subscribed to our ops"
         );
 
-        let push = self.push_ops(ctl_send, resume_from);
-        let acks = self.absorb_acks(ctl_recv, peer.node_id);
+        // The pushed frontier: highest origin_seq actually streamed on THIS
+        // connection. Acks are validated against it — a peer must not be able
+        // to ack ops it was never sent (last_acked_seq feeds tombstone GC in
+        // M2; an inflated ack there means premature GC and resurrection risk).
+        let sent_frontier = Arc::new(AtomicI64::new(resume_from));
+
+        let push = self.push_ops(ctl_send, resume_from, sent_frontier.clone());
+        let acks = self.absorb_acks(ctl_recv, peer.node_id, sent_frontier);
         let fetches = self.serve_fetches(conn.clone());
         tokio::select! {
             r = push => r,
@@ -433,6 +440,7 @@ impl Engine {
         &self,
         mut ctl_send: quinn::SendStream,
         resume_from: i64,
+        sent_frontier: Arc<AtomicI64>,
     ) -> Result<(), NetError> {
         let mut latest = self.store.watch_latest();
         let mut cursor = resume_from;
@@ -451,6 +459,9 @@ impl Engine {
             for op in ops {
                 cursor = op.origin_seq;
                 write_msg(&mut ctl_send, &Frame::OplogPush(op)).await?;
+                // Publish after the frame is written: an honest ack can only
+                // arrive after the peer received it, i.e. after this store.
+                sent_frontier.store(cursor, Ordering::Release);
             }
         }
     }
@@ -461,10 +472,18 @@ impl Engine {
         &self,
         mut ctl_recv: quinn::RecvStream,
         peer: NodeId,
+        sent_frontier: Arc<AtomicI64>,
     ) -> Result<(), NetError> {
         loop {
             match read_msg::<_, Frame>(&mut ctl_recv).await {
                 Ok(Frame::OplogAck { up_to_seq }) => {
+                    // Never trust network input: an ack is only meaningful up
+                    // to what we pushed on this connection. Beyond that is a
+                    // lying or broken peer — drop it rather than let it
+                    // inflate last_acked_seq.
+                    if up_to_seq > sent_frontier.load(Ordering::Acquire) {
+                        return Err(NetError::Violation("ack beyond the pushed frontier"));
+                    }
                     self.store.advance_ack(peer, up_to_seq).await?;
                 }
                 Ok(Frame::Ping { nonce: _ }) => {} // QUIC keep-alive covers liveness; tolerate
@@ -642,41 +661,29 @@ impl Engine {
             return Ok(()); // redelivery after a crash: just re-ack
         }
         let local = self.store.load_file(&op.path).await?;
-        let decision = decide(local.as_ref(), &op.vv);
+        let mut decision = decide(local.as_ref(), &op.vv);
         if decision == Decision::Apply {
-            match op.op_type {
-                OpType::Write => {
-                    let hash = op
-                        .content_hash
-                        .ok_or(NetError::Violation("write op without content hash"))?;
-                    // Transfer only what we lack (FR-401): skip the fetch when
-                    // the live local content already matches.
-                    let have = local
-                        .as_ref()
-                        .is_some_and(|l| !l.tombstone && l.content_hash == Some(hash));
-                    if !have {
-                        if op.size > self.cfg.max_file_bytes {
-                            return Err(NetError::TooBig);
-                        }
-                        let data = fetch_bytes(conn, hash, self.cfg.max_file_bytes).await?;
-                        let share = self.cfg.share_dir.clone();
-                        let rel = op.path.clone();
-                        let mode = op.mode;
-                        let suppress = self.suppress.clone();
-                        // fsync-heavy: keep it off the async runtime.
-                        tokio::task::spawn_blocking(move || {
-                            apply_write(&share, &rel, mode, &hash, &data, &suppress)
-                        })
-                        .await??;
-                    }
+            match self.materialize(conn, &op, local.as_ref()).await {
+                Ok(()) => {}
+                // PERMANENT failure: retrying this op can never succeed, and
+                // erroring out would reconnect-loop the whole subscription on
+                // one poison op (a pinned-peer DoS) — or, in the honest case,
+                // stall behind content the origin has since overwritten while
+                // the superseding op waits right behind it. Quarantine: record
+                // durably as handled-without-apply and let the stream advance.
+                Err(e) if is_permanent(&e) => {
+                    tracing::error!(
+                        path = %op.path,
+                        origin = %hex::encode(&op.origin[..4]),
+                        seq = op.origin_seq,
+                        error = %e,
+                        "op cannot be materialized; quarantining (a superseding op or rescan repairs)"
+                    );
+                    decision = Decision::Quarantined;
                 }
-                OpType::Delete => {
-                    let share = self.cfg.share_dir.clone();
-                    let rel = op.path.clone();
-                    let suppress = self.suppress.clone();
-                    tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress))
-                        .await??;
-                }
+                // Transient (I/O, stream, store): drop the connection; the
+                // dial loop reconnects and resumes from the durable cursor.
+                Err(e) => return Err(e),
             }
         }
         if decision == Decision::Concurrent {
@@ -690,6 +697,48 @@ impl Engine {
         }
         // THE durability point (fsynced WAL commit). Ack happens after.
         self.store.apply_remote(op, decision).await?;
+        Ok(())
+    }
+
+    /// Execute the filesystem side of a `Decision::Apply`.
+    async fn materialize(
+        &self,
+        conn: &quinn::Connection,
+        op: &OpRecord,
+        local: Option<&crate::decide::LocalFile>,
+    ) -> Result<(), NetError> {
+        match op.op_type {
+            OpType::Write => {
+                let hash = op
+                    .content_hash
+                    .ok_or(NetError::Violation("write op without content hash"))?;
+                // Transfer only what we lack (FR-401): skip the fetch when
+                // the live local content already matches.
+                let have = local.is_some_and(|l| !l.tombstone && l.content_hash == Some(hash));
+                if !have {
+                    if op.size > self.cfg.max_file_bytes {
+                        return Err(NetError::TooBig);
+                    }
+                    let data = fetch_bytes(conn, hash, self.cfg.max_file_bytes).await?;
+                    let share = self.cfg.share_dir.clone();
+                    let rel = op.path.clone();
+                    let mode = op.mode;
+                    let suppress = self.suppress.clone();
+                    // fsync-heavy: keep it off the async runtime.
+                    tokio::task::spawn_blocking(move || {
+                        apply_write(&share, &rel, mode, &hash, &data, &suppress)
+                    })
+                    .await??;
+                }
+            }
+            OpType::Delete => {
+                let share = self.cfg.share_dir.clone();
+                let rel = op.path.clone();
+                let suppress = self.suppress.clone();
+                tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress))
+                    .await??;
+            }
+        }
         Ok(())
     }
 
@@ -711,6 +760,25 @@ impl Engine {
             .peer_by_fingerprint(&fp)
             .cloned()
             .ok_or(NetError::UnknownPeer)
+    }
+}
+
+/// Would retrying this op ever succeed? `true` = quarantine it (record as
+/// handled, advance the stream); `false` = transient, drop the connection and
+/// let the dial loop resume from the durable cursor.
+fn is_permanent(e: &NetError) -> bool {
+    match e {
+        // Malformed/hostile op fields, or bytes that can never verify.
+        NetError::Violation(_) => true,
+        // The origin no longer holds this content — a superseding op for the
+        // path is behind it in the stream (or M2 anti-entropy repairs).
+        NetError::ContentUnavailable => true,
+        // Exceeds OUR configured cap; redelivery cannot shrink it.
+        NetError::TooBig => true,
+        // Path escapes are rejected per CLAUDE.md invariant 5, permanently.
+        NetError::Apply(ApplyError::UnsafePath(_)) => true,
+        // Everything else (I/O, store, stream, join) is worth a retry.
+        _ => false,
     }
 }
 
@@ -876,6 +944,183 @@ mod tests {
         }
 
         accept.abort();
+    }
+
+    #[tokio::test]
+    async fn poison_op_is_quarantined_and_stream_advances() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_b = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const B: NodeId = [0xb; 16];
+
+        // Full inbound handling on A (push + acks + fetch serving).
+        let engine_a = engine_on(
+            dir_a.path(),
+            A,
+            &id_a,
+            vec![(B, "127.0.0.1:1".parse().unwrap(), id_b.fingerprint)],
+        );
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+        tokio::spawn({
+            let engine = engine_a.clone();
+            async move {
+                while let Some(incoming) = ep_a.accept().await {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        let _ = engine.handle_inbound(incoming).await;
+                    });
+                }
+            }
+        });
+
+        // Op 1 is poison: the path escapes the share AND its content is not
+        // fetchable. Op 2 is a normal write queued right behind it — the
+        // liveness property under test is that op 2 still arrives.
+        use crate::oplog::LocalChange;
+        engine_a
+            .store
+            .append_local(LocalChange {
+                path: "../evil".into(),
+                op_type: OpType::Write,
+                mode: 0o644,
+                size: 6,
+                content_hash: Some(*blake3::hash(b"poison").as_bytes()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(dir_a.path().join("good.txt"), b"fine").unwrap();
+        engine_a
+            .store
+            .append_local(LocalChange {
+                path: "good.txt".into(),
+                op_type: OpType::Write,
+                mode: 0o644,
+                size: 4,
+                content_hash: Some(*blake3::hash(b"fine").as_bytes()),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // B subscribes for real.
+        let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_b = engine_b.build_endpoint().unwrap();
+        let peer_a = engine_b.cfg.peers[0].clone();
+        tokio::spawn({
+            let engine = engine_b.clone();
+            async move {
+                let mut backoff = RECONNECT_MIN;
+                let _ = engine.subscribe_once(&ep_b, &peer_a, &mut backoff).await;
+            }
+        });
+
+        // The good op behind the poison op must land.
+        let mut applied = false;
+        for _ in 0..200 {
+            if engine_b
+                .store
+                .load_file("good.txt")
+                .await
+                .unwrap()
+                .is_some_and(|l| !l.tombstone)
+            {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(applied, "stream stalled behind the poison op");
+        assert_eq!(
+            std::fs::read(dir_b.path().join("good.txt")).unwrap(),
+            b"fine"
+        );
+
+        // The poison op was durably quarantined: handled, cursor advanced
+        // past it, no file index entry materialized, nothing escaped the
+        // share root.
+        assert!(engine_b
+            .store
+            .has_applied(crate::proto::op_id(&A, 1))
+            .await
+            .unwrap());
+        assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 2);
+        assert!(engine_b.store.load_file("../evil").await.unwrap().is_none());
+        assert!(!dir_b.path().parent().unwrap().join("evil").exists());
+
+        // Positive ack-frontier case: legitimate acks still advance.
+        let mut acked = false;
+        for _ in 0..200 {
+            if engine_a.store.last_acked(B).await.unwrap() == 2 {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(acked, "legitimate acks did not advance last_acked_seq");
+    }
+
+    #[tokio::test]
+    async fn ack_beyond_pushed_frontier_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_b = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const B: NodeId = [0xb; 16];
+
+        let engine_a = engine_on(
+            dir.path(),
+            A,
+            &id_a,
+            vec![(B, "127.0.0.1:1".parse().unwrap(), id_b.fingerprint)],
+        );
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn({
+            let engine = engine_a.clone();
+            async move {
+                while let Some(incoming) = ep_a.accept().await {
+                    let engine = engine.clone();
+                    let tx = res_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(engine.handle_inbound(incoming).await).await;
+                    });
+                }
+            }
+        });
+
+        // A pinned-but-lying peer: valid handshake, then an ack for ops it
+        // was never sent (A's oplog is empty; frontier == resume_from == 0).
+        let engine_b = engine_on(dir.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_b = engine_b.build_endpoint().unwrap();
+        let conn = ep_b.connect(addr_a, "replicore").unwrap().await.unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        write_msg(
+            &mut send,
+            &Frame::Hello {
+                proto_version: PROTO_VERSION,
+                node_id: B,
+                resume_from: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let _hello_ack: Frame = read_msg(&mut recv).await.unwrap();
+        write_msg(&mut send, &Frame::OplogAck { up_to_seq: 999_999 })
+            .await
+            .unwrap();
+
+        let result = res_rx.recv().await.unwrap();
+        assert!(
+            matches!(&result, Err(NetError::Violation(m)) if m.contains("frontier")),
+            "expected frontier violation, got {result:?}"
+        );
+        // The inflated ack must not have been persisted.
+        assert_eq!(engine_a.store.last_acked(B).await.unwrap(), 0);
     }
 
     #[tokio::test]
