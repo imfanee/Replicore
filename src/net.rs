@@ -2692,4 +2692,60 @@ mod tests {
 
         accept.abort();
     }
+
+    /// Item 4 / NFR-CP1: `status --all` never hangs. A peer that is connected but
+    /// unresponsive (partitioned mid-query — it answers the QUIC handshake but
+    /// never the CTLQUERY stream) is marked unreachable after the per-peer 3s
+    /// timeout, and the whole call returns promptly.
+    #[tokio::test]
+    async fn status_all_fanout_times_out_on_unresponsive_peer() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_s = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const S: NodeId = [0x5; 16];
+
+        // S: a "silent" peer — accepts the connection but NEVER serves streams.
+        let engine_s = engine_on(
+            dir.path(),
+            S,
+            &id_s,
+            vec![(A, "127.0.0.1:1".parse().unwrap(), id_a.fingerprint)],
+        );
+        let ep_s = engine_s.build_endpoint().unwrap();
+        let addr_s = ep_s.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = ep_s.accept().await {
+                if let Ok(conn) = incoming.await {
+                    held.push(conn); // keep alive; never accept_bi / serve
+                }
+            }
+        });
+
+        // A pins S; connect (handshake succeeds) and register the conn as if a
+        // subscription had established it.
+        let engine_a = engine_on(dir.path(), A, &id_a, vec![(S, addr_s, id_s.fingerprint)]);
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let conn = ep_a.connect(addr_s, "replicore").unwrap().await.unwrap();
+        engine_a.conn_registry().insert(S, conn);
+
+        // The fan-out must return within the timeout (3s) + slack, with S
+        // marked unreachable — not hang on the silent peer.
+        let start = std::time::Instant::now();
+        let report = engine_a.status_report(true).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "status --all hung on an unresponsive peer ({elapsed:?})"
+        );
+        assert_eq!(report.peers.len(), 1);
+        assert!(
+            !report.peers[0].reachable && report.peers[0].status.is_none(),
+            "silent peer was not marked unreachable: {:?}",
+            report.peers[0]
+        );
+
+        silent.abort();
+    }
 }

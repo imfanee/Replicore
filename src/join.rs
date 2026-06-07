@@ -78,6 +78,12 @@ impl Inner {
             .expected
             .iter()
             .all(|p| self.completed.contains(p) || self.unreachable.contains(p));
+        // Promote to Active when every expected peer has either completed its
+        // gate or is unreachable. INTENDED edge case (reachable-only rule): a
+        // fully-isolated node — no expected peers, or every one unreachable —
+        // promotes vacuously, because it HAS reconciled with everyone it can
+        // reach (no one). It still re-reconciles on each later reconnect, and
+        // promotion is monotonic, so this never masks a missed sync.
         let next = if self.expected.is_empty() || all_settled {
             Lifecycle::Active
         } else if !self.completed.is_empty() || !self.unreachable.is_empty() {
