@@ -129,6 +129,39 @@ enum StoreCmd {
         row: Box<ReconciledRow>,
         reply: oneshot::Sender<Result<Decision, StoreError>>,
     },
+    SnapshotForJoin {
+        reply: oneshot::Sender<Result<JoinSnapshot, StoreError>>,
+    },
+    AdvanceRecvCursor {
+        peer: NodeId,
+        origin: NodeId,
+        up_to_seq: i64,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+    GetMeta {
+        key: String,
+        reply: oneshot::Sender<Result<Option<String>, StoreError>>,
+    },
+    SetMeta {
+        key: String,
+        value: String,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
+}
+
+/// An atomic bootstrap snapshot for a joining/resuming subscriber (FR-1311).
+///
+/// `rows` is the full index and `frontier` is the per-origin maximum
+/// `origin_seq` present in the oplog. Because the store thread serializes every
+/// command, both are read in ONE handler with no interleaved append — so the
+/// snapshot provably covers exactly the ops with `origin_seq <= frontier[origin]`
+/// for each origin. Any op appended AFTER this snapshot is `> frontier` by
+/// construction and therefore rides the live stream exactly once (the whole
+/// no-loss/no-double-apply guarantee rests on this atomicity).
+#[derive(Clone, Debug)]
+pub struct JoinSnapshot {
+    pub rows: Vec<FileRow>,
+    pub frontier: Vec<(NodeId, i64)>,
 }
 
 /// Async handle to the store thread. Cheap to clone.
@@ -198,6 +231,12 @@ impl Store {
                recv_cursor    INTEGER NOT NULL DEFAULT 0,
                last_acked_seq INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY (peer, origin)
+             );
+             -- Small key/value store for daemon-owned scalars (e.g. the
+             -- node's join lifecycle). String values keep migrations trivial.
+             CREATE TABLE IF NOT EXISTS meta (
+               key   TEXT PRIMARY KEY,
+               value TEXT NOT NULL
              );",
         )?;
 
@@ -384,6 +423,45 @@ impl Store {
         })
         .await
     }
+
+    /// Atomic (index rows, per-origin op frontier) for a join bootstrap.
+    /// See [`JoinSnapshot`] — the atomicity is the whole correctness argument.
+    pub async fn snapshot_for_join(&self) -> Result<JoinSnapshot, StoreError> {
+        self.call(|reply| StoreCmd::SnapshotForJoin { reply }).await
+    }
+
+    /// Durably advance our cursor of `origin`'s ops as seen via `peer` to
+    /// `up_to_seq` (monotonic MAX). Called after a reconcile bootstrap so the
+    /// subsequent live subscription resumes strictly past the snapshot frontier
+    /// instead of re-streaming the bootstrapped history (FR-1311).
+    pub async fn advance_recv_cursor(
+        &self,
+        peer: NodeId,
+        origin: NodeId,
+        up_to_seq: i64,
+    ) -> Result<(), StoreError> {
+        self.call(|reply| StoreCmd::AdvanceRecvCursor {
+            peer,
+            origin,
+            up_to_seq,
+            reply,
+        })
+        .await
+    }
+
+    /// Read a daemon-owned scalar (e.g. join lifecycle).
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let key = key.to_string();
+        self.call(|reply| StoreCmd::GetMeta { key, reply }).await
+    }
+
+    /// Persist a daemon-owned scalar (durable before returning).
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.call(|reply| StoreCmd::SetMeta { key, value, reply })
+            .await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +529,23 @@ fn run_store(
             }
             StoreCmd::ReconcileUpsert { row, reply } => {
                 let _ = reply.send(reconcile_upsert(&mut conn, &row));
+            }
+            StoreCmd::SnapshotForJoin { reply } => {
+                let _ = reply.send(snapshot_for_join(&conn));
+            }
+            StoreCmd::AdvanceRecvCursor {
+                peer,
+                origin,
+                up_to_seq,
+                reply,
+            } => {
+                let _ = reply.send(advance_recv_cursor(&conn, &peer, &origin, up_to_seq));
+            }
+            StoreCmd::GetMeta { key, reply } => {
+                let _ = reply.send(get_meta(&conn, &key));
+            }
+            StoreCmd::SetMeta { key, value, reply } => {
+                let _ = reply.send(set_meta(&conn, &key, &value));
             }
             StoreCmd::LiveFiles { reply } => {
                 let _ = reply.send(state::live_files(&conn));
@@ -787,6 +882,62 @@ fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decisi
 
 fn op_count(conn: &Connection) -> Result<i64, StoreError> {
     Ok(conn.query_row("SELECT COUNT(*) FROM oplog", [], |row| row.get(0))?)
+}
+
+/// One store-thread turn: the full index plus the per-origin op frontier. No
+/// transaction is needed for a consistent read — the store thread runs exactly
+/// one command at a time, so no append can interleave between these two queries.
+/// See [`JoinSnapshot`].
+fn snapshot_for_join(conn: &Connection) -> Result<JoinSnapshot, StoreError> {
+    let rows = state::all_files(conn)?;
+    let mut stmt = conn.prepare("SELECT origin, MAX(origin_seq) FROM oplog GROUP BY origin")?;
+    let mapped = stmt.query_map([], |row| {
+        Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut frontier = Vec::new();
+    for r in mapped {
+        let (origin_b, max_seq) = r?;
+        let origin: NodeId = origin_b
+            .try_into()
+            .map_err(|_| StoreError::Corrupt("oplog.origin"))?;
+        frontier.push((origin, max_seq));
+    }
+    Ok(JoinSnapshot { rows, frontier })
+}
+
+/// Monotonic advance of recv_cursor at (peer, origin). Mirrors the cursor bump
+/// inside `apply_remote`, but for the post-reconcile join handoff rather than a
+/// live op.
+fn advance_recv_cursor(
+    conn: &Connection,
+    peer: &NodeId,
+    origin: &NodeId,
+    up_to_seq: i64,
+) -> Result<(), StoreError> {
+    ensure_cursor_row(conn, peer, origin)?;
+    conn.execute(
+        "UPDATE peer_cursors SET recv_cursor = MAX(recv_cursor, ?1)
+         WHERE peer = ?2 AND origin = ?3",
+        params![up_to_seq, peer.as_slice(), origin.as_slice()],
+    )?;
+    Ok(())
+}
+
+fn get_meta(conn: &Connection, key: &str) -> Result<Option<String>, StoreError> {
+    Ok(conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()?)
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<(), StoreError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1228,6 +1379,86 @@ mod tests {
         // recv cursor of B's ops migrated to (B, B); B's acks of OUR ops to (B, A).
         assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 9);
         assert_eq!(store.last_acked(NODE_B).await.unwrap(), 7);
+    }
+
+    #[tokio::test]
+    async fn snapshot_for_join_is_atomic_and_next_op_exceeds_frontier() {
+        let store = mem_store(NODE_A);
+        // Two local ops and one remote op from B.
+        store
+            .append_local(write_change("a", [1; 32]))
+            .await
+            .unwrap();
+        store
+            .append_local(write_change("b", [2; 32]))
+            .await
+            .unwrap();
+        let remote = OpRecord {
+            op_id: op_id(&NODE_B, 5),
+            origin: NODE_B,
+            origin_seq: 5,
+            op_type: OpType::Write,
+            path: "c".into(),
+            mode: 0o644,
+            size: 1,
+            content_hash: Some([3; 32]),
+            vv: [(NODE_B, 1u64)].into_iter().collect(),
+        };
+        store.apply_remote(remote, Decision::Apply).await.unwrap();
+
+        let snap = store.snapshot_for_join().await.unwrap();
+        // Frontier is the per-origin max; rows cover exactly what it bounds.
+        let mut frontier = snap.frontier.clone();
+        frontier.sort();
+        assert_eq!(frontier, vec![(NODE_A, 2), (NODE_B, 5)]);
+        assert_eq!(snap.rows.len(), 3);
+
+        // The whole point: any op appended AFTER the snapshot is strictly above
+        // the frontier it advertised — so it rides the live stream once, never
+        // double-applied against the bootstrap (FR-1311).
+        let next = store
+            .append_local(write_change("d", [4; 32]))
+            .await
+            .unwrap()
+            .unwrap();
+        let a_frontier = snap.frontier.iter().find(|(o, _)| *o == NODE_A).unwrap().1;
+        assert!(
+            next.origin_seq > a_frontier,
+            "next op did not exceed frontier"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_recv_cursor_is_monotonic() {
+        let store = mem_store(NODE_A);
+        store.advance_recv_cursor(NODE_B, NODE_B, 7).await.unwrap();
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 7);
+        // A stale bootstrap frontier must never rewind a further-along cursor.
+        store.advance_recv_cursor(NODE_B, NODE_B, 3).await.unwrap();
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 7);
+        store.advance_recv_cursor(NODE_B, NODE_B, 9).await.unwrap();
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 9);
+    }
+
+    #[tokio::test]
+    async fn meta_round_trips_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("m.db");
+        {
+            let store = Store::open(&db, NODE_A).unwrap();
+            assert_eq!(store.get_meta("k").await.unwrap(), None);
+            store.set_meta("k", "active").await.unwrap();
+            store.set_meta("k", "syncing").await.unwrap(); // upsert
+            assert_eq!(
+                store.get_meta("k").await.unwrap().as_deref(),
+                Some("syncing")
+            );
+        }
+        let store = Store::open(&db, NODE_A).unwrap();
+        assert_eq!(
+            store.get_meta("k").await.unwrap().as_deref(),
+            Some("syncing")
+        );
     }
 
     #[tokio::test]

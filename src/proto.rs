@@ -16,13 +16,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::vv::{NodeId, VersionVector};
 
 /// Negotiated in `Hello`; mismatch closes the connection cleanly (FR-504).
-/// M2 is a flag-day bump (chunked data plane, frontier Hello, per-origin
-/// acks, reconcile sessions): v1 peers are refused. The mesh ships as a unit.
-pub const PROTO_VERSION: u16 = 2;
+/// M2.5 is a flag-day bump (join frontier): `RootIs` now carries the snapshot's
+/// per-origin op frontier and `SubscribeOps` carries the post-reconcile resume
+/// map, so the responder streams live ops strictly past what the bootstrap
+/// covered. v2 peers are refused. The mesh ships as a unit.
+pub const PROTO_VERSION: u16 = 3;
 
 /// ALPN identifier for every QUIC connection. Bumped with PROTO_VERSION so a
 /// stale binary fails at the TLS layer, not mid-protocol.
-pub const ALPN: &[u8] = b"replicore/2";
+pub const ALPN: &[u8] = b"replicore/3";
 
 /// Hard cap for one control/fetch-header frame. Ops are small (path + vv);
 /// anything near this size is hostile or a bug.
@@ -93,10 +95,16 @@ pub enum Frame {
         origin: NodeId,
         up_to_seq: i64,
     },
-    /// Reconcile gate (FR-702): the dialer sends this after its anti-entropy
-    /// session with the listener completes; the listener pushes NO ops before
-    /// receiving it. A restarted node never trusts the live stream unreconciled.
-    SubscribeOps,
+    /// Reconcile gate (FR-702) + join handoff (FR-1311): the dialer sends this
+    /// after its anti-entropy session completes; the listener pushes NO ops
+    /// before receiving it. `resume` is the dialer's cursor frontier AFTER the
+    /// reconcile bootstrap (`max(durable cursor, snapshot frontier)`) — the
+    /// listener streams ops with `origin_seq > resume[its origin]`, so the
+    /// bootstrapped history is never re-sent. This — not the pre-gate `Hello` —
+    /// is the authority for where the live stream resumes.
+    SubscribeOps {
+        resume: Vec<(NodeId, i64)>,
+    },
     Ping {
         nonce: u64,
     },
@@ -177,6 +185,12 @@ pub enum ReconcileFrame {
     Begin,
     RootIs {
         hash: [u8; 32],
+        /// The per-origin maximum `origin_seq` covered by the snapshot tree the
+        /// responder is serving (FR-1311). The puller advances its recv cursor
+        /// to this after a successful pull, so the live stream resumes strictly
+        /// past the bootstrap. Captured atomically with the tree (one store
+        /// turn) — see [`crate::oplog::JoinSnapshot`].
+        frontier: Vec<(NodeId, i64)>,
     },
     /// Paginated children of a directory node, sorted by name, strictly after
     /// `after_name` (empty = from the start).
@@ -300,7 +314,9 @@ mod tests {
                 origin: [2u8; 16],
                 up_to_seq: 42,
             },
-            Frame::SubscribeOps,
+            Frame::SubscribeOps {
+                resume: vec![([2u8; 16], 17), ([3u8; 16], 0)],
+            },
             Frame::Ping { nonce: 7 },
         ];
         for f in &frames {
@@ -380,7 +396,10 @@ mod tests {
 
         let frames = vec![
             ReconcileFrame::Begin,
-            ReconcileFrame::RootIs { hash: [7; 32] },
+            ReconcileFrame::RootIs {
+                hash: [7; 32],
+                frontier: vec![([7u8; 16], 42), ([8u8; 16], 0)],
+            },
             ReconcileFrame::TreeReq {
                 prefix: "a/b".into(),
                 after_name: "c".into(),

@@ -316,6 +316,8 @@ pub struct Engine {
     stats: Arc<Stats>,
     /// Engine-wide bound on concurrent file transfers (FR-1106).
     transfers: Arc<tokio::sync::Semaphore>,
+    /// Node join lifecycle (FR-1311): Joining → Syncing → Active.
+    join: crate::join::JoinTracker,
 }
 
 impl Engine {
@@ -323,6 +325,8 @@ impl Engine {
         let transfers = Arc::new(tokio::sync::Semaphore::new(
             cfg.max_concurrent_transfers.max(1),
         ));
+        let join =
+            crate::join::JoinTracker::new(store.clone(), cfg.peers.iter().map(|p| p.node_id));
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
@@ -332,7 +336,13 @@ impl Engine {
             peers_reg: PeerRegistry::new(),
             stats: Arc::new(Stats::default()),
             transfers,
+            join,
         })
+    }
+
+    /// The node's join lifecycle handle (status/gossip surface it).
+    pub fn join_tracker(&self) -> crate::join::JoinTracker {
+        self.join.clone()
     }
 
     /// Build the dual-role endpoint: server config (require + pin client
@@ -387,6 +397,9 @@ impl Engine {
 
     /// Run the transport forever: accept loop + one dial loop per peer.
     pub async fn run(self: Arc<Engine>) -> Result<(), NetError> {
+        // A node that was Active before a restart resumes Active (it will still
+        // re-reconcile on each reconnect — that never regresses it).
+        self.join.restore().await;
         let endpoint = self.build_endpoint()?;
         for peer in self.cfg.peers.clone() {
             let engine = self.clone();
@@ -434,11 +447,11 @@ impl Engine {
     ) -> Result<(), NetError> {
         // The dialer opens the control stream and speaks first.
         let (mut ctl_send, mut ctl_recv) = conn.accept_bi().await?;
-        let resume_from = match read_msg::<_, Frame>(&mut ctl_recv).await? {
+        match read_msg::<_, Frame>(&mut ctl_recv).await? {
             Frame::Hello {
                 proto_version,
                 node_id,
-                resume,
+                resume: _, // resume is now authoritative in SubscribeOps, post-reconcile
             } => {
                 if proto_version != PROTO_VERSION {
                     return Err(NetError::Version(proto_version));
@@ -449,13 +462,6 @@ impl Engine {
                 if node_id != peer.node_id {
                     return Err(NetError::PeerIdentityMismatch);
                 }
-                // M2 full mesh: we push only our own ops, so only our entry
-                // of the frontier map matters. The rest is the relay seam.
-                resume
-                    .iter()
-                    .find(|(origin, _)| origin == &self.cfg.node_id)
-                    .map(|(_, cursor)| *cursor)
-                    .unwrap_or(0)
             }
             _ => return Err(NetError::Violation("expected Hello")),
         };
@@ -469,14 +475,23 @@ impl Engine {
         .await?;
         // THE responder side of the anti-entropy gate (FR-702): serve
         // ephemeral streams NOW — the dialer's gating reconcile session
-        // arrives on one — but push NO ops until SubscribeOps.
-        {
+        // arrives on one — but push NO ops until SubscribeOps. The resume
+        // point comes from SubscribeOps (after the dialer reconciled), so the
+        // bootstrapped history is never re-streamed (FR-1311). We push only our
+        // own ops, so only our entry of the frontier map matters.
+        let resume_from = {
             let serve = self.serve_streams(conn.clone());
             tokio::pin!(serve);
             let gate = async {
                 loop {
                     match read_msg::<_, Frame>(&mut ctl_recv).await {
-                        Ok(Frame::SubscribeOps) => return Ok(()),
+                        Ok(Frame::SubscribeOps { resume }) => {
+                            return Ok(resume
+                                .iter()
+                                .find(|(origin, _)| origin == &self.cfg.node_id)
+                                .map(|(_, cursor)| *cursor)
+                                .unwrap_or(0));
+                        }
                         Ok(Frame::Ping { nonce: _ }) => {}
                         Ok(_) => {
                             return Err(NetError::Violation("control frame before SubscribeOps"))
@@ -492,7 +507,7 @@ impl Engine {
                 r = &mut serve => return r, // connection ended during the gate
                 g = gate => g?,
             }
-        }
+        };
         tracing::info!(
             peer = %hex::encode(&peer.node_id[..4]),
             resume_from,
@@ -629,12 +644,23 @@ impl Engine {
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
     ) -> Result<(), NetError> {
-        let rows = self.store.all_files().await?;
-        let tree = MerkleTree::build(rows);
+        // One atomic snapshot: the tree we serve AND the op frontier it covers
+        // are read in a single store turn, so the frontier we advertise in
+        // RootIs is exactly the boundary of what this tree reflects (FR-1311).
+        let snap = self.store.snapshot_for_join().await?;
+        let frontier = snap.frontier;
+        let tree = MerkleTree::build(snap.rows);
         loop {
             match read_msg::<_, ReconcileFrame>(&mut recv).await {
                 Ok(ReconcileFrame::Begin) => {
-                    write_msg(&mut send, &ReconcileFrame::RootIs { hash: tree.root() }).await?;
+                    write_msg(
+                        &mut send,
+                        &ReconcileFrame::RootIs {
+                            hash: tree.root(),
+                            frontier: frontier.clone(),
+                        },
+                    )
+                    .await?;
                 }
                 Ok(ReconcileFrame::TreeReq {
                     prefix,
@@ -761,6 +787,11 @@ impl Engine {
             match self.subscribe_once(&endpoint, &peer, &mut attempt).await {
                 Ok(()) => tracing::info!(addr = %peer.addr, "subscription closed; reconnecting"),
                 Err(e) => {
+                    // A peer we cannot complete a gate with is unreachable for
+                    // join-lifecycle purposes — it must not pin us in Syncing
+                    // forever (the reachable-only promotion rule, FR-1311). A
+                    // peer that already completed its gate stays counted.
+                    self.join.note_unreachable(peer.node_id).await;
                     tracing::warn!(addr = %peer.addr, error = %e, "subscription failed; reconnecting")
                 }
             }
@@ -855,8 +886,8 @@ impl Engine {
         // responder pushes nothing until it sees SubscribeOps.
         self.peers_reg
             .set_state(peer.node_id, PeerState::Reconciling);
-        match self.reconcile_with(conn, peer).await {
-            Ok(report) => {
+        let frontier = match self.reconcile_with(conn, peer).await {
+            Ok((report, frontier)) => {
                 self.peers_reg.note_reconcile(peer.node_id, true);
                 tracing::info!(
                     peer = %hex::encode(&peer.node_id[..4]),
@@ -866,17 +897,64 @@ impl Engine {
                     damaged = report.skipped_damaged,
                     "reconcile session complete"
                 );
+                frontier
             }
             Err(e) => {
                 self.peers_reg.note_reconcile(peer.node_id, false);
                 return Err(e);
             }
+        };
+
+        // Join handoff (FR-1311): the bootstrap above reflects the responder's
+        // ops up to `frontier`. Durably advance our cursor of the peer's ops to
+        // it (monotonic MAX, so a stale snapshot never rewinds a further-along
+        // live cursor) and resume the live stream strictly past it. The
+        // responder reads the resume from SubscribeOps, NOT the pre-gate Hello,
+        // so a fresh joiner (Hello cursor 0) does not re-stream all of history.
+        //
+        // Crash table — kill -9 the joiner at each point; every row is
+        // no-loss AND no-double-apply on the next session (which always begins
+        // with a fresh reconcile):
+        //   1. mid-pull               — cursor unadvanced; re-pull is cheap
+        //                               (Merkle prunes already-equal subtrees).
+        //   2. post-leaves/pre-cursor — bootstrapped rows are durable; cursor
+        //                               still 0, so the live stream would re-send
+        //                               ops ≤ frontier — but each is deduped by
+        //                               the `applied` table / Equal-VV Ignore.
+        //   3. post-cursor/pre-subscribe — cursor durably at frontier; next
+        //                               session resumes past it. No re-stream.
+        //   4. post-subscribe/pre-op  — same as 3; the responder simply restarts
+        //                               pushing from the resumed cursor.
+        //   5. post-op/pre-ack        — op is durably handled before the ack
+        //                               (apply_remote commits first); redelivery
+        //                               is an idempotent no-op (FR-802).
+        // Ops landing on the peer AFTER the snapshot are > frontier by
+        // construction, so they ride the live stream exactly once.
+        let peer_frontier = frontier
+            .iter()
+            .find(|(origin, _)| origin == &peer.node_id)
+            .map(|(_, seq)| *seq)
+            .unwrap_or(0);
+        let new_cursor = peer_frontier.max(resume_from);
+        if new_cursor > resume_from {
+            self.store
+                .advance_recv_cursor(peer.node_id, peer.node_id, new_cursor)
+                .await?;
         }
-        write_msg(&mut ctl_send, &Frame::SubscribeOps).await?;
+        write_msg(
+            &mut ctl_send,
+            &Frame::SubscribeOps {
+                resume: vec![(peer.node_id, new_cursor)],
+            },
+        )
+        .await?;
         self.peers_reg.set_state(peer.node_id, PeerState::Live);
+        // The directed pull gate for THIS link is complete — note it for join
+        // lifecycle promotion (FR-1310 bidirectional = the two directed gates).
+        self.join.note_gate_complete(peer.node_id).await;
         tracing::info!(
             peer = %hex::encode(&peer.node_id[..4]),
-            resume_from,
+            resume_from = new_cursor,
             "subscribed to peer ops"
         );
 
@@ -894,7 +972,7 @@ impl Engine {
                         return;
                     }
                     match engine.reconcile_with(&conn, &peer).await {
-                        Ok(report) => {
+                        Ok((report, _frontier)) => {
                             engine.peers_reg.note_reconcile(peer.node_id, true);
                             tracing::debug!(
                                 peer = %hex::encode(&peer.node_id[..4]),
@@ -1130,12 +1208,15 @@ impl Engine {
     }
 
     /// Run one pull-based anti-entropy session against `peer` over a fresh
-    /// tagged bi-stream on `conn` (FR-701/703).
+    /// tagged bi-stream on `conn` (FR-701/703). Returns the report and the
+    /// per-origin op frontier the responder's snapshot covered (FR-1311) — the
+    /// initial subscribe uses the frontier for the live-stream handoff;
+    /// periodic reconciles ignore it.
     async fn reconcile_with(
         &self,
         conn: &quinn::Connection,
         peer: &Peer,
-    ) -> Result<ReconcileReport, NetError> {
+    ) -> Result<(ReconcileReport, Vec<(NodeId, i64)>), NetError> {
         let rows = self.store.all_files().await?;
         let local = MerkleTree::build(rows);
         let (mut send, recv) = conn.open_bi().await?;
@@ -1145,6 +1226,7 @@ impl Engine {
             recv,
             engine: self,
             peer: peer.node_id,
+            frontier: Vec::new(),
         };
         let ctx = ReconcileCtx {
             store: &self.store,
@@ -1156,7 +1238,7 @@ impl Engine {
         let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
         let _ = transport.send.finish();
         Stats::inc(&self.stats.reconcile_runs);
-        Ok(report)
+        Ok((report, transport.frontier))
     }
 
     // -- helpers ------------------------------------------------------------
@@ -1189,6 +1271,10 @@ struct QuicReconcile<'a> {
     recv: quinn::RecvStream,
     engine: &'a Engine,
     peer: NodeId,
+    /// Captured from `RootIs` on the first `root()` call: the per-origin op
+    /// frontier the served snapshot covers. `reconcile_with` reads it after a
+    /// successful pull to advance the recv cursor (FR-1311).
+    frontier: Vec<(NodeId, i64)>,
 }
 
 impl QuicReconcile<'_> {
@@ -1201,7 +1287,10 @@ impl QuicReconcile<'_> {
 impl ReconcileTransport for QuicReconcile<'_> {
     async fn root(&mut self) -> Result<[u8; 32], ReconcileError> {
         match self.rpc(&ReconcileFrame::Begin).await? {
-            ReconcileFrame::RootIs { hash } => Ok(hash),
+            ReconcileFrame::RootIs { hash, frontier } => {
+                self.frontier = frontier;
+                Ok(hash)
+            }
             _ => Err(ReconcileError::Violation("expected RootIs")),
         }
     }
@@ -1541,15 +1630,11 @@ mod tests {
             }
         });
 
-        // Op 1 is poison: the path escapes the share — its chunks are served
-        // fine, but apply_assembled rejects the path (UnsafePath, permanent).
-        // Op 2 is a normal write queued right behind it — the liveness
-        // property under test is that op 2 still arrives.
-        append_served(&engine_a, "../evil", b"poison").await;
-        std::fs::write(dir_a.path().join("good.txt"), b"fine").unwrap();
-        append_served(&engine_a, "good.txt", b"fine").await;
-
-        // B subscribes for real.
+        // B subscribes for real and reaches Live against an EMPTY A, so its
+        // initial reconcile bootstrap is a no-op and the ops below ride the
+        // LIVE op stream (this is the path whose quarantine we are testing —
+        // the frontier handoff means a pre-existing op would instead be
+        // bootstrapped via reconcile, exercising a different code path).
         let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
         let ep_b = engine_b.build_endpoint().unwrap();
         let peer_a = engine_b.cfg.peers[0].clone();
@@ -1560,6 +1645,23 @@ mod tests {
                 let _ = engine.subscribe_once(&ep_b, &peer_a, &mut attempt).await;
             }
         });
+        let mut live = false;
+        for _ in 0..200 {
+            if engine_b.peers_reg.get(&A).state == PeerState::Live {
+                live = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(live, "B never reached Live against empty A");
+
+        // Op 1 is poison: the path escapes the share — its chunks are served
+        // fine, but apply_assembled rejects the path (UnsafePath, permanent).
+        // Op 2 is a normal write queued right behind it — the liveness
+        // property under test is that op 2 still arrives over the live stream.
+        append_served(&engine_a, "../evil", b"poison").await;
+        std::fs::write(dir_a.path().join("good.txt"), b"fine").unwrap();
+        append_served(&engine_a, "good.txt", b"fine").await;
 
         // The good op behind the poison op must land.
         let mut applied = false;
@@ -1604,6 +1706,143 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(acked, "legitimate acks did not advance last_acked_seq");
+    }
+
+    /// The join frontier (FR-1311): a node bootstraps a peer's existing ops via
+    /// the reconcile snapshot, advances its recv cursor to that snapshot's
+    /// frontier, and then streams ONLY live ops past the frontier — none of the
+    /// bootstrapped history is re-streamed (no double apply), and a disconnect
+    /// after the handoff resumes from the advanced cursor (crash points
+    /// post-cursor / post-subscribe). New ops still flow after the resume.
+    #[tokio::test]
+    async fn join_frontier_bootstraps_then_streams_live_without_redelivery() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_b = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const B: NodeId = [0xb; 16];
+
+        let engine_a = engine_on(
+            dir_a.path(),
+            A,
+            &id_a,
+            vec![(B, "127.0.0.1:1".parse().unwrap(), id_b.fingerprint)],
+        );
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+        tokio::spawn({
+            let engine = engine_a.clone();
+            async move {
+                while let Some(incoming) = ep_a.accept().await {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        let _ = engine.handle_inbound(incoming).await;
+                    });
+                }
+            }
+        });
+
+        // A already holds three ops BEFORE B ever connects — these must arrive
+        // via the reconcile bootstrap, not the live op stream.
+        for (i, name) in ["one", "two", "three"].iter().enumerate() {
+            std::fs::write(dir_a.path().join(name), format!("v{i}")).unwrap();
+            append_served(&engine_a, name, format!("v{i}").as_bytes()).await;
+        }
+
+        let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_b = engine_b.build_endpoint().unwrap();
+        let peer_a = engine_b.cfg.peers[0].clone();
+
+        // First session: connect, reconcile-bootstrap, reach Live, then we tear
+        // it down (simulating a disconnect right after the handoff).
+        let sess = tokio::spawn({
+            let engine = engine_b.clone();
+            let ep = ep_b.clone();
+            let peer = peer_a.clone();
+            async move {
+                let mut attempt = 0;
+                let _ = engine.subscribe_once(&ep, &peer, &mut attempt).await;
+            }
+        });
+        let mut live = false;
+        for _ in 0..200 {
+            if engine_b.peers_reg.get(&A).state == PeerState::Live {
+                live = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(live, "B never reached Live");
+
+        // Bootstrapped: all three files converged, the cursor jumped to the
+        // snapshot frontier (3), and NONE of A's ops are in `applied` — proof
+        // they came through reconcile, not a re-stream of history.
+        for name in ["one", "two", "three"] {
+            assert!(engine_b.store.load_file(name).await.unwrap().is_some());
+        }
+        assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 3);
+        assert!(!engine_b
+            .store
+            .has_applied(crate::proto::op_id(&A, 1))
+            .await
+            .unwrap());
+        assert!(!engine_b
+            .store
+            .has_applied(crate::proto::op_id(&A, 3))
+            .await
+            .unwrap());
+
+        // A NEW op on the SAME live session rides the op stream (> frontier):
+        // recorded in `applied`, cursor to 4 — no overlap with the bootstrap.
+        std::fs::write(dir_a.path().join("four"), b"v3").unwrap();
+        append_served(&engine_a, "four", b"v3").await; // origin_seq 4, live
+        let mut got_four = false;
+        for _ in 0..200 {
+            if engine_b
+                .store
+                .has_applied(crate::proto::op_id(&A, 4))
+                .await
+                .unwrap()
+            {
+                got_four = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            got_four,
+            "live op past the frontier did not arrive via the op path"
+        );
+        assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 4);
+        assert_eq!(std::fs::read(dir_b.path().join("four")).unwrap(), b"v3");
+
+        // Resume after a disconnect (crash points 3/4): tear the session down,
+        // reconnect, append another op. Convergence holds and the cursor only
+        // ever advances — it is never rewound below the durable frontier,
+        // however the op is delivered (live stream or the reconnect's reconcile).
+        sess.abort();
+        let _ = sess.await;
+        tokio::spawn({
+            let engine = engine_b.clone();
+            let ep = ep_b.clone();
+            async move {
+                let mut attempt = 0;
+                let _ = engine.subscribe_once(&ep, &peer_a, &mut attempt).await;
+            }
+        });
+        std::fs::write(dir_a.path().join("five"), b"v4").unwrap();
+        append_served(&engine_a, "five", b"v4").await; // origin_seq 5
+        let mut got_five = false;
+        for _ in 0..200 {
+            if std::fs::read(dir_b.path().join("five")).is_ok_and(|d| d == b"v4") {
+                got_five = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(got_five, "op after resume did not arrive");
+        assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 5);
     }
 
     #[tokio::test]
@@ -1872,7 +2111,14 @@ mod tests {
         let _hello_ack: Frame = read_msg(&mut recv).await.unwrap();
         // Pass the reconcile gate (a lying peer can skip the session and
         // claim it is done — that is fine, the gate protects the DIALER).
-        write_msg(&mut send, &Frame::SubscribeOps).await.unwrap();
+        write_msg(
+            &mut send,
+            &Frame::SubscribeOps {
+                resume: vec![(A, 0)],
+            },
+        )
+        .await
+        .unwrap();
         write_msg(
             &mut send,
             &Frame::OplogAck {
