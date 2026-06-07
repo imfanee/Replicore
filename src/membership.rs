@@ -43,13 +43,16 @@
 //! `<db>.roster.json`), serialised with serde_json and saved atomically
 //! (tmp → fsync → rename → fsync dir). The daemon NEVER writes the intent file.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 
 use crate::admin::{canonical_entry_bytes, verify_entry, AdminPubKey, EntryKind};
+use crate::config::{Config, Peer};
 use crate::vv::NodeId;
 
 #[derive(thiserror::Error, Debug)]
@@ -317,6 +320,213 @@ mod hex64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Membership — the runtime handle over the roster + derived views
+// ---------------------------------------------------------------------------
+
+#[derive(thiserror::Error, Debug)]
+pub enum MembershipError {
+    #[error("no [trust] admin_pubkey configured; membership changes are refused")]
+    NoAdminKey,
+    #[error(transparent)]
+    Roster(#[from] RosterError),
+}
+
+/// The agent-owned membership state, shared across the engine, supervisor,
+/// gossip, and control plane. Cheap to clone (all state behind `Arc`).
+///
+/// Three derived views are kept in lockstep and recomputed on every change:
+/// - `roster` — the converged signed entries (persisted).
+/// - `effective` — `seeds ∪ roster Adds − roster Removes`, the dial targets.
+/// - `allowlist` — the effective peers' fingerprints, read PER HANDSHAKE by the
+///   TLS verifiers (a removed peer is locked out without rebuilding the QUIC
+///   endpoint).
+///
+/// `RwLock` (std, not tokio) is deliberate: every critical section is a quick
+/// in-memory read/swap with no `.await` held, and the TLS verifier that reads
+/// `allowlist` is a synchronous rustls callback.
+#[derive(Clone)]
+pub struct Membership {
+    our_node_id: NodeId,
+    admin_pubkey: Option<AdminPubKey>,
+    roster_path: PathBuf,
+    seeds: Arc<Vec<Peer>>,
+    roster: Arc<RwLock<Roster>>,
+    effective: Arc<RwLock<HashMap<NodeId, Peer>>>,
+    allowlist: Arc<RwLock<HashSet<[u8; 32]>>>,
+    /// Bumped on every applied change; the supervisor watches it.
+    changed: watch::Sender<u64>,
+}
+
+impl Membership {
+    /// Build from intent config: load+re-verify the roster from disk under the
+    /// configured admin key, then compute the effective set and allowlist.
+    /// A roster signed by a now-rotated key is dropped on load (reported).
+    pub fn load(cfg: &Config) -> Result<Membership, MembershipError> {
+        let roster = match &cfg.admin_pubkey {
+            Some(pk) => {
+                let (r, dropped) = Roster::load(&cfg.roster_path, pk)?;
+                if dropped > 0 {
+                    tracing::warn!(dropped, "dropped roster entries failing admin-key verify");
+                }
+                r
+            }
+            // No trust anchor: static-peer mode. The roster file is ignored
+            // (we cannot verify it), and only seeds form the mesh.
+            None => Roster::new(),
+        };
+        let (changed, _) = watch::channel(0);
+        let m = Membership {
+            our_node_id: cfg.node_id,
+            admin_pubkey: cfg.admin_pubkey.clone(),
+            roster_path: cfg.roster_path.clone(),
+            seeds: Arc::new(cfg.peers.clone()),
+            roster: Arc::new(RwLock::new(roster)),
+            effective: Arc::new(RwLock::new(HashMap::new())),
+            allowlist: Arc::new(RwLock::new(HashSet::new())),
+            changed,
+        };
+        m.recompute();
+        Ok(m)
+    }
+
+    /// Recompute `effective` and `allowlist` from `seeds` + the roster.
+    /// Seeds first, then roster Adds override and Removes drop — signed intent
+    /// beats a static seed; a signed Remove evicts even a seeded node.
+    fn recompute(&self) {
+        let mut eff: HashMap<NodeId, Peer> = HashMap::new();
+        for seed in self.seeds.iter() {
+            eff.insert(seed.node_id, seed.clone());
+        }
+        {
+            let roster = self.roster.read().expect("roster lock");
+            for entry in roster.all_entries() {
+                if entry.node_id == self.our_node_id {
+                    continue; // never dial or pin ourselves
+                }
+                match entry.kind {
+                    EntryKind::Add => {
+                        eff.insert(
+                            entry.node_id,
+                            Peer {
+                                node_id: entry.node_id,
+                                addr: entry.addr,
+                                fingerprint: entry.fingerprint,
+                            },
+                        );
+                    }
+                    EntryKind::Remove => {
+                        eff.remove(&entry.node_id);
+                    }
+                }
+            }
+        }
+        let allow: HashSet<[u8; 32]> = eff.values().map(|p| p.fingerprint).collect();
+        *self.effective.write().expect("effective lock") = eff;
+        *self.allowlist.write().expect("allowlist lock") = allow;
+    }
+
+    /// Persist the roster atomically (daemon-owned file; the intent file is
+    /// never touched). Snapshots under the lock, writes outside it.
+    fn persist(&self) -> Result<(), RosterError> {
+        let snapshot = self.roster.read().expect("roster lock").clone();
+        snapshot.save(&self.roster_path)
+    }
+
+    /// THE mutation entry point for control/gossip/on-connect push: verify and
+    /// merge one signed entry, then (if state advanced) recompute the views,
+    /// persist, and notify the supervisor. Returns the merge outcome.
+    pub fn merge_signed(&self, entry: SignedEntry) -> Result<MergeOutcome, MembershipError> {
+        let pk = self
+            .admin_pubkey
+            .as_ref()
+            .ok_or(MembershipError::NoAdminKey)?;
+        let outcome = self
+            .roster
+            .write()
+            .expect("roster lock")
+            .merge_entry(entry, pk);
+        if outcome == MergeOutcome::Applied {
+            self.recompute();
+            self.persist()?;
+            self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        }
+        Ok(outcome)
+    }
+
+    /// Re-apply intent on `config reload` (FR-1406): swap seeds + admin key,
+    /// re-verify the roster under the (possibly rotated) key, recompute. The
+    /// caller has already validated the candidate, so this cannot half-apply.
+    pub fn apply_reload(&mut self, cfg: &Config) -> Result<(), MembershipError> {
+        let roster = match &cfg.admin_pubkey {
+            Some(pk) => Roster::load(&cfg.roster_path, pk)?.0,
+            None => Roster::new(),
+        };
+        self.admin_pubkey = cfg.admin_pubkey.clone();
+        self.roster_path = cfg.roster_path.clone();
+        self.seeds = Arc::new(cfg.peers.clone());
+        *self.roster.write().expect("roster lock") = roster;
+        self.recompute();
+        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(())
+    }
+
+    /// The current dial targets (effective members minus ourselves).
+    pub fn effective_peers(&self) -> Vec<Peer> {
+        self.effective
+            .read()
+            .expect("effective lock")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Shared fingerprint allowlist handle for the TLS verifiers (read live).
+    pub fn allowlist_handle(&self) -> Arc<RwLock<HashSet<[u8; 32]>>> {
+        self.allowlist.clone()
+    }
+
+    /// Map an authenticated cert fingerprint to its effective peer.
+    pub fn peer_by_fingerprint(&self, fp: &[u8; 32]) -> Option<Peer> {
+        self.effective
+            .read()
+            .expect("effective lock")
+            .values()
+            .find(|p| &p.fingerprint == fp)
+            .cloned()
+    }
+
+    /// Every roster winner (Adds + tombstones) — gossip payload / status.
+    pub fn roster_snapshot(&self) -> Vec<SignedEntry> {
+        self.roster
+            .read()
+            .expect("roster lock")
+            .all_entries()
+            .cloned()
+            .collect()
+    }
+
+    pub fn roster_digest(&self) -> [u8; 32] {
+        self.roster.read().expect("roster lock").digest()
+    }
+
+    pub fn next_epoch_for(&self, node_id: &NodeId) -> u64 {
+        self.roster
+            .read()
+            .expect("roster lock")
+            .next_epoch_for(node_id)
+    }
+
+    pub fn admin_pubkey(&self) -> Option<&AdminPubKey> {
+        self.admin_pubkey.as_ref()
+    }
+
+    /// Watch for membership changes (the supervisor reconciles dial loops).
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +686,109 @@ mod tests {
             Roster::load(Path::new("/nonexistent/replicore.roster.json"), &pk).unwrap();
         assert!(r.is_empty());
         assert_eq!(dropped, 0);
+    }
+
+    // --- Membership runtime handle ---
+
+    fn cfg_with(pk: Option<AdminPubKey>, roster_path: PathBuf, seeds: Vec<Peer>) -> Config {
+        let mut cfg = Config::from_toml_str(
+            r#"
+            node_id   = "000102030405060708090a0b0c0d0e0f"
+            listen    = "10.0.0.1:7000"
+            share_dir = "/srv/a"
+            db_path   = "/var/lib/replicore/a.db"
+            cert_path = "/etc/replicore/a.cert.pem"
+            key_path  = "/etc/replicore/a.key.pem"
+            "#,
+        )
+        .unwrap();
+        cfg.admin_pubkey = pk;
+        cfg.roster_path = roster_path;
+        cfg.peers = seeds;
+        cfg
+    }
+
+    fn peer(node: u8, port: u16, fp: u8) -> Peer {
+        Peer {
+            node_id: nid(node),
+            addr: addr(port),
+            fingerprint: [fp; 32],
+        }
+    }
+
+    #[test]
+    fn membership_seeds_only_with_no_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeds = vec![peer(1, 7000, 1), peer(2, 7000, 2)];
+        let m = Membership::load(&cfg_with(None, dir.path().join("r.json"), seeds)).unwrap();
+        assert_eq!(m.effective_peers().len(), 2);
+        let allow = m.allowlist_handle();
+        let allow = allow.read().unwrap();
+        assert!(allow.contains(&[1; 32]) && allow.contains(&[2; 32]));
+    }
+
+    #[tokio::test]
+    async fn membership_add_then_remove_updates_views_and_persists() {
+        let (sk, pk) = admin();
+        let dir = tempfile::tempdir().unwrap();
+        let rpath = dir.path().join("r.json");
+        // Seed node 1; admin-add node 2, then admin-remove the SEED node 1.
+        let m = Membership::load(&cfg_with(
+            Some(pk.clone()),
+            rpath.clone(),
+            vec![peer(1, 7000, 1)],
+        ))
+        .unwrap();
+
+        let add2 = make(&sk, 2, 7000, 2, 1, EntryKind::Add);
+        assert_eq!(m.merge_signed(add2).unwrap(), MergeOutcome::Applied);
+        // Effective now has both; allowlist gained node 2's fingerprint.
+        assert_eq!(m.effective_peers().len(), 2);
+        assert!(m.allowlist_handle().read().unwrap().contains(&[2; 32]));
+        assert!(m.peer_by_fingerprint(&[2; 32]).is_some());
+
+        // A signed Remove evicts the SEED (signed intent beats a static seed).
+        let rm1 = make(
+            &sk,
+            1,
+            7000,
+            1,
+            m.next_epoch_for(&nid(1)),
+            EntryKind::Remove,
+        );
+        assert_eq!(m.merge_signed(rm1).unwrap(), MergeOutcome::Applied);
+        let eff = m.effective_peers();
+        assert_eq!(eff.len(), 1);
+        assert_eq!(eff[0].node_id, nid(2));
+        // Allowlist no longer admits the removed seed.
+        assert!(!m.allowlist_handle().read().unwrap().contains(&[1; 32]));
+
+        // Persisted: a fresh load reproduces the same effective set.
+        let m2 = Membership::load(&cfg_with(Some(pk), rpath, vec![peer(1, 7000, 1)])).unwrap();
+        assert_eq!(m2.effective_peers().len(), 1);
+        assert!(!m2.allowlist_handle().read().unwrap().contains(&[1; 32]));
+    }
+
+    #[test]
+    fn membership_refuses_changes_without_admin_key() {
+        let (sk, _) = admin();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Membership::load(&cfg_with(None, dir.path().join("r.json"), vec![])).unwrap();
+        let entry = make(&sk, 2, 7000, 2, 1, EntryKind::Add);
+        assert!(matches!(
+            m.merge_signed(entry),
+            Err(MembershipError::NoAdminKey)
+        ));
+    }
+
+    #[tokio::test]
+    async fn membership_change_notifies_subscribers() {
+        let (sk, pk) = admin();
+        let dir = tempfile::tempdir().unwrap();
+        let m = Membership::load(&cfg_with(Some(pk), dir.path().join("r.json"), vec![])).unwrap();
+        let rx = m.subscribe();
+        m.merge_signed(make(&sk, 2, 7000, 2, 1, EntryKind::Add))
+            .unwrap();
+        assert!(rx.has_changed().unwrap());
     }
 }

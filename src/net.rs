@@ -1450,6 +1450,9 @@ mod tests {
             cert_path,
             key_path,
             health_listen: None,
+            admin_pubkey: None,
+            roster_path: dir.join("roster.json"),
+            control_socket: dir.join("ctl.sock"),
             peers: peers
                 .into_iter()
                 .map(|(node_id, addr, fingerprint)| crate::config::Peer {

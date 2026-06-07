@@ -23,6 +23,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use crate::admin::AdminPubKey;
 use crate::vv::NodeId;
 
 #[derive(thiserror::Error, Debug)]
@@ -49,6 +50,10 @@ pub enum ConfigError {
         "chunk sizes must satisfy 4096 <= min <= avg <= max <= 64 MiB (got {min}/{avg}/{max})"
     )]
     BadChunkSizes { min: u32, avg: u32, max: u32 },
+    #[error("[trust] admin_pubkey must be 64 hex chars (Ed25519), got {0:?}")]
+    BadAdminPubkey(String),
+    #[error("set either [[peers]] or [[seed_peers]], not both (they are aliases)")]
+    PeersAndSeedPeers,
 }
 
 /// Validated runtime configuration.
@@ -66,6 +71,18 @@ pub struct Config {
     pub key_path: PathBuf,
     /// Health endpoint bind address (FR-1102); absent = disabled.
     pub health_listen: Option<SocketAddr>,
+    /// Cluster membership trust anchor (FR-1305). Absent = no dynamic
+    /// membership: roster mutations cannot be admitted (static `[[peers]]`
+    /// still works for M2-style fixed meshes).
+    pub admin_pubkey: Option<AdminPubKey>,
+    /// Agent-owned roster file (FR-1302). Default `<db_path>.roster.json`.
+    /// The daemon owns this exclusively; it NEVER writes the intent file.
+    pub roster_path: PathBuf,
+    /// Operator control socket (UDS). Default `<db_path>.sock`.
+    pub control_socket: PathBuf,
+    /// The seed peer list (FR-601). `[[peers]]` is canonical; `[[seed_peers]]`
+    /// is an accepted alias. Dynamically-learned members live in the roster,
+    /// never here.
     pub peers: Vec<Peer>,
     /// Per-path quiescence window before a local write becomes an op (FR-105).
     pub quiesce_ms: u64,
@@ -110,7 +127,17 @@ struct RawConfig {
     #[serde(default)]
     health_listen: Option<SocketAddr>,
     #[serde(default)]
-    peers: Vec<RawPeer>,
+    trust: Option<RawTrust>,
+    #[serde(default)]
+    roster_path: Option<PathBuf>,
+    #[serde(default)]
+    control_socket: Option<PathBuf>,
+    // `peers` and `seed_peers` are aliases; at most one may be set (we can't
+    // use serde alias because we must reject *both* being present).
+    #[serde(default)]
+    peers: Option<Vec<RawPeer>>,
+    #[serde(default)]
+    seed_peers: Option<Vec<RawPeer>>,
     #[serde(default = "default_quiesce_ms")]
     quiesce_ms: u64,
     #[serde(default = "default_scan_interval_secs")]
@@ -139,6 +166,12 @@ struct RawPeer {
     node_id: String,
     addr: SocketAddr,
     fingerprint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTrust {
+    admin_pubkey: String,
 }
 
 fn default_quiesce_ms() -> u64 {
@@ -195,9 +228,16 @@ impl Config {
         let raw: RawConfig = toml::from_str(text).map_err(Box::new)?;
         let node_id = parse_node_id(&raw.node_id)?;
 
-        let mut peers = Vec::with_capacity(raw.peers.len());
+        // [[peers]] and [[seed_peers]] are aliases; reject setting both.
+        let raw_peers = match (raw.peers, raw.seed_peers) {
+            (Some(_), Some(_)) => return Err(ConfigError::PeersAndSeedPeers),
+            (Some(p), None) | (None, Some(p)) => p,
+            (None, None) => Vec::new(),
+        };
+
+        let mut peers = Vec::with_capacity(raw_peers.len());
         let mut seen = vec![node_id];
-        for rp in &raw.peers {
+        for rp in &raw_peers {
             let pid = parse_node_id(&rp.node_id)?;
             if seen.contains(&pid) {
                 return Err(ConfigError::DuplicateNode(rp.node_id.clone()));
@@ -227,6 +267,20 @@ impl Config {
         let cas_dir = raw
             .cas_dir
             .unwrap_or_else(|| raw.db_path.with_extension("cas"));
+        let roster_path = raw
+            .roster_path
+            .unwrap_or_else(|| raw.db_path.with_extension("roster.json"));
+        let control_socket = raw
+            .control_socket
+            .unwrap_or_else(|| raw.db_path.with_extension("sock"));
+
+        let admin_pubkey = match &raw.trust {
+            Some(t) => Some(
+                AdminPubKey::from_hex(&t.admin_pubkey)
+                    .map_err(|_| ConfigError::BadAdminPubkey(t.admin_pubkey.clone()))?,
+            ),
+            None => None,
+        };
 
         Ok(Config {
             node_id,
@@ -237,6 +291,9 @@ impl Config {
             cert_path: raw.cert_path,
             key_path: raw.key_path,
             health_listen: raw.health_listen,
+            admin_pubkey,
+            roster_path,
+            control_socket,
             peers,
             quiesce_ms: raw.quiesce_ms,
             scan_interval_secs: raw.scan_interval_secs,
@@ -279,6 +336,8 @@ impl Config {
             ("cas_dir", &cfg.cas_dir),
             ("cert_path", &cfg.cert_path),
             ("key_path", &cfg.key_path),
+            ("roster_path", &cfg.roster_path),
+            ("control_socket", &cfg.control_socket),
         ] {
             let effective = path.canonicalize().unwrap_or_else(|_| path.clone());
             if effective.starts_with(&cfg.share_dir) {
@@ -304,6 +363,144 @@ impl Config {
     pub fn peer_by_node_id(&self, id: &NodeId) -> Option<&Peer> {
         self.peers.iter().find(|p| &p.node_id == id)
     }
+
+    /// Classified difference between this (running) config and a `candidate`,
+    /// for `replicorectl config diff` (FR-1406). Only the seed list and the
+    /// trust anchor are HOT (applied by a `config reload` recomputing
+    /// membership); every other field is honestly RESTART-REQUIRED — we never
+    /// pretend a change took effect when it did not.
+    pub fn diff(&self, candidate: &Config) -> Vec<ConfigChange> {
+        let mut out = Vec::new();
+        let mut note = |field: &'static str, hot: bool, old: String, new: String| {
+            if old != new {
+                out.push(ConfigChange {
+                    field,
+                    hot,
+                    old,
+                    new,
+                });
+            }
+        };
+
+        // HOT — reload recomputes the membership view.
+        note(
+            "admin_pubkey",
+            true,
+            self.admin_pubkey
+                .as_ref()
+                .map(|k| k.to_hex())
+                .unwrap_or_default(),
+            candidate
+                .admin_pubkey
+                .as_ref()
+                .map(|k| k.to_hex())
+                .unwrap_or_default(),
+        );
+        note(
+            "peers",
+            true,
+            fmt_peers(&self.peers),
+            fmt_peers(&candidate.peers),
+        );
+
+        // RESTART-REQUIRED — bound at boot; reload cannot move them.
+        note(
+            "node_id",
+            false,
+            hex::encode(self.node_id),
+            hex::encode(candidate.node_id),
+        );
+        note(
+            "listen",
+            false,
+            self.listen.to_string(),
+            candidate.listen.to_string(),
+        );
+        note(
+            "share_dir",
+            false,
+            disp(&self.share_dir),
+            disp(&candidate.share_dir),
+        );
+        note(
+            "db_path",
+            false,
+            disp(&self.db_path),
+            disp(&candidate.db_path),
+        );
+        note(
+            "cas_dir",
+            false,
+            disp(&self.cas_dir),
+            disp(&candidate.cas_dir),
+        );
+        note(
+            "cert_path",
+            false,
+            disp(&self.cert_path),
+            disp(&candidate.cert_path),
+        );
+        note(
+            "key_path",
+            false,
+            disp(&self.key_path),
+            disp(&candidate.key_path),
+        );
+        note(
+            "roster_path",
+            false,
+            disp(&self.roster_path),
+            disp(&candidate.roster_path),
+        );
+        note(
+            "control_socket",
+            false,
+            disp(&self.control_socket),
+            disp(&candidate.control_socket),
+        );
+        note(
+            "health_listen",
+            false,
+            self.health_listen
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+            candidate
+                .health_listen
+                .map(|a| a.to_string())
+                .unwrap_or_default(),
+        );
+        out
+    }
+}
+
+/// One classified field change from [`Config::diff`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigChange {
+    pub field: &'static str,
+    /// True if a `config reload` applies it live; false = restart required.
+    pub hot: bool,
+    pub old: String,
+    pub new: String,
+}
+
+fn disp(p: &Path) -> String {
+    p.display().to_string()
+}
+
+fn fmt_peers(peers: &[Peer]) -> String {
+    let mut lines: Vec<String> = peers
+        .iter()
+        .map(|p| {
+            format!(
+                "{}@{}#{}",
+                hex::encode(p.node_id),
+                p.addr,
+                hex::encode(p.fingerprint)
+            )
+        })
+        .collect();
+    lines.sort(); // order-independent comparison
+    lines.join(",")
 }
 
 #[cfg(test)]
@@ -450,5 +647,78 @@ mod tests {
         assert!(cfg.peer_by_fingerprint(&[0xaa; 32]).is_some());
         assert!(cfg.peer_by_fingerprint(&[0xbb; 32]).is_none());
         assert_eq!(cfg.pinned_fingerprints(), vec![[0xaa; 32]]);
+    }
+
+    #[test]
+    fn m25_path_defaults_and_trust_parse() {
+        let cfg = Config::from_toml_str(GOOD).unwrap();
+        // Daemon-owned state files default beside the db.
+        assert_eq!(
+            cfg.roster_path,
+            PathBuf::from("/var/lib/replicore/a.roster.json")
+        );
+        assert_eq!(
+            cfg.control_socket,
+            PathBuf::from("/var/lib/replicore/a.sock")
+        );
+        assert!(cfg.admin_pubkey.is_none());
+
+        let text = GOOD.replace(
+            "[[peers]]",
+            "[trust]\nadmin_pubkey = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n[[peers]]",
+        );
+        let cfg = Config::from_toml_str(&text).unwrap();
+        assert_eq!(cfg.admin_pubkey.unwrap().0, [0xbb; 32]);
+    }
+
+    #[test]
+    fn rejects_bad_admin_pubkey() {
+        let text = GOOD.replace("[[peers]]", "[trust]\nadmin_pubkey = \"nothex\"\n[[peers]]");
+        assert!(matches!(
+            Config::from_toml_str(&text),
+            Err(ConfigError::BadAdminPubkey(_))
+        ));
+    }
+
+    #[test]
+    fn seed_peers_is_an_alias_but_not_both() {
+        // [[seed_peers]] alone works and is identical to [[peers]].
+        let aliased = GOOD.replace("[[peers]]", "[[seed_peers]]");
+        let cfg = Config::from_toml_str(&aliased).unwrap();
+        assert_eq!(cfg.peers.len(), 1);
+        assert_eq!(cfg.peers[0].fingerprint, [0xaa; 32]);
+
+        // Both present is an error.
+        let both = format!(
+            "{GOOD}\n[[seed_peers]]\nnode_id = \"202122232425262728292a2b2c2d2e2f\"\naddr = \"10.0.0.3:7000\"\nfingerprint = \"ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"\n"
+        );
+        assert!(matches!(
+            Config::from_toml_str(&both),
+            Err(ConfigError::PeersAndSeedPeers)
+        ));
+    }
+
+    #[test]
+    fn diff_classifies_hot_vs_restart() {
+        let running = Config::from_toml_str(GOOD).unwrap();
+
+        // A changed listen addr is restart-required.
+        let cand = Config::from_toml_str(&GOOD.replace("10.0.0.1:7000", "10.0.0.9:7000")).unwrap();
+        let d = running.diff(&cand);
+        let listen = d.iter().find(|c| c.field == "listen").unwrap();
+        assert!(!listen.hot);
+
+        // A changed peer set is hot.
+        let cand = Config::from_toml_str(&GOOD.replace(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &"dd".repeat(32),
+        ))
+        .unwrap();
+        let d = running.diff(&cand);
+        let peers = d.iter().find(|c| c.field == "peers").unwrap();
+        assert!(peers.hot);
+
+        // Identical configs diff to nothing.
+        assert!(running.diff(&running).is_empty());
     }
 }
