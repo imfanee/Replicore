@@ -215,6 +215,9 @@ down() {
   need_root
   for n in "${NODES[@]}"; do ip netns del "${NS[$n]}" 2>/dev/null || true; done
   ip netns del _rc_probe 2>/dev/null || true
+  # Bridge-side veth peers can orphan when their ns-side end was downed
+  # (e.g. a partition test) before the netns died — delete explicitly.
+  for n in "${NODES[@]}"; do ip link del "brv-$n" 2>/dev/null || true; done
   ip link del "$BR" 2>/dev/null || true
   echo "down."
 }

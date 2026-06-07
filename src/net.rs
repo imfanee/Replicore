@@ -645,6 +645,12 @@ impl Engine {
         transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
         transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
         transport.send_window(64 * 1024 * 1024);
+        // Lossy-WAN throughput (NFR-P6): the default loss-based CC (Cubic)
+        // collapses under ~1% RANDOM loss (measured 66–83% utilization on
+        // the rig); BBR models bandwidth instead of treating loss as
+        // congestion. quinn ships it natively — the quiche fallback from the
+        // stack notes stays unnecessary.
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         let transport = Arc::new(transport);
 
         let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -2259,6 +2265,12 @@ impl Engine {
         let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
         let _ = transport.send.finish();
         Stats::inc(&self.stats.reconcile_runs);
+        // FR-305: conflicts witnessed via anti-entropy count too — resolved
+        // or (rarely) left for the next session.
+        Stats::add(
+            &self.stats.conflicts,
+            report.resolved_conflicts + report.skipped_concurrent,
+        );
         Ok((report, transport.frontier))
     }
 

@@ -172,3 +172,18 @@ the rescan path on the assumption that fanotify catches everything.
 - M3 SEAMs (grep `SEAM(`): hardlinks-as-links (storm-free leader-election
   design sketched in metadata.rs), directory metadata / default ACLs on dirs
   (rides the dir-lifecycle seam), per-share encryption (FR-1004, deferred).
+
+## M3 rig commands
+
+```sh
+# M3 exit-criteria suite (root; run serially, owns the rig):
+sudo -E cargo test --release --test integration_m3 -- --ignored --nocapture --test-threads=1
+# soak (criterion 6): one week = DURATION=604800; smoke = 900
+sudo DURATION=604800 scripts/soak.sh
+# deep convergence gate (nightly):
+PROPTEST_CASES=20000 cargo test --release --test conflict_proptest
+```
+
+Transport CC is quinn's native BBR (NFR-P6: loss-based Cubic measured
+66–83% utilization at 1% loss on the rig; BBR holds 80–83%) — the quiche
+fallback in the stack notes is unnecessary.
