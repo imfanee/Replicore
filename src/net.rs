@@ -841,10 +841,42 @@ impl Engine {
 
         // Authenticated inbound connections serve multi-source fetch too.
         let peer_id = peer.node_id;
-        self.conns.insert(peer_id, conn.clone());
+        self.register_authenticated(peer_id, &conn)?;
         let result = self.inbound_io(conn.clone(), peer).await;
         self.conns.remove_if_same(&peer_id, &conn);
         result
+    }
+
+    /// Register an authenticated connection AND close the removal race
+    /// (review finding S4): a signed Remove may land between the TLS
+    /// allowlist check and this insert, and the supervisor's `close_all`
+    /// severs only connections present when it runs. Re-validating
+    /// effectiveness AFTER the insert leaves no window:
+    /// `recompute()` (the membership swap) strictly precedes the
+    /// supervisor's `close_all`, so either our insert precedes the
+    /// close_all snapshot (the supervisor severs us) or this re-check runs
+    /// after the swap (we sever ourselves). One of the two always fires.
+    fn register_authenticated(
+        &self,
+        peer_id: NodeId,
+        conn: &quinn::Connection,
+    ) -> Result<(), NetError> {
+        self.conns.insert(peer_id, conn.clone());
+        if !self
+            .membership
+            .effective_peers()
+            .iter()
+            .any(|p| p.node_id == peer_id)
+        {
+            self.conns.remove_if_same(&peer_id, conn);
+            conn.close(0u32.into(), b"membership-remove");
+            tracing::info!(
+                node = %hex::encode(&peer_id[..4]),
+                "connection raced a membership removal; severed at registration"
+            );
+            return Err(NetError::UnknownPeer);
+        }
+        Ok(())
     }
 
     async fn inbound_io(
@@ -1363,7 +1395,7 @@ impl Engine {
         // streams too. (Without this, a request stream opened toward a
         // dialer-only endpoint sits unaccepted forever and wedges the peer's
         // receive path — found as a 3-node startup race.)
-        self.conns.insert(peer.node_id, conn.clone());
+        self.register_authenticated(peer.node_id, &conn)?;
         let serve = tokio::spawn({
             let engine = self.clone();
             let conn = conn.clone();
