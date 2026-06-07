@@ -38,6 +38,8 @@ fn remote_op(path: &str, hash: [u8; 32]) -> OpRecord {
         origin_seq: 1,
         op_type: OpType::Write,
         path: path.into(),
+        path_old: None,
+        uuid: None,
         mode: 0o644,
         size: 8,
         content_hash: Some(hash),
@@ -53,6 +55,7 @@ fn op_version(op: &OpRecord) -> replicore::conflict::Version {
         mode: op.mode,
         size: op.size,
         vv: op.vv.clone(),
+        uuid: op.uuid,
     }
 }
 
@@ -192,6 +195,7 @@ async fn resolution_superseded_by_a_dominating_row_is_refused() {
             size: 8,
             vv: merged_vv.clone(),
             tombstone: false,
+            uuid: None,
         })
         .await
         .unwrap();

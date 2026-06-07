@@ -16,15 +16,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::vv::{NodeId, VersionVector};
 
 /// Negotiated in `Hello`; mismatch closes the connection cleanly (FR-504).
-/// M2.5 is a flag-day bump (join frontier): `RootIs` now carries the snapshot's
-/// per-origin op frontier and `SubscribeOps` carries the post-reconcile resume
-/// map, so the responder streams live ops strictly past what the bootstrap
-/// covered. v2 peers are refused. The mesh ships as a unit.
-pub const PROTO_VERSION: u16 = 3;
+/// M3 is a flag-day bump: `OpRecord` gains the file identity (`uuid`) and
+/// rename support (`OpType::Rename` + `path_old`); `LeafResp` carries the
+/// uuid. The remaining M3 wire change (full metadata + the leaf-hash formula)
+/// lands inside the same v4 before release — v3 peers are refused either way.
+/// The mesh ships as a unit.
+pub const PROTO_VERSION: u16 = 4;
 
 /// ALPN identifier for every QUIC connection. Bumped with PROTO_VERSION so a
 /// stale binary fails at the TLS layer, not mid-protocol.
-pub const ALPN: &[u8] = b"replicore/3";
+pub const ALPN: &[u8] = b"replicore/4";
 
 /// Hard cap for one control/fetch-header frame. Ops are small (path + vv);
 /// anything near this size is hostile or a bug.
@@ -36,10 +37,21 @@ pub enum OpType {
     Write,
     /// Tombstone, never a hard delete on the receiver (FR-204).
     Delete,
+    /// Identity-preserving move (FR-205, identity-lite): ONE op whose two
+    /// path-effects commit atomically — `path_old` becomes a tombstone and
+    /// `path` receives the SAME file (same uuid, same content, the same VV
+    /// lineage bumped once). Not delete+create: causality and identity are
+    /// continuous, so the move neither retransfers content nor conflicts
+    /// with itself. Each path-effect still resolves independently against
+    /// concurrent activity on ITS path (a concurrent write to `path_old`
+    /// resurrects it — modify wins; cross-path write redirect is
+    /// SEAM(M4): rename redirect).
+    Rename,
 }
 
 /// One replicated operation (FR-202): identity, origin, type, path, metadata
-/// snapshot, content hash, version vector. `mtime`/xattr fidelity is M3.
+/// snapshot, content hash, version vector. `mtime`/xattr fidelity lands later
+/// in M3 (FR-106).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub struct OpRecord {
     /// Globally unique: `blake3(origin || origin_seq)` — see [`op_id`].
@@ -48,8 +60,14 @@ pub struct OpRecord {
     /// Origin node's monotonic sequence for this op (resume + ack cursor).
     pub origin_seq: i64,
     pub op_type: OpType,
-    /// Path relative to the share root, '/' separators.
+    /// Path relative to the share root, '/' separators. For a rename: the
+    /// NEW path.
     pub path: String,
+    /// Rename source path; `Some` iff `op_type == Rename`.
+    pub path_old: Option<String>,
+    /// Stable per-file identity (FR-205): minted at create, carried by every
+    /// later op on the file, preserved across renames.
+    pub uuid: Option<[u8; 16]>,
     /// Unix permission bits (full metadata fidelity is M3, FR-106).
     pub mode: u32,
     pub size: u64,
@@ -211,9 +229,9 @@ pub enum ReconcileFrame {
     LeafReq {
         path: String,
     },
-    /// `mode`/`size` ride along for the state upsert but are NOT part of the
-    /// Merkle leaf hash (metadata fidelity is M3 — no flap on unreconciled
-    /// fields).
+    /// `mode`/`size`/`uuid` ride along for the state upsert but are NOT part
+    /// of the Merkle leaf hash yet (metadata fidelity lands later in M3 — no
+    /// flap on unreconciled fields).
     LeafResp {
         found: bool,
         tombstone: bool,
@@ -221,6 +239,7 @@ pub enum ReconcileFrame {
         vv: VersionVector,
         mode: u32,
         size: u64,
+        uuid: Option<[u8; 16]>,
     },
     Done,
 }
@@ -298,6 +317,8 @@ mod tests {
             origin_seq: 42,
             op_type: OpType::Write,
             path: "a/b/c.wav".into(),
+            path_old: None,
+            uuid: Some([4u8; 16]),
             mode: 0o644,
             size: 12345,
             content_hash: Some([9u8; 32]),
@@ -315,6 +336,12 @@ mod tests {
                 resume: vec![([2u8; 16], 17), ([3u8; 16], 0)],
             },
             Frame::OplogPush(sample_op()),
+            Frame::OplogPush(OpRecord {
+                op_type: OpType::Rename,
+                path: "a/b/d.wav".into(),
+                path_old: Some("a/b/c.wav".into()),
+                ..sample_op()
+            }),
             Frame::OplogAck {
                 origin: [2u8; 16],
                 up_to_seq: 42,
@@ -428,6 +455,7 @@ mod tests {
                 vv: [([7u8; 16], 3u64)].into_iter().collect(),
                 mode: 0o644,
                 size: 123,
+                uuid: Some([4u8; 16]),
             },
             ReconcileFrame::Done,
         ];

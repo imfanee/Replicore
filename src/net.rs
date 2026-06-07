@@ -40,7 +40,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::apply::{apply_assembled, apply_delete, apply_rename, ApplyError};
 use crate::chunk::Cas;
 use crate::config::{Config, Peer};
 use crate::conflict::{PlannedRow, Version, META_NONE};
@@ -1047,6 +1047,7 @@ impl Engine {
                             vv: row.vv.clone(),
                             mode: row.mode,
                             size: row.size,
+                            uuid: row.uuid,
                         },
                         None => ReconcileFrame::LeafResp {
                             found: false,
@@ -1055,6 +1056,7 @@ impl Engine {
                             vv: crate::vv::VersionVector::new(),
                             mode: 0,
                             size: 0,
+                            uuid: None,
                         },
                     };
                     write_msg(&mut send, &resp).await?;
@@ -1486,6 +1488,61 @@ impl Engine {
                 self.resolve_concurrent_op(&resolved_op).await?;
             }
         }
+        // A rename's SECOND path-effect: the source tombstone committed in
+        // the same transaction iff the op dominated the source row. Repair /
+        // resolve whatever did not dominate (a quarantined op never touched
+        // either side).
+        if resolved_op.op_type == OpType::Rename && decision != Decision::Quarantined {
+            if let Some(old_rel) = resolved_op.path_old.clone() {
+                let old_local = self.store.load_file(&old_rel).await?;
+                match decide(old_local.as_ref(), &resolved_op.vv) {
+                    // Normal success lands here too (the committed tombstone
+                    // dominates the op): restore-from-row is an idempotent
+                    // no-op then, and the repair when a local write landed
+                    // during the fetch window after we unlinked the source.
+                    Decision::Ignore | Decision::Apply => {
+                        crate::merkle::restore_local_content(
+                            &self.store,
+                            &self.cas,
+                            &self.cfg.share_dir,
+                            &self.suppress,
+                            &old_rel,
+                        )
+                        .await;
+                    }
+                    Decision::Concurrent => {
+                        // rename-vs-modify at the source: modify wins, the
+                        // source resurrects (FR-304, identity-lite).
+                        Stats::inc(&self.stats.conflicts);
+                        tracing::warn!(
+                            path = %old_rel,
+                            origin = %hex::encode(&resolved_op.origin[..4]),
+                            "concurrent write at rename source; restoring and resolving (FR-304)"
+                        );
+                        crate::merkle::restore_local_content(
+                            &self.store,
+                            &self.cas,
+                            &self.cfg.share_dir,
+                            &self.suppress,
+                            &old_rel,
+                        )
+                        .await;
+                        let src_effect = Version {
+                            tombstone: true,
+                            content_hash: None,
+                            meta_hash: META_NONE,
+                            mode: 0,
+                            size: 0,
+                            vv: resolved_op.vv.clone(),
+                            uuid: resolved_op.uuid,
+                        };
+                        self.resolve_concurrent_at(&old_rel, src_effect, resolved_op.origin)
+                            .await?;
+                    }
+                    Decision::Quarantined => {}
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1510,19 +1567,33 @@ impl Engine {
             mode: op.mode,
             size: op.size,
             vv: op.vv.clone(),
+            uuid: op.uuid,
         };
+        self.resolve_concurrent_at(&op.path, remote, op.origin)
+            .await
+    }
+
+    /// Resolve one conflicted path against `remote` (an op's effect on that
+    /// path, or a reconcile leaf), fetching loser content from `origin`
+    /// first. See `resolve_concurrent_op` for the loop contract.
+    async fn resolve_concurrent_at(
+        &self,
+        path: &str,
+        remote: Version,
+        origin: NodeId,
+    ) -> Result<(), NetError> {
         let mut staged: Vec<PlannedRow> = Vec::new();
         let mut staged_paths: Vec<String> = Vec::new();
         for _ in 0..4 {
             match self
                 .store
-                .resolve_rows(&op.path, remote.clone(), std::mem::take(&mut staged))
+                .resolve_rows(path, remote.clone(), std::mem::take(&mut staged))
                 .await?
             {
                 ResolveOutcome::Resolved => {
                     tracing::info!(
-                        path = %op.path,
-                        origin = %hex::encode(&op.origin[..4]),
+                        path = %path,
+                        origin = %hex::encode(&origin[..4]),
                         "conflict resolved: winner + copies committed (FR-303)"
                     );
                     return Ok(());
@@ -1534,7 +1605,7 @@ impl Engine {
                 }
                 ResolveOutcome::Unresolvable => {
                     tracing::error!(
-                        path = %op.path,
+                        path = %path,
                         "conflict copy chain too deep; keeping local (reconcile retries)"
                     );
                     self.restore_paths(&staged_paths).await;
@@ -1542,7 +1613,7 @@ impl Engine {
                 }
                 ResolveOutcome::Stale { plan } => {
                     for row in &plan {
-                        match self.stage_planned_row(row, op.origin).await {
+                        match self.stage_planned_row(row, origin).await {
                             Ok(true) => staged_paths.push(row.path.clone()),
                             Ok(false) => {}
                             Err(e) if is_permanent(&e) => {
@@ -1565,7 +1636,7 @@ impl Engine {
             }
         }
         tracing::warn!(
-            path = %op.path,
+            path = %path,
             "conflict resolution retries exhausted under local writes; reconcile retries"
         );
         self.restore_paths(&staged_paths).await;
@@ -1716,6 +1787,61 @@ impl Engine {
                 let suppress = self.suppress.clone();
                 tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress))
                     .await??;
+            }
+            // Identity-preserving move (FR-205): the target receives the file
+            // (rename(2) of the local bytes when they match — no retransfer;
+            // assemble otherwise), the source goes away IF the op dominates
+            // it (a concurrent write to the source keeps it — modify wins;
+            // the post-commit step in process_remote_op resolves it).
+            OpType::Rename => {
+                let hash = op
+                    .content_hash
+                    .ok_or(NetError::Violation("rename op without content hash"))?;
+                let old_rel = op
+                    .path_old
+                    .clone()
+                    .ok_or(NetError::Violation("rename op without path_old"))?;
+                let old_local = self.store.load_file(&old_rel).await?;
+                let old_dominated = decide(old_local.as_ref(), &op.vv) == Decision::Apply;
+                let have = local.is_some_and(|l| !l.tombstone && l.content_hash == Some(hash));
+                if !have {
+                    let moved = if old_dominated {
+                        let share = self.cfg.share_dir.clone();
+                        let old = old_rel.clone();
+                        let new = op.path.clone();
+                        let mode = op.mode;
+                        let suppress = self.suppress.clone();
+                        tokio::task::spawn_blocking(move || {
+                            apply_rename(&share, &old, &new, mode, &hash, &suppress)
+                        })
+                        .await??
+                    } else {
+                        false
+                    };
+                    if !moved {
+                        if op.size > self.cfg.max_file_bytes {
+                            return Err(NetError::TooBig);
+                        }
+                        self.await_unpaused().await;
+                        let _transfer_permit = self
+                            .transfers
+                            .clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+                        Stats::gauge_inc(&self.stats.inflight_transfers);
+                        let result = self.fetch_and_assemble(op, hash).await;
+                        Stats::gauge_dec(&self.stats.inflight_transfers);
+                        result?;
+                    }
+                }
+                if old_dominated {
+                    // Idempotent if the fast path already moved the file.
+                    let share = self.cfg.share_dir.clone();
+                    let suppress = self.suppress.clone();
+                    tokio::task::spawn_blocking(move || apply_delete(&share, &old_rel, &suppress))
+                        .await??;
+                }
             }
         }
         Ok(())
@@ -1930,12 +2056,14 @@ impl ReconcileTransport for QuicReconcile<'_> {
                 vv,
                 mode,
                 size,
+                uuid,
             } => Ok(Some(RemoteLeaf {
                 tombstone,
                 content_hash,
                 vv,
                 mode,
                 size,
+                uuid,
             })),
             _ => Err(ReconcileError::Violation("expected LeafResp")),
         }

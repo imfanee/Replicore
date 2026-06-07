@@ -40,6 +40,10 @@ tempfile = "3"
 # Integration tests inspect connection state directly (deterministic teardown
 # assertions); the types are already public via ConnRegistry's API.
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+# The v3→v4 migration test forges a legacy-layout database directly (a test
+# fixture the write-path grep-gate must not see inside src/).
+rusqlite = { version = "0.37", features = ["bundled"] }
+bincode = "1.3"
 
 [profile.release]
 opt-level = 2

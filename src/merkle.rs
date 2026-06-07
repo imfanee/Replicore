@@ -221,6 +221,7 @@ pub struct RemoteLeaf {
     pub vv: VersionVector,
     pub mode: u32,
     pub size: u64,
+    pub uuid: Option<[u8; 16]>,
 }
 
 /// Session transport, abstracted so the convergence property test can drive
@@ -395,6 +396,7 @@ async fn resolve_concurrent_leaf<T: ReconcileTransport>(
         mode: rleaf.mode,
         size: rleaf.size,
         vv: rleaf.vv.clone(),
+        uuid: rleaf.uuid,
     };
     let mut staged: Vec<PlannedRow> = Vec::new();
     let mut staged_paths: Vec<String> = Vec::new();
@@ -522,6 +524,7 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
                 size: 0,
                 vv: rleaf.vv.clone(),
                 tombstone: true,
+                uuid: rleaf.uuid,
             })
             .await?;
     } else {
@@ -549,6 +552,7 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
                 size: rleaf.size,
                 vv: rleaf.vv.clone(),
                 tombstone: false,
+                uuid: rleaf.uuid,
             })
             .await?;
     }
@@ -663,6 +667,7 @@ mod tests {
             size: 1,
             tombstone,
             vv: [(nid(1), vva)].into_iter().collect(),
+            uuid: None,
         }
     }
 

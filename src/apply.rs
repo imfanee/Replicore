@@ -216,6 +216,55 @@ fn verify_on_disk(path: &Path, hash: &[u8; 32], rel: &str) -> Result<(), ApplyEr
     Ok(())
 }
 
+/// Identity-preserving move for a remote rename (FR-205): `root/old_rel` →
+/// `root/new_rel` via `rename(2)`, taken ONLY when the source file already
+/// holds exactly `hash` (verified by readback first) — the no-retransfer fast
+/// path. Returns `Ok(false)` with the fs untouched when the source is missing
+/// or holds other bytes; the caller falls back to assemble-at-target.
+/// Suppression is registered for BOTH path events before the mutation.
+pub fn apply_rename(
+    root: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    mode: u32,
+    hash: &[u8; 32],
+    suppress: &Suppressor,
+) -> Result<bool, ApplyError> {
+    let src = safe_dest(root, old_rel)?;
+    let dest = safe_dest(root, new_rel)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| ApplyError::UnsafePath(new_rel.to_string()))?;
+    match verify_on_disk(&src, hash, old_rel) {
+        Ok(()) => {}
+        // Source gone or different content: not a fast-path candidate.
+        Err(ApplyError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false)
+        }
+        Err(ApplyError::HashMismatch(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(parent).map_err(io_err("mkdir", parent))?;
+
+    // Both halves of the move are self-inflicted events (FR-902).
+    suppress.register_delete(old_rel);
+    suppress.register_write(new_rel, *hash);
+
+    std::fs::rename(&src, &dest).map_err(io_err("rename", &dest))?;
+    let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+    std::fs::set_permissions(&dest, perms).map_err(io_err("chmod", &dest))?;
+    // Persist the namespace change in both directories.
+    if let Ok(dirf) = std::fs::File::open(parent) {
+        let _ = dirf.sync_all();
+    }
+    if let Some(old_parent) = src.parent() {
+        if let Ok(dirf) = std::fs::File::open(old_parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    Ok(true)
+}
+
 /// Unlink `root/rel` for a remote delete (tombstone). A missing file is
 /// success — the delete already happened from the fs point of view.
 pub fn apply_delete(root: &Path, rel: &str, suppress: &Suppressor) -> Result<(), ApplyError> {

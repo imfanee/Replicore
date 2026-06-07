@@ -48,6 +48,20 @@ fn op_version(op: &OpRecord) -> Version {
         mode: op.mode,
         size: op.size,
         vv: op.vv.clone(),
+        uuid: op.uuid,
+    }
+}
+
+/// A rename op's SOURCE-path effect: a tombstone with the op's lineage.
+fn rename_source_version(op: &OpRecord) -> Version {
+    Version {
+        tombstone: true,
+        content_hash: None,
+        meta_hash: META_NONE,
+        mode: 0,
+        size: 0,
+        vv: op.vv.clone(),
+        uuid: op.uuid,
     }
 }
 
@@ -128,6 +142,19 @@ impl Replica {
                     }
                 }
                 OpType::Delete => self.fs.delete(&op.path),
+                OpType::Rename => {
+                    if let Some(hash) = op.content_hash {
+                        self.fs.write(&op.path, hash);
+                    }
+                    // Source file goes only if the op dominates the source
+                    // row (mirrors materialize + the committing tx).
+                    if let Some(old_rel) = &op.path_old {
+                        let old_local = self.store.load_file(old_rel).await?;
+                        if decide(old_local.as_ref(), &op.vv) == Decision::Apply {
+                            self.fs.delete(old_rel);
+                        }
+                    }
+                }
             }
         }
         if decision == Decision::Concurrent {
@@ -152,7 +179,52 @@ impl Replica {
                 self.resolve_conflict(&op.path, op_version(op)).await?;
             }
         }
+        // A rename's SECOND path-effect (the source) was decided per-path in
+        // the same transaction; repair / resolve whatever did not dominate
+        // (mirrors process_remote_op's post-step).
+        if op.op_type == OpType::Rename && decision != Decision::Quarantined {
+            if let Some(old_rel) = &op.path_old {
+                let old_local = self.store.load_file(old_rel).await?;
+                match decide(old_local.as_ref(), &op.vv) {
+                    Decision::Ignore | Decision::Apply => self.sync_fs_from_row(old_rel).await?,
+                    Decision::Concurrent => {
+                        self.sync_fs_from_row(old_rel).await?;
+                        self.resolve_conflict(old_rel, rename_source_version(op))
+                            .await?;
+                    }
+                    Decision::Quarantined => {}
+                }
+            }
+        }
         Ok(Some(effective))
+    }
+
+    /// The harness analogue of `merkle::restore_local_content`: make the fake
+    /// fs agree with the committed row for `path`.
+    async fn sync_fs_from_row(&mut self, path: &str) -> Result<(), StoreError> {
+        match self.store.load_file(path).await? {
+            Some(row) if !row.tombstone => {
+                if let Some(hash) = row.content_hash {
+                    self.fs.write(path, hash);
+                }
+            }
+            _ => self.fs.delete(path),
+        }
+        Ok(())
+    }
+
+    /// A local application moves `old` to `new`: mutate the fake fs, then run
+    /// the real identity-preserving rename append (FR-205).
+    pub async fn local_rename(
+        &mut self,
+        old: &str,
+        new: &str,
+    ) -> Result<Option<OpRecord>, StoreError> {
+        if let Some(hash) = self.fs.0.get(old).copied() {
+            self.fs.delete(old);
+            self.fs.write(new, hash);
+        }
+        self.store.append_local_rename(old, new).await
     }
 
     /// The conflict-resolution loop every Concurrent site runs (net.rs mirrors
@@ -206,6 +278,7 @@ impl Replica {
                             size: r.size,
                             vv: r.vv.clone(),
                             tombstone: r.tombstone,
+                            uuid: r.uuid,
                         })
                         .await?;
                     if effective == Decision::Apply {

@@ -30,11 +30,14 @@ const NODES: [NodeId; 3] = [[0xaa; 16], [0xbb; 16], [0xcc; 16]];
 enum Action {
     Write(u8),
     Delete,
+    /// Identity-preserving move to another pool slot (FR-205/FR-304:
+    /// rename-vs-modify and rename-vs-rename interleavings).
+    Rename(usize),
 }
 
 /// Scripts over a SHARED namespace: every node writes the same few paths, so
-/// concurrent overlap (the thing under test) is dense, with deletes mixed in
-/// for the delete-vs-modify rule.
+/// concurrent overlap (the thing under test) is dense, with deletes and
+/// renames mixed in for the FR-304 rule matrix.
 fn arb_script() -> impl Strategy<Value = Vec<(usize, Action)>> {
     proptest::collection::vec(
         (
@@ -42,6 +45,7 @@ fn arb_script() -> impl Strategy<Value = Vec<(usize, Action)>> {
             prop_oneof![
                 4 => (0u8..6).prop_map(Action::Write),
                 1 => Just(Action::Delete),
+                1 => (0usize..3).prop_map(Action::Rename),
             ],
         ),
         0..8,
@@ -58,6 +62,10 @@ async fn run_script(
         let emitted = match action {
             Action::Write(c) => replica.local_write(&path, &[*c]).await.unwrap(),
             Action::Delete => replica.local_delete(&path).await.unwrap(),
+            Action::Rename(to) => {
+                let target = format!("shared/p{to}");
+                replica.local_rename(&path, &target).await.unwrap()
+            }
         };
         ops.extend(emitted);
     }
@@ -186,6 +194,9 @@ proptest! {
                 std::collections::BTreeMap::new();
             for ops in &all_ops {
                 for op in ops {
+                    if let Some(old_path) = &op.path_old {
+                        last_by_author.remove(&(old_path.clone(), op.origin));
+                    }
                     match op.content_hash {
                         Some(h) => last_by_author.insert((op.path.clone(), op.origin), h),
                         None => last_by_author.remove(&(op.path.clone(), op.origin)),

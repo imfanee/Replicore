@@ -111,6 +111,7 @@ impl ReconcileTransport for TestTransport<'_> {
             vv: row.vv.clone(),
             mode: row.mode,
             size: row.size,
+            uuid: row.uuid,
         }))
     }
 
@@ -366,6 +367,7 @@ async fn reconcile_resolves_concurrent_local_write_landing_during_fetch() {
                 vv: row.vv.clone(),
                 mode: row.mode,
                 size: row.size,
+                uuid: row.uuid,
             }))
         }
         async fn ensure_content(

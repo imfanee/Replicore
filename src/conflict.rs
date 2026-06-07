@@ -94,6 +94,10 @@ pub struct Version {
     pub mode: u32,
     pub size: u64,
     pub vv: VersionVector,
+    /// File identity (FR-205). NOT a winner-key input — identity does not
+    /// rank content — but the committed winner row carries the winner's uuid
+    /// (normalized like `mode` when keys tie).
+    pub uuid: Option<[u8; 16]>,
 }
 
 impl Version {
@@ -116,6 +120,7 @@ impl Version {
             mode: row.mode,
             size: row.size,
             vv: row.vv.clone(),
+            uuid: row.uuid,
         }
     }
 }
@@ -132,6 +137,7 @@ pub struct PlannedRow {
     pub size: u64,
     pub tombstone: bool,
     pub vv: VersionVector,
+    pub uuid: Option<[u8; 16]>,
 }
 
 /// Copy chains longer than this are refused (`plan_candidates` returns
@@ -200,18 +206,15 @@ pub fn plan_candidates<E>(
     for c in candidates {
         vv.merge(&c.vv);
     }
+    // Among equal-key members the content is identical but mode/uuid are not
+    // part of any key: normalize so all nodes commit the same row.
+    let equal_key = || maximal.iter().filter(|m| m.key() == winner.key());
     let mode = if winner.tombstone {
         0
     } else {
-        // Among equal-key members the content is identical but mode is not
-        // part of any key (until 3c): normalize so all nodes commit the same.
-        maximal
-            .iter()
-            .filter(|m| m.key() == winner.key())
-            .map(|m| m.mode)
-            .max()
-            .unwrap_or(winner.mode)
+        equal_key().map(|m| m.mode).max().unwrap_or(winner.mode)
     };
+    let uuid = equal_key().filter_map(|m| m.uuid).max().or(winner.uuid);
     let mut rows = vec![PlannedRow {
         path: path.to_string(),
         content_hash: winner.content_hash,
@@ -219,6 +222,7 @@ pub fn plan_candidates<E>(
         size: if winner.tombstone { 0 } else { winner.size },
         tombstone: winner.tombstone,
         vv,
+        uuid,
     }];
 
     // Losers with content of their own become copies. The antichain is key-
@@ -248,6 +252,10 @@ pub fn plan_candidates<E>(
                 break;
             }
             let cvv = copy_vv(&cp);
+            // A copy row's uuid is as synthetic as its VV: a deterministic
+            // function of the copy path (a copy is a NEW file, not the
+            // original's identity at a second name).
+            let cuuid = Some(copy_origin(&cp));
             match lookup(&cp)? {
                 None => rows.push(PlannedRow {
                     path: cp.clone(),
@@ -256,6 +264,7 @@ pub fn plan_candidates<E>(
                     size: content.size,
                     tombstone: false,
                     vv: cvv,
+                    uuid: cuuid,
                 }),
                 Some(existing) => match cvv.compare(&existing.vv) {
                     // Empty-history row only; treat like absent.
@@ -266,6 +275,7 @@ pub fn plan_candidates<E>(
                         size: content.size,
                         tombstone: false,
                         vv: cvv,
+                        uuid: cuuid,
                     }),
                     // Idempotent re-derivation (Equal) or the copy was since
                     // edited by a user (Dominated): the existing row stands.
@@ -277,6 +287,7 @@ pub fn plan_candidates<E>(
                         let as_copy = Version {
                             tombstone: false,
                             vv: cvv.clone(),
+                            uuid: cuuid,
                             ..content.clone()
                         };
                         let pair = [existing.clone(), as_copy];
@@ -284,17 +295,19 @@ pub fn plan_candidates<E>(
                         let (w, l) = (nested[0], nested[1]);
                         let mut nvv = existing.vv.clone();
                         nvv.merge(&cvv);
+                        let keys_tie = w.key() == l.key();
                         rows.push(PlannedRow {
                             path: cp.clone(),
                             content_hash: w.content_hash,
-                            mode: if w.key() == l.key() {
-                                w.mode.max(l.mode)
-                            } else {
-                                w.mode
-                            },
+                            mode: if keys_tie { w.mode.max(l.mode) } else { w.mode },
                             size: w.size,
                             tombstone: false,
                             vv: nvv,
+                            uuid: if keys_tie {
+                                w.uuid.max(l.uuid)
+                            } else {
+                                w.uuid.or(cuuid)
+                            },
                         });
                         if let Some(lh) = l.content_hash {
                             if w.content_hash != Some(lh) {
@@ -368,6 +381,7 @@ mod tests {
             mode: 0o644,
             size: 1,
             vv: v,
+            uuid: None,
         }
     }
 
@@ -379,6 +393,7 @@ mod tests {
             mode: 0o644,
             size: 0,
             vv: v,
+            uuid: None,
         }
     }
 
@@ -546,6 +561,7 @@ mod tests {
             mode: 0o644,
             size: 1,
             vv: copy_vv(&cp),
+            uuid: None,
         };
         let rows = match plan_candidates::<Infallible>("f", &[lo, hi], &mut |p| {
             Ok((p == cp).then(|| existing.clone()))
