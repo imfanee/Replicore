@@ -249,7 +249,9 @@ proptest! {
                 // Reconstruct: original may have had an extension restored
                 // after the marker; accept either form.
                 let with_ext = row.path.rsplit('.').next().filter(|e| !e.contains('-'));
-                let mh = Meta::hash_of(&row.meta);
+                // Names derive from the STABLE naming subset, not the full meta hash
+                // (review-copy-naming.md).
+                let mh = Meta::naming_hash(&row.meta);
                 let candidate_a = replicore::conflict::copy_path_for(&original, &hash, &mh);
                 let candidate_b = with_ext
                     .map(|e| {

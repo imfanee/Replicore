@@ -127,6 +127,60 @@ impl Meta {
         }
     }
 
+    /// Hash of the STABLE metadata subset used for conflict-COPY NAMING
+    /// (review-copy-naming.md). [`META_NONE`] for absent metadata (so every
+    /// meta-less loser names identically to a `META_NONE` caller).
+    ///
+    /// Included — durable, node-agnostic fields a user genuinely sets, so a
+    /// real difference must yield a distinct copy (S1 no-loss):
+    ///   `kind`, `mode`, `rdev`, `symlink_target`, `xattrs` (⊃ POSIX ACLs).
+    /// EXCLUDED — `mtime_s`, `mtime_ns`, `uid`, `gid`: timestamps and
+    /// ownership skew without semantic content (and uid/gid can diverge under
+    /// the residual `owner_policy=numeric` EPERM-skip), so they would only
+    /// proliferate near-duplicate copies; they are kept out of the name by
+    /// design. (The committed copy ROW still stores the FULL `Meta` — only
+    /// the NAME uses this subset.)
+    ///
+    /// Fixed, length-prefixed field order: this value is agreed across the
+    /// mesh and must never depend on encoding ambiguity.
+    pub fn naming_hash(meta: &Option<Meta>) -> [u8; 32] {
+        let Some(m) = meta else { return META_NONE };
+        let mut h = blake3::Hasher::new();
+        // kind: explicit discriminant (never rely on enum repr).
+        let kind: u8 = match m.kind {
+            FileKind::Regular => 0,
+            FileKind::Symlink => 1,
+            FileKind::Fifo => 2,
+            FileKind::CharDev => 3,
+            FileKind::BlockDev => 4,
+        };
+        h.update(&[kind]);
+        h.update(&m.mode.to_le_bytes());
+        h.update(&m.rdev.to_le_bytes());
+        match &m.symlink_target {
+            Some(t) => {
+                h.update(&[1]);
+                h.update(&(t.len() as u64).to_le_bytes());
+                h.update(t);
+            }
+            None => {
+                h.update(&[0]);
+            }
+        }
+        // xattrs (⊃ ACLs): sorted defensively, each entry length-prefixed so
+        // no key/value boundary is ambiguous.
+        let mut xattrs = m.xattrs.clone();
+        xattrs.sort();
+        h.update(&(xattrs.len() as u64).to_le_bytes());
+        for (k, v) in &xattrs {
+            h.update(&(k.len() as u64).to_le_bytes());
+            h.update(k);
+            h.update(&(v.len() as u64).to_le_bytes());
+            h.update(v);
+        }
+        *h.finalize().as_bytes()
+    }
+
     /// Snapshot `path`'s metadata (no following). `Ok(None)` = kind we do
     /// not replicate (socket, directory). The xattr list is sorted here —
     /// capture is the single place canonicalization happens.
@@ -516,6 +570,77 @@ mod tests {
             change(&mut m);
             assert_ne!(h, Meta::hash_of(&Some(m)), "field must be hashed");
         }
+    }
+
+    #[test]
+    fn naming_hash_includes_durable_excludes_skew() {
+        let base = Meta {
+            kind: FileKind::Regular,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            mtime_s: 1,
+            mtime_ns: 2,
+            symlink_target: None,
+            rdev: 0,
+            xattrs: vec![(b"user.a".to_vec(), b"1".to_vec())],
+        };
+        let h = Meta::naming_hash(&Some(base.clone()));
+        assert_eq!(h, Meta::naming_hash(&Some(base.clone())), "deterministic");
+        assert_eq!(Meta::naming_hash(&None), META_NONE, "None == META_NONE");
+        assert_ne!(h, META_NONE);
+
+        // DURABLE fields are in the subset — a change must alter the name.
+        for change in [
+            (|m: &mut Meta| m.mode = 0o600) as fn(&mut Meta),
+            |m: &mut Meta| m.kind = FileKind::Fifo,
+            |m: &mut Meta| m.rdev = 7,
+            |m: &mut Meta| m.symlink_target = Some(b"t".to_vec()),
+            |m: &mut Meta| m.xattrs[0].1 = b"2".to_vec(),
+            |m: &mut Meta| m.xattrs.push((b"user.b".to_vec(), b"x".to_vec())),
+        ] {
+            let mut m = base.clone();
+            change(&mut m);
+            assert_ne!(
+                h,
+                Meta::naming_hash(&Some(m)),
+                "durable field must be in the naming subset (S1)"
+            );
+        }
+
+        // SKEW fields are EXCLUDED — changing them must NOT alter the name
+        // (proliferation/divergence avoidance: mtime + ownership).
+        for change in [
+            (|m: &mut Meta| m.mtime_s = 9_999) as fn(&mut Meta),
+            |m: &mut Meta| m.mtime_ns = 7,
+            |m: &mut Meta| m.uid = 0,
+            |m: &mut Meta| m.gid = 0,
+        ] {
+            let mut m = base.clone();
+            change(&mut m);
+            assert_eq!(
+                h,
+                Meta::naming_hash(&Some(m)),
+                "skew field must NOT feed the name (mtime/uid/gid excluded)"
+            );
+        }
+
+        // xattr order is canonicalized (capture sorts; naming_hash re-sorts).
+        let mut reordered = base.clone();
+        reordered.xattrs = vec![
+            (b"user.z".to_vec(), b"9".to_vec()),
+            (b"user.a".to_vec(), b"1".to_vec()),
+        ];
+        let mut sorted = base.clone();
+        sorted.xattrs = vec![
+            (b"user.a".to_vec(), b"1".to_vec()),
+            (b"user.z".to_vec(), b"9".to_vec()),
+        ];
+        assert_eq!(
+            Meta::naming_hash(&Some(reordered)),
+            Meta::naming_hash(&Some(sorted)),
+            "xattr order must not affect the name"
+        );
     }
 
     #[test]

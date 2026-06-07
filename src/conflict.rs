@@ -46,10 +46,16 @@
 //!
 //! ## Conflict-copy naming
 //!
-//! The copy name is a pure function of the LOSING content:
-//! `<stem>.sync-conflict-<hex16><.ext>` with `hex16 = blake3(loser_hash)[..8]`.
-//! Same path + same losing content ⇒ same name on every node, and re-deriving
-//! the copy is idempotent. Distinct losers name distinct copies.
+//! The copy name is a pure function of the LOSING content AND its STABLE
+//! metadata subset: `<stem>.sync-conflict-<hex16><.ext>` with
+//! `hex16 = blake3(loser_content_hash ‖ Meta::naming_hash(loser_meta))[..8]`.
+//! The naming subset is {kind, mode, rdev, symlink_target, xattrs} and
+//! EXCLUDES mtime/uid/gid (durable, node-agreed fields distinguish copies;
+//! timestamp/ownership skew would only proliferate near-duplicates — see
+//! docs/review-copy-naming.md). Same path + same content + same durable meta
+//! ⇒ same name on every node; re-deriving is idempotent; a genuine durable
+//! difference names a distinct copy (S1 no-loss). The committed copy ROW
+//! still stores the loser's FULL metadata — only the NAME uses the subset.
 //!
 //! Copies derived at intermediate states (before the full op set arrived)
 //! persist — they are never garbage-collected by a later derivation. The set
@@ -252,9 +258,11 @@ pub fn plan_candidates<E>(
         }
         // The copy chain: each link is (copy path, the version whose content
         // lands there); a collision with a live row pushes the chain one
-        // deterministic link further.
+        // deterministic link further. The NAME uses the stable metadata
+        // subset (Meta::naming_hash — excludes mtime/uid/gid) so mtime/owner-
+        // only losers coalesce; the committed row below keeps FULL `meta`.
         let mut link = Some((
-            copy_path_for(path, &hash, &loser.meta_hash),
+            copy_path_for(path, &hash, &Meta::naming_hash(&loser.meta)),
             (**loser).clone(),
         ));
         let mut depth = 0usize;
@@ -264,14 +272,17 @@ pub fn plan_candidates<E>(
                 return Ok(None);
             }
             // A copy planned for this same resolution already? The name is a
-            // pure function of (content, meta), so a collision here means an
-            // identical version is already preserved.
+            // pure function of (content, naming-subset meta), so a collision
+            // here means a same-content, same-DURABLE-meta version is already
+            // preserved. Two losers differing ONLY in the excluded fields
+            // (mtime/uid/gid) intentionally COALESCE to this one copy — the
+            // first wins; the metadata that survives is its full snapshot.
             if let Some(planned) = rows.iter().find(|r| r.path == cp) {
                 debug_assert_eq!(planned.content_hash, content.content_hash);
                 debug_assert_eq!(
-                    Meta::hash_of(&planned.meta),
-                    content.meta_hash,
-                    "copy-name collision with differing meta"
+                    Meta::naming_hash(&planned.meta),
+                    Meta::naming_hash(&content.meta),
+                    "copy-name collision with differing durable meta"
                 );
                 break;
             }
@@ -338,7 +349,10 @@ pub fn plan_candidates<E>(
                         });
                         if let Some(lh) = l.content_hash {
                             if l.key() != w.key() {
-                                link = Some((copy_path_for(&cp, &lh, &l.meta_hash), l.clone()));
+                                link = Some((
+                                    copy_path_for(&cp, &lh, &Meta::naming_hash(&l.meta)),
+                                    l.clone(),
+                                ));
                             }
                         }
                     }
@@ -350,10 +364,13 @@ pub fn plan_candidates<E>(
 }
 
 /// Conflict-copy name for a losing VERSION: a pure function of the losing
-/// content hash AND meta hash — never the clock, never node-local state.
-/// Meta participates because a meta-only loser (same bytes, different
-/// xattrs/owner/mode/mtime) is replicated state too (FR-303): it needs its
-/// own deterministic name, distinct from a content-loser sharing its bytes.
+/// content hash AND a metadata hash — never the clock, never node-local
+/// state. Callers pass the STABLE naming subset ([`Meta::naming_hash`],
+/// excludes mtime/uid/gid) so a loser differing only in durable metadata
+/// (a real xattr/mode/kind difference) gets its own deterministic name
+/// (S1 no-loss), while mtime/owner-only variants coalesce to one copy.
+/// `META_NONE` for meta-less (delete-shaped) losers. See
+/// docs/review-copy-naming.md.
 ///
 /// `dir/report.txt` → `dir/report.sync-conflict-<hex16>.txt`. The extension is
 /// preserved (operators expect `.wav` to stay playable); a leading dot is not
@@ -419,6 +436,36 @@ mod tests {
         }
     }
 
+    /// A write carrying a REAL `Meta` (so `naming_hash` reflects it). The
+    /// `meta_hash` field is kept consistent with `meta` like production.
+    fn write_meta(hash: u8, v: VersionVector, meta: crate::metadata::Meta) -> Version {
+        let some = Some(meta);
+        Version {
+            tombstone: false,
+            content_hash: Some([hash; 32]),
+            meta_hash: Meta::hash_of(&some),
+            mode: some.as_ref().unwrap().mode,
+            size: 1,
+            vv: v,
+            uuid: None,
+            meta: some,
+        }
+    }
+
+    fn base_meta() -> crate::metadata::Meta {
+        crate::metadata::Meta {
+            kind: crate::metadata::FileKind::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_s: 1_000,
+            mtime_ns: 0,
+            symlink_target: None,
+            rdev: 0,
+            xattrs: vec![],
+        }
+    }
+
     fn tomb(v: VersionVector) -> Version {
         Version {
             tombstone: true,
@@ -453,6 +500,11 @@ mod tests {
         assert_eq!(plan("dir/f.txt", &perm), base);
         perm.reverse();
         assert_eq!(plan("dir/f.txt", &perm), base);
+        // The conflict copy's NAME is part of that byte-identical plan — two
+        // nodes deriving the same conflict (same candidate set, any order)
+        // produce the identical copy path. This is the determinism property.
+        let copy = base.iter().find(|r| r.path.contains(COPY_MARKER));
+        assert!(copy.is_some(), "expected a conflict copy in the plan");
     }
 
     /// The pairwise non-confluence repro: B writes H0, C writes H1 then H0.
@@ -533,36 +585,126 @@ mod tests {
     }
 
     #[test]
-    fn meta_only_loser_is_preserved_with_its_metadata() {
-        // S1 review finding: concurrent metadata-only writes (same bytes,
-        // different xattrs/owner/mode/mtime) are replicated state — the
-        // losing snapshot must survive as a copy, not vanish (FR-303).
-        let mut a = write(5, vv(&[(1, 1)]));
-        let mut b = write(5, vv(&[(2, 1)]));
-        a.meta_hash = [1u8; 32];
-        b.meta_hash = [2u8; 32];
-        let rows = plan("f", &[a.clone(), b.clone()]);
-        assert_eq!(rows.len(), 2, "meta-only loser must be copied");
-        // Winner: larger meta_hash breaks the content tie.
-        assert_eq!(rows[0].content_hash, Some([5u8; 32]));
-        // The copy carries the LOSER's bytes AND its name embeds the losing
-        // meta hash (distinct from a copy of the same bytes under other
-        // meta); rows[1].meta is the loser's snapshot (None in this minimal
-        // harness, hashed as META_NONE would differ from [1;32] — the name
-        // is computed from meta_HASH which the Version carries).
+    fn durable_meta_losers_get_distinct_copies() {
+        // S1 (review-copy-naming.md §2): two losers with identical bytes but a
+        // genuine DURABLE metadata difference (mode here, xattr below) must
+        // each be preserved as a DISTINCT copy — the naming subset keeps mode
+        // and xattrs, so the names differ. (Winner = the one whose full key
+        // is larger; the two losers are what we check survive.)
+        let mut hi = write_meta(9, vv(&[(1, 1)]), base_meta()); // content winner
+        hi.meta = Some(crate::metadata::Meta {
+            mode: 0o600,
+            ..base_meta()
+        });
+        hi.meta_hash = Meta::hash_of(&hi.meta);
+        hi.mode = 0o600;
+        let mut lo_a = write_meta(5, vv(&[(2, 1)]), base_meta()); // loser, mode 644
+        let mut lo_b = write_meta(5, vv(&[(3, 1)]), base_meta()); // loser, same bytes
+        lo_b.meta = Some(crate::metadata::Meta {
+            mode: 0o755,
+            ..base_meta()
+        });
+        lo_b.meta_hash = Meta::hash_of(&lo_b.meta);
+        lo_b.mode = 0o755;
+        // lo_a and lo_b share content (5) but differ in mode (644 vs 755).
+        let _ = &mut lo_a;
+        let rows = plan("f", &[hi.clone(), lo_a.clone(), lo_b.clone()]);
+        let copies: Vec<_> = rows
+            .iter()
+            .filter(|r| r.path.contains(COPY_MARKER))
+            .collect();
         assert_eq!(
-            rows[1].path,
-            copy_path_for("f", &[5u8; 32], &[1u8; 32]),
-            "copy name must embed the losing meta hash"
+            copies.len(),
+            2,
+            "two losers with different DURABLE meta (mode) must each be copied (S1)"
         );
-        // Symmetric in either presentation order.
-        assert_eq!(plan("f", &[b, a]), rows);
-        // Same bytes, IDENTICAL meta: interchangeable — still no copy.
-        let mut c = write(5, vv(&[(1, 1)]));
-        let mut d = write(5, vv(&[(2, 1)]));
-        c.meta_hash = [9u8; 32];
-        d.meta_hash = [9u8; 32];
-        assert_eq!(plan("g", &[c, d]).len(), 1);
+        let names: std::collections::BTreeSet<_> = copies.iter().map(|r| &r.path).collect();
+        assert_eq!(names.len(), 2, "the two copies must have DISTINCT names");
+        // Order-independent.
+        let rows2 = plan("f", &[lo_b, lo_a, hi]);
+        assert_eq!(rows, rows2);
+
+        // Same content, different XATTR → also distinct copies.
+        let mut x = write_meta(9, vv(&[(1, 1)]), base_meta());
+        let mut y_a = write_meta(5, vv(&[(2, 1)]), base_meta());
+        let mut y_b = write_meta(5, vv(&[(3, 1)]), base_meta());
+        y_a.meta = Some(crate::metadata::Meta {
+            xattrs: vec![(b"user.k".to_vec(), b"1".to_vec())],
+            ..base_meta()
+        });
+        y_a.meta_hash = Meta::hash_of(&y_a.meta);
+        y_b.meta = Some(crate::metadata::Meta {
+            xattrs: vec![(b"user.k".to_vec(), b"2".to_vec())],
+            ..base_meta()
+        });
+        y_b.meta_hash = Meta::hash_of(&y_b.meta);
+        let _ = &mut x;
+        let xr = plan("g", &[x, y_a, y_b]);
+        assert_eq!(
+            xr.iter().filter(|r| r.path.contains(COPY_MARKER)).count(),
+            2,
+            "two losers differing only by xattr value must each be copied (S1)"
+        );
+    }
+
+    #[test]
+    fn mtime_only_losers_coalesce_to_one_copy() {
+        // Proliferation fix (review-copy-naming.md §1): two losers with
+        // identical bytes AND identical durable meta but DIFFERENT mtime must
+        // collapse to ONE copy — mtime is excluded from the name.
+        let winner = write_meta(9, vv(&[(1, 1)]), base_meta()); // content winner
+        let mut l1 = write_meta(5, vv(&[(2, 1)]), base_meta());
+        let mut l2 = write_meta(5, vv(&[(3, 1)]), base_meta());
+        l1.meta = Some(crate::metadata::Meta {
+            mtime_s: 100,
+            ..base_meta()
+        });
+        l1.meta_hash = Meta::hash_of(&l1.meta);
+        l2.meta = Some(crate::metadata::Meta {
+            mtime_s: 999,
+            ..base_meta()
+        });
+        l2.meta_hash = Meta::hash_of(&l2.meta);
+        // Distinct full meta_hash (mtime differs) but same naming subset.
+        assert_ne!(l1.meta_hash, l2.meta_hash);
+        assert_eq!(
+            Meta::naming_hash(&l1.meta),
+            Meta::naming_hash(&l2.meta),
+            "mtime must not affect the naming subset"
+        );
+        let rows = plan("f", &[winner, l1, l2]);
+        assert_eq!(
+            rows.iter().filter(|r| r.path.contains(COPY_MARKER)).count(),
+            1,
+            "mtime-only-different losers must coalesce to ONE copy"
+        );
+    }
+
+    #[test]
+    fn uid_only_losers_coalesce_to_one_copy() {
+        // ownership is excluded too (the residual EPERM-skew case): two
+        // losers differing only in uid/gid coalesce.
+        let winner = write_meta(9, vv(&[(1, 1)]), base_meta());
+        let mut l1 = write_meta(5, vv(&[(2, 1)]), base_meta());
+        let mut l2 = write_meta(5, vv(&[(3, 1)]), base_meta());
+        l1.meta = Some(crate::metadata::Meta {
+            uid: 1000,
+            gid: 1000,
+            ..base_meta()
+        });
+        l1.meta_hash = Meta::hash_of(&l1.meta);
+        l2.meta = Some(crate::metadata::Meta {
+            uid: 2000,
+            gid: 2000,
+            ..base_meta()
+        });
+        l2.meta_hash = Meta::hash_of(&l2.meta);
+        let rows = plan("f", &[winner, l1, l2]);
+        assert_eq!(
+            rows.iter().filter(|r| r.path.contains(COPY_MARKER)).count(),
+            1,
+            "uid/gid-only-different losers must coalesce to ONE copy"
+        );
     }
 
     #[test]
