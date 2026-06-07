@@ -336,6 +336,10 @@ pub struct Engine {
     join: crate::join::JoinTracker,
     /// Dynamic membership: roster + effective peers + live TLS allowlist.
     membership: Membership,
+    /// Operator pause gate (FR-1404): when set, push and new transfers wait;
+    /// in-flight transfers finish. Resume wakes the waiters.
+    paused: Arc<std::sync::atomic::AtomicBool>,
+    resume_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Engine {
@@ -363,6 +367,8 @@ impl Engine {
             transfers,
             join,
             membership,
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -374,6 +380,201 @@ impl Engine {
     /// The membership handle (control plane / gossip operate through it).
     pub fn membership(&self) -> Membership {
         self.membership.clone()
+    }
+
+    // -- control-plane accessors (FR-1401–1408) -----------------------------
+
+    pub fn conflicts(&self) -> u64 {
+        Stats::get(&self.stats.conflicts)
+    }
+
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Release);
+        self.resume_notify.notify_waiters();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    /// Park while paused (the push loop and new transfers call this). In-flight
+    /// transfers already past this gate run to completion.
+    async fn await_unpaused(&self) {
+        while self.paused.load(Ordering::Acquire) {
+            self.resume_notify.notified().await;
+        }
+    }
+
+    /// Local self-status (also the CTLQUERY mesh reply).
+    pub fn local_status(&self) -> crate::control::NodeStatus {
+        crate::control::NodeStatus {
+            node_id: hex::encode(self.cfg.node_id),
+            lifecycle: self.join.lifecycle().as_str().to_string(),
+            effective_members: self.membership.effective_peers().len(),
+            live_peers: self.conns.len(),
+            conflicts: self.conflicts(),
+            inflight_transfers: Stats::get_gauge(&self.stats.inflight_transfers),
+            paused: self.is_paused(),
+            roster_digest: hex::encode(self.membership.roster_digest()),
+            proto_version: PROTO_VERSION,
+        }
+    }
+
+    /// `status` (and `status --all`, which fans out over the mesh, FR-1407).
+    pub async fn status_report(&self, all: bool) -> crate::control::StatusReport {
+        let local = self.local_status();
+        let mut peers = Vec::new();
+        if all {
+            for (id, conn) in self.conns.all() {
+                let status = self.query_peer_status(&conn).await;
+                peers.push(crate::control::PeerStatusEntry {
+                    node_id: hex::encode(id),
+                    reachable: status.is_some(),
+                    status,
+                });
+            }
+        }
+        crate::control::StatusReport { local, peers }
+    }
+
+    /// Ask one peer for its status over a CTLQUERY stream, 3s timeout — a dead
+    /// or slow peer is marked unreachable rather than hanging the operator.
+    async fn query_peer_status(
+        &self,
+        conn: &quinn::Connection,
+    ) -> Option<crate::control::NodeStatus> {
+        let fut = async {
+            let (mut send, mut recv) = conn.open_bi().await.ok()?;
+            send.write_all(&[crate::proto::STREAM_TAG_CTLQUERY])
+                .await
+                .ok()?;
+            send.finish().ok()?;
+            read_msg::<_, crate::control::NodeStatus>(&mut recv)
+                .await
+                .ok()
+        };
+        tokio::time::timeout(Duration::from_secs(3), fut)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub fn member_views(&self) -> Vec<crate::control::MemberView> {
+        self.membership
+            .roster_snapshot()
+            .into_iter()
+            .map(|e| crate::control::MemberView {
+                node_id: hex::encode(e.node_id),
+                addr: e.addr.to_string(),
+                fingerprint: hex::encode(e.fingerprint),
+                epoch: e.epoch,
+                kind: match e.kind {
+                    crate::admin::EntryKind::Add => "add",
+                    crate::admin::EntryKind::Remove => "remove",
+                }
+                .to_string(),
+            })
+            .collect()
+    }
+
+    /// The current addr/fingerprint for a known member (for signing a Remove).
+    pub fn member_addr_fp(&self, node: &NodeId) -> (Option<String>, Option<String>) {
+        self.membership
+            .effective_peers()
+            .into_iter()
+            .find(|p| &p.node_id == node)
+            .map(|p| (Some(p.addr.to_string()), Some(hex::encode(p.fingerprint))))
+            .unwrap_or((None, None))
+    }
+
+    pub fn peer_views(&self) -> Vec<crate::control::PeerView> {
+        let connected: HashSet<NodeId> = self.conns.all().into_iter().map(|(id, _)| id).collect();
+        self.peers_reg
+            .snapshot()
+            .into_iter()
+            .map(|(id, st)| crate::control::PeerView {
+                node_id: hex::encode(id),
+                state: st.state.as_str().to_string(),
+                connected: connected.contains(&id),
+            })
+            .collect()
+    }
+
+    pub async fn lag_views(&self) -> Vec<crate::control::LagView> {
+        let our_latest = *self.store.watch_latest().borrow();
+        let mut out = Vec::new();
+        for peer in self.membership.effective_peers() {
+            let recv_cursor = self.store.recv_cursor(peer.node_id).await.unwrap_or(0);
+            let last_acked = self.store.last_acked(peer.node_id).await.unwrap_or(0);
+            out.push(crate::control::LagView {
+                node_id: hex::encode(peer.node_id),
+                recv_cursor,
+                last_acked,
+                our_latest,
+            });
+        }
+        out
+    }
+
+    pub fn transfers_view(&self) -> crate::control::TransfersView {
+        crate::control::TransfersView {
+            inflight: Stats::get_gauge(&self.stats.inflight_transfers),
+            chunks_fetched: Stats::get(&self.stats.chunks_fetched),
+            chunks_served: Stats::get(&self.stats.chunks_served),
+            bytes_in: Stats::get(&self.stats.bytes_in),
+            bytes_out: Stats::get(&self.stats.bytes_out),
+        }
+    }
+
+    pub fn version_view(&self) -> crate::control::VersionView {
+        crate::control::VersionView {
+            node_id: hex::encode(self.cfg.node_id),
+            proto_version: PROTO_VERSION,
+            pkg_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    pub fn config_diff(&self, candidate: &Config) -> Vec<crate::config::ConfigChange> {
+        self.cfg.diff(candidate)
+    }
+
+    /// Atomic config reload (FR-1406): apply the HOT membership view from the
+    /// candidate; restart-required fields are reported but not applied. The
+    /// candidate was already validated by the caller, so this cannot half-apply.
+    pub fn reload(
+        &self,
+        candidate: &Config,
+    ) -> Result<Vec<crate::config::ConfigChange>, crate::membership::MembershipError> {
+        let changes = self.cfg.diff(candidate);
+        self.membership.apply_reload(candidate)?;
+        Ok(changes)
+    }
+
+    /// On-demand anti-entropy (FR-1405): reconcile now with `node` (or every
+    /// live link). Returns how many links were reconciled.
+    pub async fn resync(self: &Arc<Engine>, node: Option<NodeId>) -> usize {
+        let eff: HashMap<NodeId, Peer> = self
+            .membership
+            .effective_peers()
+            .into_iter()
+            .map(|p| (p.node_id, p))
+            .collect();
+        let mut count = 0;
+        for (id, conn) in self.conns.all() {
+            if node.is_some_and(|n| n != id) {
+                continue;
+            }
+            if let Some(peer) = eff.get(&id) {
+                if self.reconcile_with(&conn, peer).await.is_ok() {
+                    count += 1;
+                }
+            }
+        }
+        count
     }
 
     /// Build the dual-role endpoint: server config (require + pin client
@@ -453,7 +654,7 @@ impl Engine {
     /// between changes, anti-entropy with ONE random live peer every ~1.5s to
     /// heal anything missed. A node with no admin key has no roster to spread.
     async fn gossip_driver(self: Arc<Engine>) {
-        if self.membership.admin_pubkey().is_none() {
+        if !self.membership.has_admin_key() {
             return;
         }
         let mut changes = self.membership.subscribe();
@@ -688,6 +889,8 @@ impl Engine {
         let mut latest = self.store.watch_latest();
         let mut cursor = resume_from;
         loop {
+            // Pause gate (FR-1404): hold outbound replication while paused.
+            self.await_unpaused().await;
             let ops = self
                 .store
                 .ops_since(self.cfg.node_id, cursor, PUSH_BATCH)
@@ -785,8 +988,16 @@ impl Engine {
                     tracing::debug!(error = %e, "roster gossip serve ended");
                     NetError::Violation("roster gossip")
                 }),
+            crate::proto::STREAM_TAG_CTLQUERY => self.serve_ctlquery(send).await,
             _ => Err(NetError::Violation("unknown stream tag")),
         }
+    }
+
+    /// Answer a `status --all` fan-out query: write our local NodeStatus.
+    async fn serve_ctlquery(&self, mut send: quinn::SendStream) -> Result<(), NetError> {
+        write_msg(&mut send, &self.local_status()).await?;
+        let _ = send.finish();
+        Ok(())
     }
 
     /// Responder side of an anti-entropy session: answer root/tree/leaf
@@ -1231,6 +1442,7 @@ impl Engine {
         if decision == Decision::Concurrent {
             // Detected, durably recorded as skipped, surfaced to operators.
             // TODO(M3): deterministic winner + conflict copy (FR-303/304).
+            Stats::inc(&self.stats.conflicts);
             tracing::warn!(
                 path = %op.path,
                 origin = %hex::encode(&op.origin[..4]),
@@ -1246,6 +1458,9 @@ impl Engine {
         let origin = op.origin;
         let effective = self.store.apply_remote(op, decision).await?;
         if decision == Decision::Apply && effective != Decision::Apply {
+            // The committing re-check downgraded a stale Apply to Concurrent —
+            // the second Concurrent site (FR-303 counter).
+            Stats::inc(&self.stats.conflicts);
             tracing::warn!(
                 path = %path,
                 origin = %hex::encode(&origin[..4]),
@@ -1285,6 +1500,9 @@ impl Engine {
                     if op.size > self.cfg.max_file_bytes {
                         return Err(NetError::TooBig);
                     }
+                    // Pause gate (FR-1404): do not START a new transfer while
+                    // paused; in-flight ones (past this point) finish.
+                    self.await_unpaused().await;
                     // Engine-wide transfer bound (FR-1106): total in-flight
                     // bytes <= transfers x per-file concurrency x chunk max.
                     let _transfer_permit = self

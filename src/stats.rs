@@ -32,6 +32,10 @@ pub struct Stats {
     pub reconcile_runs: AtomicU64,
     /// Files currently in the fetch+assemble pipeline (gauge).
     pub inflight_transfers: AtomicI64,
+    /// Concurrent-version detections (FR-303): bumped at every site that keeps
+    /// local and records the remote as concurrent. Surfaced by
+    /// `replicorectl conflicts` until M3 adds conflict copies.
+    pub conflicts: AtomicU64,
 }
 
 impl Stats {

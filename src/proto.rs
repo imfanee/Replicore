@@ -123,6 +123,9 @@ pub const STREAM_TAG_MANIFEST: u8 = 2;
 pub const STREAM_TAG_RECONCILE: u8 = 3;
 /// Roster gossip exchange (FR-1304). Frames defined in `gossip.rs`.
 pub const STREAM_TAG_ROSTER: u8 = 4;
+/// `status --all` fan-out query (FR-1407). One frame back: the peer's local
+/// `NodeStatus` (defined in `control.rs`).
+pub const STREAM_TAG_CTLQUERY: u8 = 5;
 
 /// One entry of a file manifest: a chunk's BLAKE3 and its length. Offsets are
 /// implicit prefix sums — the ordered list fully determines the file.

@@ -178,6 +178,17 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         });
     }
 
+    // Operator control plane over the Unix domain socket (FR-1401).
+    {
+        let engine = engine.clone();
+        let socket = cfg.control_socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = replicore::control::serve(engine, socket).await {
+                tracing::error!(error = %e, "control plane died");
+            }
+        });
+    }
+
     engine.run().await.context("transport engine")
 }
 

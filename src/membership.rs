@@ -345,14 +345,22 @@ pub enum MembershipError {
 /// `RwLock` (std, not tokio) is deliberate: every critical section is a quick
 /// in-memory read/swap with no `.await` held, and the TLS verifier that reads
 /// `allowlist` is a synchronous rustls callback.
+///
+/// All mutable state lives behind a single `Arc<Inner>` so a `config reload`
+/// (which swaps seeds/admin key and re-verifies the roster) is visible through
+/// every clone — the running verifiers, supervisor, and gossip all observe it.
 #[derive(Clone)]
 pub struct Membership {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
     our_node_id: NodeId,
-    admin_pubkey: Option<AdminPubKey>,
-    roster_path: PathBuf,
-    seeds: Arc<Vec<Peer>>,
-    roster: Arc<RwLock<Roster>>,
-    effective: Arc<RwLock<HashMap<NodeId, Peer>>>,
+    admin_pubkey: RwLock<Option<AdminPubKey>>,
+    roster_path: RwLock<PathBuf>,
+    seeds: RwLock<Vec<Peer>>,
+    roster: RwLock<Roster>,
+    effective: RwLock<HashMap<NodeId, Peer>>,
     allowlist: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// Bumped on every applied change; the supervisor watches it.
     changed: watch::Sender<u64>,
@@ -363,28 +371,19 @@ impl Membership {
     /// configured admin key, then compute the effective set and allowlist.
     /// A roster signed by a now-rotated key is dropped on load (reported).
     pub fn load(cfg: &Config) -> Result<Membership, MembershipError> {
-        let roster = match &cfg.admin_pubkey {
-            Some(pk) => {
-                let (r, dropped) = Roster::load(&cfg.roster_path, pk)?;
-                if dropped > 0 {
-                    tracing::warn!(dropped, "dropped roster entries failing admin-key verify");
-                }
-                r
-            }
-            // No trust anchor: static-peer mode. The roster file is ignored
-            // (we cannot verify it), and only seeds form the mesh.
-            None => Roster::new(),
-        };
+        let roster = load_roster(cfg)?;
         let (changed, _) = watch::channel(0);
         let m = Membership {
-            our_node_id: cfg.node_id,
-            admin_pubkey: cfg.admin_pubkey.clone(),
-            roster_path: cfg.roster_path.clone(),
-            seeds: Arc::new(cfg.peers.clone()),
-            roster: Arc::new(RwLock::new(roster)),
-            effective: Arc::new(RwLock::new(HashMap::new())),
-            allowlist: Arc::new(RwLock::new(HashSet::new())),
-            changed,
+            inner: Arc::new(Inner {
+                our_node_id: cfg.node_id,
+                admin_pubkey: RwLock::new(cfg.admin_pubkey.clone()),
+                roster_path: RwLock::new(cfg.roster_path.clone()),
+                seeds: RwLock::new(cfg.peers.clone()),
+                roster: RwLock::new(roster),
+                effective: RwLock::new(HashMap::new()),
+                allowlist: Arc::new(RwLock::new(HashSet::new())),
+                changed,
+            }),
         };
         m.recompute();
         Ok(m)
@@ -395,13 +394,13 @@ impl Membership {
     /// beats a static seed; a signed Remove evicts even a seeded node.
     fn recompute(&self) {
         let mut eff: HashMap<NodeId, Peer> = HashMap::new();
-        for seed in self.seeds.iter() {
+        for seed in self.inner.seeds.read().expect("seeds lock").iter() {
             eff.insert(seed.node_id, seed.clone());
         }
         {
-            let roster = self.roster.read().expect("roster lock");
+            let roster = self.inner.roster.read().expect("roster lock");
             for entry in roster.all_entries() {
-                if entry.node_id == self.our_node_id {
+                if entry.node_id == self.inner.our_node_id {
                     continue; // never dial or pin ourselves
                 }
                 match entry.kind {
@@ -422,34 +421,35 @@ impl Membership {
             }
         }
         let allow: HashSet<[u8; 32]> = eff.values().map(|p| p.fingerprint).collect();
-        *self.effective.write().expect("effective lock") = eff;
-        *self.allowlist.write().expect("allowlist lock") = allow;
+        *self.inner.effective.write().expect("effective lock") = eff;
+        *self.inner.allowlist.write().expect("allowlist lock") = allow;
     }
 
     /// Persist the roster atomically (daemon-owned file; the intent file is
     /// never touched). Snapshots under the lock, writes outside it.
     fn persist(&self) -> Result<(), RosterError> {
-        let snapshot = self.roster.read().expect("roster lock").clone();
-        snapshot.save(&self.roster_path)
+        let snapshot = self.inner.roster.read().expect("roster lock").clone();
+        let path = self.inner.roster_path.read().expect("path lock").clone();
+        snapshot.save(&path)
     }
 
     /// THE mutation entry point for control/gossip/on-connect push: verify and
     /// merge one signed entry, then (if state advanced) recompute the views,
     /// persist, and notify the supervisor. Returns the merge outcome.
     pub fn merge_signed(&self, entry: SignedEntry) -> Result<MergeOutcome, MembershipError> {
-        let pk = self
-            .admin_pubkey
-            .as_ref()
-            .ok_or(MembershipError::NoAdminKey)?;
-        let outcome = self
-            .roster
-            .write()
-            .expect("roster lock")
-            .merge_entry(entry, pk);
+        let outcome = {
+            let pk_guard = self.inner.admin_pubkey.read().expect("admin lock");
+            let pk = pk_guard.as_ref().ok_or(MembershipError::NoAdminKey)?;
+            self.inner
+                .roster
+                .write()
+                .expect("roster lock")
+                .merge_entry(entry, pk)
+        };
         if outcome == MergeOutcome::Applied {
             self.recompute();
             self.persist()?;
-            self.changed.send_modify(|v| *v = v.wrapping_add(1));
+            self.inner.changed.send_modify(|v| *v = v.wrapping_add(1));
         }
         Ok(outcome)
     }
@@ -457,23 +457,21 @@ impl Membership {
     /// Re-apply intent on `config reload` (FR-1406): swap seeds + admin key,
     /// re-verify the roster under the (possibly rotated) key, recompute. The
     /// caller has already validated the candidate, so this cannot half-apply.
-    pub fn apply_reload(&mut self, cfg: &Config) -> Result<(), MembershipError> {
-        let roster = match &cfg.admin_pubkey {
-            Some(pk) => Roster::load(&cfg.roster_path, pk)?.0,
-            None => Roster::new(),
-        };
-        self.admin_pubkey = cfg.admin_pubkey.clone();
-        self.roster_path = cfg.roster_path.clone();
-        self.seeds = Arc::new(cfg.peers.clone());
-        *self.roster.write().expect("roster lock") = roster;
+    pub fn apply_reload(&self, cfg: &Config) -> Result<(), MembershipError> {
+        let roster = load_roster(cfg)?;
+        *self.inner.admin_pubkey.write().expect("admin lock") = cfg.admin_pubkey.clone();
+        *self.inner.roster_path.write().expect("path lock") = cfg.roster_path.clone();
+        *self.inner.seeds.write().expect("seeds lock") = cfg.peers.clone();
+        *self.inner.roster.write().expect("roster lock") = roster;
         self.recompute();
-        self.changed.send_modify(|v| *v = v.wrapping_add(1));
+        self.inner.changed.send_modify(|v| *v = v.wrapping_add(1));
         Ok(())
     }
 
     /// The current dial targets (effective members minus ourselves).
     pub fn effective_peers(&self) -> Vec<Peer> {
-        self.effective
+        self.inner
+            .effective
             .read()
             .expect("effective lock")
             .values()
@@ -483,12 +481,13 @@ impl Membership {
 
     /// Shared fingerprint allowlist handle for the TLS verifiers (read live).
     pub fn allowlist_handle(&self) -> Arc<RwLock<HashSet<[u8; 32]>>> {
-        self.allowlist.clone()
+        self.inner.allowlist.clone()
     }
 
     /// Map an authenticated cert fingerprint to its effective peer.
     pub fn peer_by_fingerprint(&self, fp: &[u8; 32]) -> Option<Peer> {
-        self.effective
+        self.inner
+            .effective
             .read()
             .expect("effective lock")
             .values()
@@ -498,7 +497,8 @@ impl Membership {
 
     /// Every roster winner (Adds + tombstones) — gossip payload / status.
     pub fn roster_snapshot(&self) -> Vec<SignedEntry> {
-        self.roster
+        self.inner
+            .roster
             .read()
             .expect("roster lock")
             .all_entries()
@@ -507,23 +507,45 @@ impl Membership {
     }
 
     pub fn roster_digest(&self) -> [u8; 32] {
-        self.roster.read().expect("roster lock").digest()
+        self.inner.roster.read().expect("roster lock").digest()
     }
 
     pub fn next_epoch_for(&self, node_id: &NodeId) -> u64 {
-        self.roster
+        self.inner
+            .roster
             .read()
             .expect("roster lock")
             .next_epoch_for(node_id)
     }
 
-    pub fn admin_pubkey(&self) -> Option<&AdminPubKey> {
-        self.admin_pubkey.as_ref()
+    /// True iff a trust anchor is configured (dynamic membership enabled).
+    pub fn has_admin_key(&self) -> bool {
+        self.inner
+            .admin_pubkey
+            .read()
+            .expect("admin lock")
+            .is_some()
     }
 
     /// Watch for membership changes (the supervisor reconciles dial loops).
     pub fn subscribe(&self) -> watch::Receiver<u64> {
-        self.changed.subscribe()
+        self.inner.changed.subscribe()
+    }
+}
+
+/// Load + re-verify the roster under the config's admin key (empty if none).
+fn load_roster(cfg: &Config) -> Result<Roster, MembershipError> {
+    match &cfg.admin_pubkey {
+        Some(pk) => {
+            let (r, dropped) = Roster::load(&cfg.roster_path, pk)?;
+            if dropped > 0 {
+                tracing::warn!(dropped, "dropped roster entries failing admin-key verify");
+            }
+            Ok(r)
+        }
+        // No trust anchor: static-peer mode. The roster file is ignored (we
+        // cannot verify it); only seeds form the mesh.
+        None => Ok(Roster::new()),
     }
 }
 

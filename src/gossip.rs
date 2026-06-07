@@ -71,7 +71,7 @@ pub async fn gossip_once(
     membership: &Membership,
     conn: &quinn::Connection,
 ) -> Result<GossipReport, GossipError> {
-    if membership.admin_pubkey().is_none() {
+    if !membership.has_admin_key() {
         return Ok(GossipReport::default());
     }
     let (mut send, mut recv) = conn.open_bi().await?;
