@@ -132,6 +132,38 @@ pub struct FileRow {
     pub vv: VersionVector,
 }
 
+/// Load the FULL row for one path (`None` = never seen) — the conflict
+/// resolution view: unlike [`load_file`] it carries `size` and is shaped for
+/// `conflict::Version`. Read-only.
+pub(crate) fn load_row(conn: &Connection, path: &str) -> Result<Option<FileRow>, StoreError> {
+    let row = conn
+        .query_row(
+            "SELECT content_hash, mode, size, tombstone, vv FROM files WHERE path = ?1",
+            [path],
+            |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(hash, mode, size, tombstone, vv_blob)| {
+        Ok(FileRow {
+            path: path.to_string(),
+            content_hash: hash.map(|h| blob32(h, "files.content_hash")).transpose()?,
+            mode: mode as u32,
+            size: size as u64,
+            tombstone,
+            vv: decode_vv(&vv_blob)?,
+        })
+    })
+    .transpose()
+}
+
 /// Every row, live and tombstoned, ordered by path.
 pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
     let mut stmt = conn

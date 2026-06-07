@@ -12,8 +12,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::conflict::{self, Version, META_NONE};
 use crate::decide::{decide, Decision};
-use crate::oplog::{LocalChange, Store, StoreError};
+use crate::oplog::{LocalChange, ReconciledRow, ResolveOutcome, Store, StoreError};
 use crate::proto::{OpRecord, OpType};
 use crate::state::FileRow;
 use crate::vv::NodeId;
@@ -35,6 +36,18 @@ impl ApplyEffect for FakeFs {
     }
     fn delete(&mut self, path: &str) {
         self.0.remove(path);
+    }
+}
+
+/// The remote side of a conflict, as carried by a live op.
+fn op_version(op: &OpRecord) -> Version {
+    Version {
+        tombstone: op.op_type == OpType::Delete,
+        content_hash: op.content_hash,
+        meta_hash: META_NONE,
+        mode: op.mode,
+        size: op.size,
+        vv: op.vv.clone(),
     }
 }
 
@@ -96,6 +109,11 @@ impl Replica {
     /// (which re-validates the decision in the committing tx). Returns the
     /// EFFECTIVE decision (`None` = duplicate, dropped). On a downgrade the
     /// fake fs is repaired from the committed row, mirroring production.
+    ///
+    /// M3 (FR-303): a Concurrent op is RESOLVED, not skipped — the rows
+    /// commit through `resolve_rows` first, then `apply_remote` records the
+    /// op (a crash between the two is healed on redelivery: the merged row
+    /// dominates the op, so it records as Ignore).
     pub async fn receive(&mut self, op: &OpRecord) -> Result<Option<Decision>, StoreError> {
         if self.store.has_applied(op.op_id).await? {
             return Ok(None); // already durably handled: would just re-ack
@@ -112,10 +130,13 @@ impl Replica {
                 OpType::Delete => self.fs.delete(&op.path),
             }
         }
+        if decision == Decision::Concurrent {
+            self.resolve_conflict(&op.path, op_version(op)).await?;
+        }
         let effective = self.store.apply_remote(op.clone(), decision).await?;
         if decision == Decision::Apply && effective != Decision::Apply {
             // Repair the clobber from the committed row (production runs
-            // merkle::restore_local_content here).
+            // merkle::restore_local_content here)...
             match self.store.load_file(&op.path).await? {
                 Some(row) if !row.tombstone => {
                     if let Some(hash) = row.content_hash {
@@ -124,8 +145,83 @@ impl Replica {
                 }
                 _ => self.fs.delete(&op.path),
             }
+            // ...and then RESOLVE: the downgrade means a local write landed
+            // concurrently during the (simulated) fetch — the second
+            // Concurrent site gets the same treatment as the first.
+            if effective == Decision::Concurrent {
+                self.resolve_conflict(&op.path, op_version(op)).await?;
+            }
         }
         Ok(Some(effective))
+    }
+
+    /// The conflict-resolution loop every Concurrent site runs (net.rs mirrors
+    /// this against the real fs): ask the store for the authoritative plan
+    /// (an empty staging never matches, so round one returns `Stale` carrying
+    /// it), stage its contents, then commit. Bounded: each retry consumes
+    /// fresh state, and absent new local writes the second round commits.
+    async fn resolve_conflict(&mut self, path: &str, remote: Version) -> Result<(), StoreError> {
+        let mut plan = Vec::new();
+        for _ in 0..5 {
+            // Production stages the plan's contents on disk HERE (loser fetch
+            // + stage→fsync→verify→rename + suppression). The harness's fs
+            // effect is applied after the commit instead — same end state at
+            // every quiesced assertion point.
+            match self.store.resolve_rows(path, remote.clone(), plan).await? {
+                ResolveOutcome::Resolved => {
+                    break;
+                }
+                ResolveOutcome::Stale { plan: fresh } => plan = fresh,
+                ResolveOutcome::NotConcurrent(_) | ResolveOutcome::Unresolvable => return Ok(()),
+            }
+        }
+        // Mirror the committed rows into the fake fs (production already
+        // staged them pre-commit).
+        for row in self.store.all_files().await? {
+            if row.path == path || row.path.contains(conflict::COPY_MARKER) {
+                match row.content_hash {
+                    Some(h) if !row.tombstone => self.fs.write(&row.path, h),
+                    _ => self.fs.delete(&row.path),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One anti-entropy pass: ingest every row of a remote snapshot (what the
+    /// Merkle reconcile delivers leaf-by-leaf). Applies dominating rows,
+    /// resolves concurrent ones — the path that hands conflict copies to a
+    /// node that never witnessed the conflict on the op plane.
+    pub async fn reconcile_from(&mut self, rows: &[FileRow]) -> Result<(), StoreError> {
+        for r in rows {
+            let local = self.store.load_file(&r.path).await?;
+            match decide(local.as_ref(), &r.vv) {
+                Decision::Apply => {
+                    let effective = self
+                        .store
+                        .reconcile_upsert(ReconciledRow {
+                            path: r.path.clone(),
+                            content_hash: r.content_hash,
+                            mode: r.mode,
+                            size: r.size,
+                            vv: r.vv.clone(),
+                            tombstone: r.tombstone,
+                        })
+                        .await?;
+                    if effective == Decision::Apply {
+                        match r.content_hash {
+                            Some(h) if !r.tombstone => self.fs.write(&r.path, h),
+                            _ => self.fs.delete(&r.path),
+                        }
+                    }
+                }
+                Decision::Concurrent => {
+                    self.resolve_conflict(&r.path, Version::from_row(r)).await?;
+                }
+                Decision::Ignore | Decision::Quarantined => {}
+            }
+        }
+        Ok(())
     }
 
     /// Materialized state: path → (content_hash, tombstone, vv). Two

@@ -19,6 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::chunk::Manifest;
+use crate::conflict::{self, PlannedRow, Version};
 use crate::decide::{decide, Decision, LocalFile};
 use crate::proto::{op_id, OpRecord, OpType};
 use crate::state::{self, FileRow, LiveFile};
@@ -67,10 +68,45 @@ pub struct ReconciledRow {
     pub tombstone: bool,
 }
 
+/// Outcome of a [`Store::resolve_rows`] attempt — the conflict-path analogue
+/// of the effective decision `apply_remote` returns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ResolveOutcome {
+    /// The staged plan still matched under the committing transaction: winner
+    /// row and copy rows are durable. The caller's staged disk state is now
+    /// the truth.
+    Resolved,
+    /// The fresh row is no longer concurrent with the remote version (e.g.
+    /// reconcile merged another node's resolution meanwhile). NOTHING was
+    /// committed; the caller repairs any staged disk state from the rows
+    /// (`Ignore`-shaped) or re-routes (`Apply`-shaped).
+    NotConcurrent(Decision),
+    /// Still concurrent, but the rows changed since the caller planned (a
+    /// local write landed during the loser fetch — the stale-decision hazard
+    /// on the conflict path) or a copy-path collision surfaced. NOTHING was
+    /// committed. `plan` is the authoritative re-derivation: stage its
+    /// contents and retry.
+    Stale { plan: Vec<PlannedRow> },
+    /// The copy chain exceeded [`conflict::MAX_COPY_DEPTH`]. Nothing was
+    /// committed; the conflict stays detected-but-unresolved (the M1 posture)
+    /// and reconcile retries later. Operators see it via the conflict log.
+    Unresolvable,
+}
+
 enum StoreCmd {
     AppendLocal {
         change: LocalChange,
         reply: oneshot::Sender<Result<Option<OpRecord>, StoreError>>,
+    },
+    ResolveRows {
+        path: String,
+        remote: Box<Version>,
+        staged: Vec<PlannedRow>,
+        reply: oneshot::Sender<Result<ResolveOutcome, StoreError>>,
+    },
+    LoadRow {
+        path: String,
+        reply: oneshot::Sender<Result<Option<FileRow>, StoreError>>,
     },
     ApplyRemote {
         op: Box<OpRecord>,
@@ -195,6 +231,9 @@ impl Store {
                vv           BLOB NOT NULL
              );
              CREATE INDEX IF NOT EXISTS oplog_origin ON oplog(origin, origin_seq);
+             -- Conflict resolution derives from the path's op history (the
+             -- antichain scan in resolve_rows).
+             CREATE INDEX IF NOT EXISTS oplog_path ON oplog(path);
              CREATE TABLE IF NOT EXISTS files (
                path         TEXT PRIMARY KEY,
                content_hash BLOB,
@@ -413,6 +452,45 @@ impl Store {
         .await
     }
 
+    /// Commit a conflict resolution: winner row + conflict-copy rows in ONE
+    /// transaction, after RE-DERIVING the plan from the freshly-loaded rows
+    /// and comparing it to what the caller staged (the stale-decision
+    /// re-check, extended to the conflict path — FR-303 routes through the
+    /// same committing discipline as `apply_remote`).
+    ///
+    /// State-plane only, like [`Store::reconcile_upsert`]: touches `files`
+    /// exclusively — no oplog row, no `applied` entry, no cursor movement.
+    /// The op-plane record for a live Concurrent op is the unchanged
+    /// `apply_remote(op, Concurrent)`; resolution is *derived locally* on
+    /// every node that witnesses the conflict and is never itself an op
+    /// (reconcile delivers the copy rows to nodes that never witness it).
+    ///
+    /// The caller must have staged every live row in `staged` on disk
+    /// (stage→fsync→verify→rename + suppression) BEFORE this call; on any
+    /// non-`Resolved` outcome it repairs the staging.
+    pub async fn resolve_rows(
+        &self,
+        path: &str,
+        remote: Version,
+        staged: Vec<PlannedRow>,
+    ) -> Result<ResolveOutcome, StoreError> {
+        let path = path.to_string();
+        self.call(|reply| StoreCmd::ResolveRows {
+            path,
+            remote: Box::new(remote),
+            staged,
+            reply,
+        })
+        .await
+    }
+
+    /// Full row for one path (size + VV included) — the conflict-resolution
+    /// planning view. Read-only.
+    pub async fn load_row(&self, path: &str) -> Result<Option<FileRow>, StoreError> {
+        let path = path.to_string();
+        self.call(|reply| StoreCmd::LoadRow { path, reply }).await
+    }
+
     /// Anti-entropy state apply — see [`ReconciledRow`] for the contract.
     /// Returns the effective decision (re-validated in the committing tx);
     /// on downgrade the caller repairs the disk.
@@ -529,6 +607,17 @@ fn run_store(
             }
             StoreCmd::ReconcileUpsert { row, reply } => {
                 let _ = reply.send(reconcile_upsert(&mut conn, &row));
+            }
+            StoreCmd::ResolveRows {
+                path,
+                remote,
+                staged,
+                reply,
+            } => {
+                let _ = reply.send(resolve_rows(&mut conn, &path, &remote, &staged));
+            }
+            StoreCmd::LoadRow { path, reply } => {
+                let _ = reply.send(state::load_row(&conn, &path));
             }
             StoreCmd::SnapshotForJoin { reply } => {
                 let _ = reply.send(snapshot_for_join(&conn));
@@ -878,6 +967,120 @@ fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decisi
     }
     tx.commit()?;
     Ok(effective)
+}
+
+/// The path's op history as resolution candidates — every op ever recorded
+/// for `path`, live-stream or local, in arrival order (the antichain scan
+/// normalizes order away).
+fn ops_as_candidates(conn: &Connection, path: &str) -> Result<Vec<Version>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT op_type, mode, size, content_hash, vv FROM oplog WHERE path = ?1",
+    )?;
+    let rows = stmt.query_map([path], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (op_type, mode, size, hash, vv_blob) = row?;
+        let tombstone = op_type_from_i64(op_type)? == OpType::Delete;
+        out.push(Version {
+            tombstone,
+            content_hash: hash
+                .map(|h| {
+                    h.try_into()
+                        .map_err(|_| StoreError::Corrupt("oplog.content_hash"))
+                })
+                .transpose()?,
+            meta_hash: conflict::META_NONE,
+            mode: mode as u32,
+            size: size as u64,
+            vv: state::decode_vv(&vv_blob)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Conflict resolution, ONE transaction (see [`Store::resolve_rows`]).
+///
+/// Candidates = the path's op history ∪ {the remote version} ∪ {the current
+/// row, only when the ops do not fully explain its VV — e.g. after a join
+/// bootstrap, where state arrived without history}. Deriving from the op SET
+/// (not the row/op pair) is what makes resolution confluent: max over an
+/// antichain is delivery-order-free, and a causally-superseded intermediate
+/// is never maximal, so it can never win. When the row IS fully covered by
+/// ops it must be excluded — its merged VV would otherwise dominate every op
+/// and collapse the derivation back to the non-confluent pairwise contest.
+///
+/// The committing re-check, conflict flavor: the caller staged disk for a
+/// plan derived BEFORE a multi-second loser fetch. The plan is re-derived
+/// here from state under the committing transaction; only an exact match
+/// commits. A concurrent local write during the fetch changes the derivation
+/// (a new op at minimum) and comes back `Stale` with the fresh plan — nothing
+/// committed, the caller restages and retries. Trusting the stale plan would
+/// clobber the newer write exactly like the stale-Apply hazard `apply_remote`
+/// guards against.
+fn resolve_rows(
+    conn: &mut Connection,
+    path: &str,
+    remote: &Version,
+    staged: &[PlannedRow],
+) -> Result<ResolveOutcome, StoreError> {
+    let tx = conn.transaction()?;
+    let local_row = state::load_row(&tx, path)?;
+    let local_lf = local_row.as_ref().map(|r| LocalFile {
+        vv: r.vv.clone(),
+        tombstone: r.tombstone,
+        content_hash: r.content_hash,
+        mode: r.mode,
+    });
+    let decision = decide(local_lf.as_ref(), &remote.vv);
+    if decision != Decision::Concurrent {
+        return Ok(ResolveOutcome::NotConcurrent(decision));
+    }
+    // decide(None, _) is Apply, so a Concurrent decision proves the row exists.
+    let Some(local_row) = local_row else {
+        return Err(StoreError::Corrupt("concurrent decision without a row"));
+    };
+    let mut candidates = ops_as_candidates(&tx, path)?;
+    candidates.push(remote.clone());
+    let mut coverage = crate::vv::VersionVector::new();
+    for c in &candidates {
+        coverage.merge(&c.vv);
+    }
+    match coverage.compare(&local_row.vv) {
+        // Ops (+ remote) fully explain the row: derive from history alone.
+        crate::vv::Ord3::Dominates | crate::vv::Ord3::Equal => {}
+        // The row embodies history we hold no ops for: it is a candidate.
+        _ => candidates.push(Version::from_row(&local_row)),
+    }
+    let derived = conflict::plan_candidates(path, &candidates, &mut |p| {
+        state::load_row(&tx, p).map(|row| row.as_ref().map(Version::from_row))
+    })?;
+    let Some(derived) = derived else {
+        return Ok(ResolveOutcome::Unresolvable);
+    };
+    if derived != staged {
+        return Ok(ResolveOutcome::Stale { plan: derived });
+    }
+    for row in &derived {
+        state::upsert_file(
+            &tx,
+            &row.path,
+            row.content_hash.as_ref(),
+            row.mode,
+            row.size,
+            &row.vv,
+            row.tombstone,
+        )?;
+    }
+    tx.commit()?;
+    Ok(ResolveOutcome::Resolved)
 }
 
 fn op_count(conn: &Connection) -> Result<i64, StoreError> {
