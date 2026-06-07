@@ -149,7 +149,15 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         peers = cfg.peers.len(),
         "replicored starting"
     );
-    let engine = Engine::new(cfg.clone(), store.clone(), suppress, cas.clone());
+    let membership =
+        replicore::membership::Membership::load(&cfg).context("load membership roster")?;
+    let engine = Engine::new(
+        cfg.clone(),
+        store.clone(),
+        suppress,
+        cas.clone(),
+        membership,
+    );
 
     // Health endpoint (FR-1102), if configured.
     if let Some(addr) = cfg.health_listen {

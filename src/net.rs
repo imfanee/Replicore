@@ -27,10 +27,10 @@
 //! dedupe; resume authority is always the receiver's persisted cursor.
 //! // SEAM(M2): mesh > 2 nodes reuses this pairwise scheme per peer link.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Duration;
 
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -45,6 +45,7 @@ use crate::chunk::Cas;
 use crate::config::{Config, Peer};
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
+use crate::membership::Membership;
 use crate::merkle::{
     reconcile_pull, MerkleTree, ReconcileCtx, ReconcileError, ReconcileReport, ReconcileTransport,
     RemoteLeaf,
@@ -164,8 +165,14 @@ pub fn load_identity(
 // FR-1001/1002)
 // ---------------------------------------------------------------------------
 
-fn pin_ok(allow: &HashSet<[u8; 32]>, end_entity: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-    if allow.contains(&cert_fingerprint(end_entity.as_ref())) {
+/// The live fingerprint allowlist, shared with [`Membership`]. Read on EVERY
+/// handshake (not snapshotted at endpoint-build time) so a signed membership
+/// change locks a peer out — or lets one in — without rebuilding the endpoint.
+type Allowlist = Arc<StdRwLock<HashSet<[u8; 32]>>>;
+
+fn pin_ok(allow: &Allowlist, end_entity: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+    let fp = cert_fingerprint(end_entity.as_ref());
+    if allow.read().expect("allowlist lock").contains(&fp) {
         Ok(())
     } else {
         Err(rustls::Error::General(
@@ -177,7 +184,7 @@ fn pin_ok(allow: &HashSet<[u8; 32]>, end_entity: &CertificateDer<'_>) -> Result<
 /// Client-side: accept the server cert iff its fingerprint is pinned.
 #[derive(Debug)]
 struct PinnedServerVerifier {
-    allow: HashSet<[u8; 32]>,
+    allow: Allowlist,
     provider: Arc<CryptoProvider>,
 }
 
@@ -234,7 +241,7 @@ impl ServerCertVerifier for PinnedServerVerifier {
 /// protocol layer (exit criterion 5).
 #[derive(Debug)]
 struct PinnedClientVerifier {
-    allow: HashSet<[u8; 32]>,
+    allow: Allowlist,
     provider: Arc<CryptoProvider>,
 }
 
@@ -318,15 +325,24 @@ pub struct Engine {
     transfers: Arc<tokio::sync::Semaphore>,
     /// Node join lifecycle (FR-1311): Joining → Syncing → Active.
     join: crate::join::JoinTracker,
+    /// Dynamic membership: roster + effective peers + live TLS allowlist.
+    membership: Membership,
 }
 
 impl Engine {
-    pub fn new(cfg: Config, store: Store, suppress: Suppressor, cas: Cas) -> Arc<Engine> {
+    pub fn new(
+        cfg: Config,
+        store: Store,
+        suppress: Suppressor,
+        cas: Cas,
+        membership: Membership,
+    ) -> Arc<Engine> {
         let transfers = Arc::new(tokio::sync::Semaphore::new(
             cfg.max_concurrent_transfers.max(1),
         ));
-        let join =
-            crate::join::JoinTracker::new(store.clone(), cfg.peers.iter().map(|p| p.node_id));
+        // Promotion is gated on the CURRENT effective set, not just the seeds.
+        let expected = membership.effective_peers().into_iter().map(|p| p.node_id);
+        let join = crate::join::JoinTracker::new(store.clone(), expected);
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
@@ -337,6 +353,7 @@ impl Engine {
             stats: Arc::new(Stats::default()),
             transfers,
             join,
+            membership,
         })
     }
 
@@ -345,13 +362,19 @@ impl Engine {
         self.join.clone()
     }
 
+    /// The membership handle (control plane / gossip operate through it).
+    pub fn membership(&self) -> Membership {
+        self.membership.clone()
+    }
+
     /// Build the dual-role endpoint: server config (require + pin client
     /// certs) bound to `cfg.listen`, default client config (present our cert,
     /// pin server certs).
     pub fn build_endpoint(&self) -> Result<quinn::Endpoint, NetError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let (cert, key) = load_identity(&self.cfg.cert_path, &self.cfg.key_path)?;
-        let allow: HashSet<[u8; 32]> = self.cfg.pinned_fingerprints().into_iter().collect();
+        // The live allowlist — shared with Membership and read per handshake.
+        let allow = self.membership.allowlist_handle();
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
@@ -401,12 +424,90 @@ impl Engine {
         // re-reconcile on each reconnect — that never regresses it).
         self.join.restore().await;
         let endpoint = self.build_endpoint()?;
-        for peer in self.cfg.peers.clone() {
+        // The accept loop runs in the background; the supervisor owns dialing,
+        // spawning and tearing down per-peer loops as membership changes.
+        tokio::spawn({
             let engine = self.clone();
             let ep = endpoint.clone();
-            tokio::spawn(async move { engine.dial_loop(ep, peer).await });
+            async move {
+                if let Err(e) = engine.accept_loop(ep).await {
+                    tracing::error!(error = %e, "accept loop ended");
+                }
+            }
+        });
+        self.supervise(endpoint).await
+    }
+
+    /// Reconcile the set of running dial loops to the effective membership,
+    /// re-running whenever the roster changes (FR-1304/1307, zero-downtime).
+    ///
+    /// Removal teardown order is LAW: the fingerprint is evicted from the TLS
+    /// allowlist by `Membership` the instant the signed Remove merges — BEFORE
+    /// this supervisor wakes — so a reconnect can never race the gap. Here we
+    /// only (1) abort the dial task and (2) close + deregister the connection.
+    async fn supervise(self: Arc<Engine>, endpoint: quinn::Endpoint) -> Result<(), NetError> {
+        use tokio::task::JoinHandle;
+        let mut tasks: HashMap<NodeId, (Peer, JoinHandle<()>)> = HashMap::new();
+        let mut changes = self.membership.subscribe();
+        loop {
+            let desired: HashMap<NodeId, Peer> = self
+                .membership
+                .effective_peers()
+                .into_iter()
+                .map(|p| (p.node_id, p))
+                .collect();
+
+            // Spawn new members; restart a member whose addr/fingerprint moved
+            // (a higher-epoch re-add) or whose task has exited.
+            for (id, peer) in &desired {
+                let needs_spawn = match tasks.get(id) {
+                    Some((existing, h)) => {
+                        h.is_finished()
+                            || existing.addr != peer.addr
+                            || existing.fingerprint != peer.fingerprint
+                    }
+                    None => true,
+                };
+                if needs_spawn {
+                    if let Some((_, h)) = tasks.remove(id) {
+                        h.abort();
+                    }
+                    let engine = self.clone();
+                    let ep = endpoint.clone();
+                    let p = peer.clone();
+                    let h = tokio::spawn(async move { engine.dial_loop(ep, p).await });
+                    tasks.insert(*id, (peer.clone(), h));
+                }
+            }
+
+            // Tear down members no longer in the effective set.
+            let removed: Vec<NodeId> = tasks
+                .keys()
+                .filter(|id| !desired.contains_key(*id))
+                .cloned()
+                .collect();
+            for id in removed {
+                if let Some((_, h)) = tasks.remove(&id) {
+                    h.abort();
+                }
+                if let Some(conn) = self.conns.get(&id) {
+                    conn.close(0u32.into(), b"membership-remove");
+                    self.conns.remove_if_same(&id, &conn);
+                }
+                self.peers_reg.set_state(id, PeerState::Disconnected);
+                tracing::info!(
+                    node = %hex::encode(&id[..4]),
+                    "peer removed from mesh; dial loop and connection torn down"
+                );
+            }
+
+            // Keep join-lifecycle promotion gated on the live effective set.
+            self.join.set_expected(desired.keys().cloned()).await;
+
+            if changes.changed().await.is_err() {
+                return Ok(()); // membership handle dropped: shutting down
+            }
         }
-        self.accept_loop(endpoint).await
     }
 
     // -- inbound ------------------------------------------------------------
@@ -1252,12 +1353,14 @@ impl Engine {
         Ok(cert_fingerprint(first.as_ref()))
     }
 
-    /// Map an authenticated inbound connection to its configured peer.
+    /// Map an authenticated inbound connection to its EFFECTIVE peer. Using the
+    /// dynamic membership (not the static intent) means a removed peer — evicted
+    /// from the effective set and the allowlist — is rejected here even on the
+    /// off chance it cleared the TLS layer mid-removal.
     fn identify(&self, conn: &quinn::Connection) -> Result<Peer, NetError> {
         let fp = self.peer_fingerprint(conn)?;
-        self.cfg
+        self.membership
             .peer_by_fingerprint(&fp)
-            .cloned()
             .ok_or(NetError::UnknownPeer)
     }
 }
@@ -1483,7 +1586,8 @@ mod tests {
         let cfg = test_config(node_id, "127.0.0.1:0".parse().unwrap(), dir, ident, peers);
         let store = Store::open(Path::new(":memory:"), node_id).unwrap();
         let cas = Cas::open(&cfg.cas_dir.join(hex::encode(&node_id[..2]))).unwrap();
-        Engine::new(cfg, store, Suppressor::new(), cas)
+        let membership = crate::membership::Membership::load(&cfg).unwrap();
+        Engine::new(cfg, store, Suppressor::new(), cas, membership)
     }
 
     /// Append a local write WITH its chunks in the engine's CAS and the
