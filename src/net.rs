@@ -55,7 +55,7 @@ use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
     read_msg, write_msg, ChunkReq, ChunkResp, Frame, ManifestReq, ManifestResp, OpRecord, OpType,
     ProtoError, ReconcileFrame, ALPN, MANIFEST_PAGE, PROTO_VERSION, STREAM_TAG_CHUNK,
-    STREAM_TAG_MANIFEST, STREAM_TAG_RECONCILE, TREE_PAGE,
+    STREAM_TAG_MANIFEST, STREAM_TAG_RECONCILE, STREAM_TAG_ROSTER, TREE_PAGE,
 };
 use crate::stats::Stats;
 use crate::suppress::Suppressor;
@@ -169,6 +169,15 @@ pub fn load_identity(
 /// handshake (not snapshotted at endpoint-build time) so a signed membership
 /// change locks a peer out — or lets one in — without rebuilding the endpoint.
 type Allowlist = Arc<StdRwLock<HashSet<[u8; 32]>>>;
+
+/// Pick a uniformly random connection for periodic anti-entropy gossip.
+fn pick_random(conns: &[(NodeId, quinn::Connection)]) -> Option<&(NodeId, quinn::Connection)> {
+    if conns.is_empty() {
+        None
+    } else {
+        conns.get(fastrand::usize(..conns.len()))
+    }
+}
 
 fn pin_ok(allow: &Allowlist, end_entity: &CertificateDer<'_>) -> Result<(), rustls::Error> {
     let fp = cert_fingerprint(end_entity.as_ref());
@@ -435,7 +444,44 @@ impl Engine {
                 }
             }
         });
+        tokio::spawn(self.clone().gossip_driver());
         self.supervise(endpoint).await
+    }
+
+    /// Drive roster gossip (FR-1304): on every local membership change, push to
+    /// ALL live peers immediately so an admin's add/remove propagates fast;
+    /// between changes, anti-entropy with ONE random live peer every ~1.5s to
+    /// heal anything missed. A node with no admin key has no roster to spread.
+    async fn gossip_driver(self: Arc<Engine>) {
+        if self.membership.admin_pubkey().is_none() {
+            return;
+        }
+        let mut changes = self.membership.subscribe();
+        let mut tick = tokio::time::interval(Duration::from_millis(1500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let conns = self.conns.all();
+                    if let Some((_, conn)) = pick_random(&conns) {
+                        if let Err(e) = crate::gossip::gossip_once(&self.membership, conn).await {
+                            tracing::debug!(error = %e, "periodic gossip failed");
+                        }
+                    }
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return; // membership dropped: shutting down
+                    }
+                    // Immediate push to everyone currently connected.
+                    for (_, conn) in self.conns.all() {
+                        if let Err(e) = crate::gossip::gossip_once(&self.membership, &conn).await {
+                            tracing::debug!(error = %e, "change-push gossip failed");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Reconcile the set of running dial loops to the effective membership,
@@ -733,6 +779,12 @@ impl Engine {
             STREAM_TAG_CHUNK => self.serve_chunk(send, recv).await,
             STREAM_TAG_MANIFEST => self.serve_manifest(send, recv).await,
             STREAM_TAG_RECONCILE => self.serve_reconcile(send, recv).await,
+            STREAM_TAG_ROSTER => crate::gossip::serve_roster(&self.membership, send, recv)
+                .await
+                .map_err(|e| {
+                    tracing::debug!(error = %e, "roster gossip serve ended");
+                    NetError::Violation("roster gossip")
+                }),
             _ => Err(NetError::Violation("unknown stream tag")),
         }
     }
@@ -1053,6 +1105,12 @@ impl Engine {
         // The directed pull gate for THIS link is complete — note it for join
         // lifecycle promotion (FR-1310 bidirectional = the two directed gates).
         self.join.note_gate_complete(peer.node_id).await;
+        // On-connect roster gossip (FR-1304): converge membership immediately
+        // with this peer rather than waiting for the periodic tick. One
+        // exchange converges both sides (the merge is a join).
+        if let Err(e) = crate::gossip::gossip_once(&self.membership, conn).await {
+            tracing::debug!(peer = %hex::encode(&peer.node_id[..4]), error = %e, "on-connect gossip failed");
+        }
         tracing::info!(
             peer = %hex::encode(&peer.node_id[..4]),
             resume_from = new_cursor,

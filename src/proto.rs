@@ -121,6 +121,8 @@ pub enum Frame {
 pub const STREAM_TAG_CHUNK: u8 = 1;
 pub const STREAM_TAG_MANIFEST: u8 = 2;
 pub const STREAM_TAG_RECONCILE: u8 = 3;
+/// Roster gossip exchange (FR-1304). Frames defined in `gossip.rs`.
+pub const STREAM_TAG_ROSTER: u8 = 4;
 
 /// One entry of a file manifest: a chunk's BLAKE3 and its length. Offsets are
 /// implicit prefix sums — the ordered list fully determines the file.

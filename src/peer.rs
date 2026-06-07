@@ -134,6 +134,14 @@ impl ConnRegistry {
         read_lock(&self.0).get(peer).cloned()
     }
 
+    /// Every live connection — gossip fan-out / control-plane fan-out.
+    pub fn all(&self) -> Vec<(NodeId, quinn::Connection)> {
+        read_lock(&self.0)
+            .iter()
+            .map(|(k, c)| (*k, c.clone()))
+            .collect()
+    }
+
     /// Fetch candidates: `origin_first` (the node most likely to hold the
     /// content) followed by every other live connection.
     pub fn candidates(&self, origin_first: &NodeId) -> Vec<(NodeId, quinn::Connection)> {

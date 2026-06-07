@@ -10,6 +10,7 @@ pub mod chunk;
 pub mod config;
 pub mod decide;
 pub mod fetch;
+pub mod gossip;
 pub mod health;
 pub mod ingest;
 pub mod join;
