@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! conflict.rs — deterministic conflict resolution, the pure half (FR-303/304).
 //!
 //! `decide.rs` answers *whether* two versions are concurrent; this module

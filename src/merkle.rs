@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! merkle.rs — Merkle-tree anti-entropy (FR-701/702/703).
 //!
 //! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ uuid ‖ meta_hash

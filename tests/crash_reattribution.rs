@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Crash-recovery scanner re-attribution — the deterministic pin for the bug
 //! CLASS the integration_wan findings pointed at (false-delete /
 //! stale-write-clobber under crash injection). The flaky integration

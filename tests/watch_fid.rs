@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! FID watcher end-to-end (FR-102): create / attrib / rename / delete events
 //! against a real filesystem, through the real fanotify read loop.
 //!

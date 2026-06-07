@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! net.rs — QUIC transport with mutual TLS and pinned peer certificates
 //! (FR-501/504, FR-1001/1002). Built on quinn so we never hand-roll a UDP
 //! reliability/congestion layer (NFR-C2).

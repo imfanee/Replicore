@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! health.rs — hand-rolled HTTP/1.1 health + metrics endpoint (FR-1102/1101).
 //!
 //! `GET /healthz` returns a JSON snapshot: per-peer state + cursors, transfer

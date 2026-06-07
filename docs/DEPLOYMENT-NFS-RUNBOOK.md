@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # DEPLOYMENT-NFS-RUNBOOK.md — operator runbook for NFS-fronted Replicore nodes
 
 For the person standing up the three DRC/Marseille-class nodes. Each node owns

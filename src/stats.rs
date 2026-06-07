@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! stats.rs — shared transfer/reconcile counters (FR-1102; the integration
 //! tests' dedup / no-retransfer / resume assertions read these via /healthz).
 //!

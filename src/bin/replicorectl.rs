@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! replicorectl — operator CLI over the daemon's Unix domain socket.
 //!
 //! Each invocation opens the socket, sends one request, prints the reply, and

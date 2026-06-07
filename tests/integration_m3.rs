@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! M3 exit-criteria integration tests on the emulated-WAN rig (RSD §I.5).
 //!
 //! ```sh

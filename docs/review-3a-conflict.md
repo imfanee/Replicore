@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # Review 3a — antichain conflict resolution (the deferred M3 review diff)
 
 Scope: `src/conflict.rs` (`antichain` :157, `plan_candidates` :200,

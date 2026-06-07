@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! oplog.rs — durable, WAL-backed operation log and store thread (FR-201/202,
 //! FR-801/802).
 //!

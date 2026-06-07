@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! v3 → v4 store migration (FR-205): the uuid/path_old columns are added to
 //! pre-existing databases at open, and identities minted for old rows are a
 //! pure function of the PATH — two nodes migrating independently MUST mint

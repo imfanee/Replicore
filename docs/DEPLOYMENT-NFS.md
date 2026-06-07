@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # DEPLOYMENT-NFS.md — Replicore nodes fronting LAN app servers over NFS
 
 This document captures the operational and policy constraints for the supported

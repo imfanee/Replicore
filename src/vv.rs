@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! vv.rs — per-file version vectors (FR-301/302).
 //!
 //! Causality comes from these vectors, **never** wall-clock time (RSD FR-301,

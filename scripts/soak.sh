@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 # soak.sh — synthetic IVR-traffic soak on the wan-testbed rig (M3 exit
 # criterion 6 / RSD §II.8). Root required (the rig is netns-based).
 #

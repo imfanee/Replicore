@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! config.rs — declarative node configuration (FR-1201, FR-601).
 //!
 //! One TOML file per node: identity, listen address, share root, state-store

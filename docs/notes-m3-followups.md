@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # M3 follow-up notes (for decision — no code changes here)
 
 ## 1. BBR is the active congestion controller (confirmed)

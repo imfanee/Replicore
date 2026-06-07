@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! The stale-decision property on the CONFLICT path (M3 gate): a concurrent
 //! LOCAL write landing *during* a conflict-copy fetch must be caught by the
 //! committing re-check — the M2 `apply_remote` re-validation, extended to

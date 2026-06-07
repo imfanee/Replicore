@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Grep-gate for the M3 lead invariant (FR-303 / reviewer checklist):
 //! conflict resolution introduced NO new write path to the `files` index.
 //! Every mutation goes through the store thread's committing transactions —

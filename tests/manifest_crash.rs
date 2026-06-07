@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Partial-manifest crash residue (QA finding): a kill -9 during the
 //! receiver's manifest persist left the `manifests` row (chunk_count = N)
 //! with fewer than N `manifest_chunks` rows, because the standalone

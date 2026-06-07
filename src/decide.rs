@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! decide.rs — the pure apply/ignore/concurrent decision (FR-302).
 //!
 //! Given the local materialized state of a path and an incoming remote op,

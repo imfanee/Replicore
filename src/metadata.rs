@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! metadata.rs — full POSIX metadata fidelity (FR-106 / FR-804).
 //!
 //! One canonical [`Meta`] rides every Write/Rename op and every `files` row:

@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Property tests for the membership register's convergence (FR-1303).
 //!
 //! The register is an epoch-versioned LWW per node_id ordered by

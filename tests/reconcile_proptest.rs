@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Anti-entropy property test (M2 exit criterion: divergent replicas — one
 //! node fed ops the other missed — reconcile to identical state with no data
 //! loss) plus the O(diff) descent-count proof (reviewer item).

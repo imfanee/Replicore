@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! fetch.rs — missing-chunk diff + multi-source parallel fetch + resume
 //! (FR-401/403/404).
 //!

@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Membership control-plane integration tests (M2.5 AC 8–12), exercised with
 //! real in-process engines over localhost QUIC — no netns rig, so these run in
 //! plain `cargo test`. Each test drives the SAME code paths the operator does:

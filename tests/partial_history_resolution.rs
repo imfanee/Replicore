@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Conflict resolution under PARTIAL op history — the coverage-branch case
 //! the conflict proptest does not construct (its replicas always hold every
 //! op they resolved against).

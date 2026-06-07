@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! qos.rs — bandwidth limiting and free-space safety (FR-1103/1104/1107).
 //!
 //! ## Token buckets (debt model)

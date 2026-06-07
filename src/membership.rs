@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! membership.rs — the agent-owned roster (mandate 2, FR-1302/1303/1306).
 //!
 //! ## What this is (own the honest semantics)

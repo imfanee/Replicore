@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! chunk.rs — content-defined chunking + content-addressed store (FR-402/403).
 //!
 //! Chunk identity is BLAKE3 of the chunk bytes (mandated). A file's manifest

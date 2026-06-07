@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # Review 3c — metadata apply path (the deferred M3 review diff)
 
 Scope: `src/metadata.rs` (`apply_meta` :242, `capture` :124,

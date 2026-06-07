@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! FR-106 / FR-804 end-to-end: metadata captured by the real ingest pipeline
 //! rides the op and is applied byte-exact on the receiving side — through the
 //! REAL apply machinery (stage→fsync→verify→meta→rename) against real files.

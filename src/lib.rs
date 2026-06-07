@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Replicore library crate — the replication engine's correctness core.
 //!
 //! The `replicored` binary (`main.rs`) is a thin wiring layer over these

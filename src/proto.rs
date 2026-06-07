@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! proto.rs — versioned wire protocol (FR-501/504).
 //!
 //! Control stream: length-prefixed (`u32` big-endian) bincode frames, one

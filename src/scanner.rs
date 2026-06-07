@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! scanner.rs — baseline scan + periodic rescan (FR-103; FR-104-lite).
 //!
 //! The watcher is best-effort; **the rescan is authoritative** (see

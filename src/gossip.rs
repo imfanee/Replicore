@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! gossip.rs — lean SWIM-style roster dissemination (FR-1304).
 //!
 //! Membership changes are admin-signed entries; gossip just spreads them. The

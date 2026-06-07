@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! main.rs — `replicored` entrypoint (anyhow boundary).
 //!
 //!   replicored gen-cert --out-dir DIR --name NAME

@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! FR-205 (identity-lite) + FR-304 rename rules: renames are ONE op whose two
 //! path-effects commit atomically — identity (uuid) and the VV lineage
 //! continue at the target, no content retransfer, no self-conflict. The

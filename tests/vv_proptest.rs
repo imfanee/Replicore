@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Property tests for version-vector dominance (CLAUDE.md: correctness-critical
 //! logic MUST have property-based tests; M1 reviewer checklist: the concurrent
 //! case must be detected correctly and nothing else may order it).

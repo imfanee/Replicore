@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! state.rs — materialized current-state index per path (FR-203/204).
 //!
 //! Row-level helpers over the `files` table. These run **only inside the store

@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! replica.rs — in-memory simulation harness for the correctness core.
 //!
 //! Drives the REAL store (`:memory:` SQLite — same schema, transactions, and

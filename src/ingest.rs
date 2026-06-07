@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! ingest.rs — the local-change pipeline (FR-101/105, FR-901/902).
 //!
 //! Watcher and scanner events funnel through one channel into this task,

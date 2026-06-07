@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! control.rs — operator control plane over a Unix domain socket (FR-1401–1409).
 //!
 //! `replicorectl` connects to `control_socket`, sends one [`CtlRequest`], reads

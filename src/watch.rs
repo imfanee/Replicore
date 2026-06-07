@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! watch.rs — change detection via fanotify FID reporting (FR-102).
 //!
 //! Three tiers, probed at startup, best first:

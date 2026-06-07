@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! THE M3 convergence gate (FR-303/304, exit criterion 3): dense concurrent
 //! write/delete sets across N nodes, delivered in adversarial per-receiver
 //! permutations with duplicates, must converge to **byte-identical state

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 # wan-testbed.sh — four-node emulated-WAN test rig for Replicore (M2 mesh +
 # M2.5 dynamic membership: a,b,c are the static trio; d joins dynamically).
 #

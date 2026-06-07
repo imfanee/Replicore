@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! THE M1 correctness gate (exit criterion 4): random op sequences applied in
 //! different orders on two simulated nodes converge to identical state.
 //!

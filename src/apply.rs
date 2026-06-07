@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! apply.rs — atomic, verified, suppressed apply (FR-803, FR-802, FR-902).
 //!
 //! Stage into a temp file in the destination directory (same filesystem so the

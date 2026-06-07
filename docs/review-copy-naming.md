@@ -1,3 +1,5 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # Review — conflict-copy naming by a stable metadata subset
 
 Determinism-critical AND no-loss-critical surface (the S1 class). This proves

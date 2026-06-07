@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Two-node integration test on the emulated-WAN rig (exit criteria 1–3, 5).
 //!
 //! Needs root, iproute2, and `cargo build --release` first:
