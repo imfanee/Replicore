@@ -138,6 +138,13 @@ impl Cas {
 
     /// Read a chunk back, re-verifying its hash (bit-rot is an error, never
     /// silently served into an assembly).
+    ///
+    /// SELF-HEALING: a corrupt chunk is UNLINKED before the error returns.
+    /// Without this, a bit-rotted chunk wedges every transfer that needs it
+    /// forever: the fetch diff sees it as "present" and skips it, assembly
+    /// keeps failing, and the transient-retry loop never converges (found by
+    /// the reviewer-checklist resume trace). Dropping it makes the next
+    /// fetch pass re-fetch a verified copy from a peer.
     pub fn read(&self, h: &ChunkHash) -> Result<Vec<u8>, CasError> {
         let path = self.path_for(h);
         let bytes = match std::fs::read(&path) {
@@ -148,6 +155,9 @@ impl Cas {
             Err(e) => return Err(io_err("read", &path)(e)),
         };
         if blake3::hash(&bytes).as_bytes() != h {
+            tracing::error!(chunk = %hex::encode(h),
+                "corrupt chunk detected in CAS; dropping for re-fetch");
+            let _ = std::fs::remove_file(&path);
             return Err(CasError::HashMismatch);
         }
         Ok(bytes)
@@ -372,9 +382,54 @@ mod tests {
         assert!(cas.has(&h));
         assert_eq!(cas.read(&h).unwrap(), data);
 
-        // Bit-rot is detected on read, never silently served.
+        // Bit-rot is detected on read, never silently served — and the
+        // corrupt chunk is dropped so the next fetch diff re-fetches it
+        // instead of wedging in a skip/fail retry loop forever.
         std::fs::write(cas.path_for(&h), b"corrupted!!!!!!").unwrap();
         assert!(matches!(cas.read(&h).unwrap_err(), CasError::HashMismatch));
+        assert!(!cas.has(&h), "corrupt chunk must be evicted for re-fetch");
+        // The heal: a verified re-insert restores service.
+        cas.put_verified(&h, data).unwrap();
+        assert_eq!(cas.read(&h).unwrap(), data);
+    }
+
+    /// End-to-end shape of the wedge this fix prevents: corrupt chunk ->
+    /// assembly fails AND evicts -> the missing-diff now includes it ->
+    /// re-fetch -> assembly succeeds.
+    #[test]
+    fn corrupt_chunk_unwedges_assembly_after_refetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = Cas::open(dir.path().join("cas").as_path()).unwrap();
+        let data = noise(200_000, 11);
+        let src = dir.path().join("src");
+        std::fs::write(&src, &data).unwrap();
+        let manifest = chunk_file_into_cas(&src, &P, &cas).unwrap();
+        assert!(manifest.chunks.len() >= 3);
+
+        // Bit-rot one middle chunk.
+        let victim = manifest.chunks[1].hash;
+        std::fs::write(cas.path_for(&victim), b"rotten").unwrap();
+
+        // Assembly fails ONCE and evicts the bad chunk...
+        let mut out = std::fs::File::create(dir.path().join("out1")).unwrap();
+        assert!(assemble_from_cas(&manifest, &cas, &mut out).is_err());
+        assert!(!cas.has(&victim), "victim must be evicted");
+
+        // ...so the fetch diff would now re-fetch it (simulated re-insert)...
+        let start = manifest
+            .chunks
+            .iter()
+            .take(1)
+            .map(|c| c.len as usize)
+            .sum::<usize>();
+        let len = manifest.chunks[1].len as usize;
+        cas.put_verified(&victim, &data[start..start + len])
+            .unwrap();
+
+        // ...and the retry converges.
+        let mut out = std::fs::File::create(dir.path().join("out2")).unwrap();
+        let got = assemble_from_cas(&manifest, &cas, &mut out).unwrap();
+        assert_eq!(got, manifest.content_hash);
     }
 
     #[test]

@@ -30,9 +30,14 @@ use crate::proto::{
 use crate::stats::Stats;
 use crate::vv::NodeId;
 
-/// Backstop against a hostile `total` in ManifestResp: 2^24 chunks ≈ 64 TiB
-/// at the 4 MiB max — far beyond any real file, small enough to bound memory.
-const MAX_MANIFEST_CHUNKS: u32 = 1 << 24;
+/// An honest manifest has at most one chunk (the tail) under the configured
+/// minimum, and config floors `chunk_min_bytes` at 4096 — so the entry count
+/// is bounded by the file-size cap, NOT by a generous constant a hostile
+/// pinned peer could exploit to make us accumulate hundreds of MB of entries
+/// (CLAUDE.md invariant 5: bound every buffer).
+fn max_manifest_chunks(limits: &FetchLimits) -> u64 {
+    limits.max_file_bytes / 4096 + 2
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum FetchError {
@@ -117,6 +122,10 @@ async fn manifest_from_peer(
     limits: &FetchLimits,
 ) -> Result<Option<Manifest>, FetchError> {
     let mut chunks: Vec<ChunkEntry> = Vec::new();
+    // Bounds are enforced INCREMENTALLY, per page, before anything
+    // accumulates — a post-loop check would let a hostile responder grow
+    // `chunks` without limit first.
+    let mut running_len: u64 = 0;
     loop {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|_| FetchError::NoUsablePeer)?;
         send.write_all(&[STREAM_TAG_MANIFEST])
@@ -146,8 +155,8 @@ async fn manifest_from_peer(
         if resp.content_hash != content_hash {
             return Err(FetchError::BadManifest("wrong content_hash"));
         }
-        if resp.total > MAX_MANIFEST_CHUNKS {
-            return Err(FetchError::BadManifest("absurd chunk count"));
+        if u64::from(resp.total) > max_manifest_chunks(limits) {
+            return Err(FetchError::BadManifest("chunk count exceeds file-size cap"));
         }
         if resp.chunks.len() as u32 > MANIFEST_PAGE {
             return Err(FetchError::BadManifest("oversized page"));
@@ -155,6 +164,12 @@ async fn manifest_from_peer(
         for c in &resp.chunks {
             if c.len == 0 || c.len > limits.max_chunk_bytes {
                 return Err(FetchError::BadManifest("chunk length out of bounds"));
+            }
+            running_len += u64::from(c.len);
+            if running_len > limits.max_file_bytes {
+                return Err(FetchError::BadManifest(
+                    "total length exceeds max_file_bytes",
+                ));
             }
         }
         let total = resp.total;
@@ -170,16 +185,10 @@ async fn manifest_from_peer(
             return Err(FetchError::BadManifest("empty page before total"));
         }
     }
-    let manifest = Manifest {
+    Ok(Some(Manifest {
         content_hash,
         chunks,
-    };
-    if manifest.total_len() > limits.max_file_bytes {
-        return Err(FetchError::BadManifest(
-            "total length exceeds max_file_bytes",
-        ));
-    }
-    Ok(Some(manifest))
+    }))
 }
 
 /// Ensure every chunk of `manifest` is present in the CAS, fetching missing

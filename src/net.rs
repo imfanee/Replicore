@@ -1190,6 +1190,10 @@ impl ReconcileTransport for QuicReconcile<'_> {
     ) -> Result<Vec<crate::proto::WireChild>, ReconcileError> {
         let mut out = Vec::new();
         let mut after = String::new();
+        // Never trust network input: a count cap alone still lets a hostile
+        // responder feed multi-GB of long names across pages — track BYTES
+        // accumulated, not just entries, and reject non-filesystem names.
+        let mut budget_bytes: usize = 32 * 1024 * 1024;
         loop {
             let resp = self
                 .rpc(&ReconcileFrame::TreeReq {
@@ -1206,14 +1210,19 @@ impl ReconcileTransport for QuicReconcile<'_> {
                     if more && children.is_empty() {
                         return Err(ReconcileError::Violation("empty page with more=true"));
                     }
+                    for c in &children {
+                        if c.name.is_empty() || c.name.len() > 255 {
+                            // Linux NAME_MAX: anything else is hostile.
+                            return Err(ReconcileError::Violation("child name out of bounds"));
+                        }
+                        budget_bytes = budget_bytes.checked_sub(c.name.len() + 33).ok_or(
+                            ReconcileError::Violation("directory listing exceeds budget"),
+                        )?;
+                    }
                     if let Some(last) = children.last() {
                         after = last.name.clone();
                     }
                     out.extend(children);
-                    // Bound a hostile responder paging forever.
-                    if out.len() > 1_000_000 {
-                        return Err(ReconcileError::Violation("absurd directory fan-out"));
-                    }
                     if !more {
                         return Ok(out);
                     }
