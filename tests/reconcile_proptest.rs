@@ -290,39 +290,57 @@ async fn descent_is_proportional_to_diff_not_corpus() {
     );
 }
 
-/// Concurrent overlap across a partition: both sides detect, neither
-/// clobbers, both count it (resolution is M3).
+/// Concurrent overlap across a partition heals with a DETERMINISTIC
+/// resolution (M3, FR-303): the first pull resolves winner + conflict copy;
+/// the second side adopts the merged rows; both end byte-identical with zero
+/// loss.
 #[tokio::test]
-async fn reconcile_detects_concurrent_without_clobbering() {
+async fn reconcile_resolves_concurrent_identically() {
     let a = Node::new(NODE_A);
     let b = Node::new(NODE_B);
     a.local_write("shared/p", b"version A").await;
     b.local_write("shared/p", b"version B").await;
 
+    let hash_a = *blake3::hash(b"version A").as_bytes();
+    let hash_b = *blake3::hash(b"version B").as_bytes();
+    let (win, lose): (&[u8], _) = if hash_a > hash_b {
+        (b"version A", hash_b)
+    } else {
+        (b"version B", hash_a)
+    };
+    let copy_rel = replicore::conflict::copy_path_for("shared/p", &lose);
+
+    // A's pull witnesses the conflict and resolves it.
     let ra = pull(&a, &b).await;
+    assert_eq!(ra.resolved_conflicts, 1);
+    assert_eq!(ra.skipped_concurrent, 0);
+    // B's pull then sees A's merged winner row (dominating) and the copy row:
+    // plain applies, no second resolution.
     let rb = pull(&b, &a).await;
-    assert_eq!(ra.skipped_concurrent, 1);
-    assert_eq!(rb.skipped_concurrent, 1);
-    assert_eq!(ra.applied, 0);
-    assert_eq!(rb.applied, 0);
-    assert_eq!(
-        std::fs::read(a.share.join("shared/p")).unwrap(),
-        b"version A"
-    );
-    assert_eq!(
-        std::fs::read(b.share.join("shared/p")).unwrap(),
-        b"version B"
-    );
+    assert_eq!(rb.resolved_conflicts, 0);
+    assert_eq!(rb.skipped_concurrent, 0);
+    assert_eq!(rb.applied, 2);
+
+    // Byte-identical state, including the copy row and its name.
+    let snap_a = a.store.all_files().await.unwrap();
+    let snap_b = b.store.all_files().await.unwrap();
+    assert_eq!(snap_a, snap_b);
+    assert!(snap_a.iter().any(|r| r.path == copy_rel));
+    for node in [&a, &b] {
+        assert_eq!(std::fs::read(node.share.join("shared/p")).unwrap(), win);
+        let copy_bytes = std::fs::read(node.share.join(&copy_rel)).unwrap();
+        assert_eq!(*blake3::hash(&copy_bytes).as_bytes(), lose);
+    }
 }
 
 /// The stale-decision race, reconcile flavor: handle_leaf decides Apply,
 /// then a concurrent local write to the same path lands during the content
 /// fetch (injected inside ensure_content), then apply_assembled clobbers the
-/// disk and reconcile_upsert runs. The committing re-check must downgrade,
-/// the row must keep the local content un-merged, and the disk must be
-/// repaired from the local row.
+/// disk and reconcile_upsert runs. The committing re-check must downgrade —
+/// and the downgrade must then RESOLVE (M3): deterministic winner, both VVs
+/// absorbed, the loser preserved as a conflict copy, the disk matching.
 #[tokio::test]
-async fn reconcile_does_not_clobber_concurrent_local_write() {
+async fn reconcile_resolves_concurrent_local_write_landing_during_fetch() {
     /// Like TestTransport, but lands a local write on `dst` from inside the
     /// content fetch — the exact hazard window.
     struct RacingTransport<'a> {
@@ -402,24 +420,31 @@ async fn reconcile_does_not_clobber_concurrent_local_write() {
         .await
         .unwrap();
 
-    // Downgrade detected and counted; nothing applied for the raced leaf.
-    assert_eq!(report.skipped_concurrent, 1);
+    // Downgrade caught AND resolved; nothing counted as a plain apply.
+    assert_eq!(report.resolved_conflicts, 1);
+    assert_eq!(report.skipped_concurrent, 0);
     assert_eq!(report.applied, 0);
 
-    // Row keeps the LOCAL content, remote VV NOT merged (no masking)...
+    // Deterministic winner, both VV components absorbed — no masking, no
+    // loss: the loser survives as the content-derived copy.
+    let local_hash = *blake3::hash(b"local content X").as_bytes();
+    let remote_hash = *blake3::hash(b"remote content R").as_bytes();
+    let (win_data, lose_hash): (&[u8], _) = if local_hash > remote_hash {
+        (b"local content X", remote_hash)
+    } else {
+        (b"remote content R", local_hash)
+    };
     let row = b.store.load_file("race.bin").await.unwrap().unwrap();
-    assert_eq!(
-        row.content_hash,
-        Some(*blake3::hash(b"local content X").as_bytes())
-    );
-    assert_eq!(row.vv.get(&NODE_A), 0, "remote VV merged: masking");
+    assert_eq!(row.content_hash, Some(*blake3::hash(win_data).as_bytes()));
+    assert_eq!(row.vv.get(&NODE_A), 1);
     assert_eq!(row.vv.get(&NODE_B), 1);
-    // ...and the disk was repaired back to the local content after the
-    // session's rename clobbered it.
-    assert_eq!(
-        std::fs::read(b.share.join("race.bin")).unwrap(),
-        b"local content X"
-    );
+    let copy_rel = replicore::conflict::copy_path_for("race.bin", &lose_hash);
+    let copy_row = b.store.load_file(&copy_rel).await.unwrap().unwrap();
+    assert_eq!(copy_row.content_hash, Some(lose_hash));
+    // Disk agrees: winner at the path, loser at the copy.
+    assert_eq!(std::fs::read(b.share.join("race.bin")).unwrap(), win_data);
+    let copy_bytes = std::fs::read(b.share.join(&copy_rel)).unwrap();
+    assert_eq!(*blake3::hash(&copy_bytes).as_bytes(), lose_hash);
 }
 
 /// Tombstones propagate via reconcile and stale content cannot resurrect.

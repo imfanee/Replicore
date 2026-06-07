@@ -43,6 +43,7 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use crate::apply::{apply_assembled, apply_delete, ApplyError};
 use crate::chunk::Cas;
 use crate::config::{Config, Peer};
+use crate::conflict::{PlannedRow, Version, META_NONE};
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
 use crate::membership::Membership;
@@ -50,7 +51,7 @@ use crate::merkle::{
     reconcile_pull, MerkleTree, ReconcileCtx, ReconcileError, ReconcileReport, ReconcileTransport,
     RemoteLeaf,
 };
-use crate::oplog::{Store, StoreError};
+use crate::oplog::{ResolveOutcome, Store, StoreError};
 use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
     read_msg, write_msg, ChunkReq, ChunkResp, Frame, ManifestReq, ManifestResp, OpRecord, OpType,
@@ -1442,43 +1443,233 @@ impl Engine {
             }
         }
         if decision == Decision::Concurrent {
-            // Detected, durably recorded as skipped, surfaced to operators.
-            // TODO(M3): deterministic winner + conflict copy (FR-303/304).
+            // Detected (FR-305 counter + per-conflict log), then RESOLVED
+            // (FR-303): winner + copies commit through resolve_rows BEFORE
+            // apply_remote records the op — a crash between the two heals on
+            // redelivery (the merged row dominates, so it records as Ignore).
             Stats::inc(&self.stats.conflicts);
             tracing::warn!(
                 path = %op.path,
                 origin = %hex::encode(&op.origin[..4]),
-                "concurrent versions detected; keeping local (resolution is M3)"
+                "concurrent versions detected; resolving (FR-303)"
             );
+            self.resolve_concurrent_op(&op).await?;
         }
         // THE durability point (fsynced WAL commit). Ack happens after.
         // The store RE-VALIDATES an Apply under the committing transaction:
         // if a concurrent local write landed during the (multi-second) fetch
         // window, the decision comes back downgraded and the rename that
         // already hit the disk must be repaired from the local row.
-        let path = op.path.clone();
-        let origin = op.origin;
+        let resolved_op = op.clone();
         let effective = self.store.apply_remote(op, decision).await?;
         if decision == Decision::Apply && effective != Decision::Apply {
             // The committing re-check downgraded a stale Apply to Concurrent —
             // the second Concurrent site (FR-303 counter).
             Stats::inc(&self.stats.conflicts);
             tracing::warn!(
-                path = %path,
-                origin = %hex::encode(&origin[..4]),
+                path = %resolved_op.path,
+                origin = %hex::encode(&resolved_op.origin[..4]),
                 ?effective,
-                "concurrent local write landed during transfer; restoring local content, remote recorded (resolution is M3)"
+                "concurrent local write landed during transfer; restoring local content and resolving"
             );
             crate::merkle::restore_local_content(
                 &self.store,
                 &self.cas,
                 &self.cfg.share_dir,
                 &self.suppress,
-                &path,
+                &resolved_op.path,
+            )
+            .await;
+            if effective == Decision::Concurrent {
+                // The remote bytes are already CAS-resident (just fetched):
+                // the same resolution as site 1, no second transfer.
+                self.resolve_concurrent_op(&resolved_op).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The conflict-resolution loop, live-op flavor (FR-303): ask the store
+    /// for the authoritative plan (an empty staging never matches), stage its
+    /// contents on disk through the atomic-apply discipline, commit. `Stale`
+    /// re-derives under local-write interference; bounded retries. On any
+    /// non-committed exit every path staged here is restored from its
+    /// committed row, so no uncommitted content (and no orphan copy the
+    /// scanner would mint an op for) is left on disk.
+    ///
+    /// A PERMANENT staging failure (loser content gone everywhere, oversized)
+    /// abandons the resolution quarantine-style: the op still gets recorded
+    /// by the caller and a later reconcile session retries — the conflict
+    /// stays detected, never silently dropped. Transient failures propagate
+    /// (connection drops, redelivery re-runs the resolution).
+    async fn resolve_concurrent_op(&self, op: &OpRecord) -> Result<(), NetError> {
+        let remote = Version {
+            tombstone: op.op_type == OpType::Delete,
+            content_hash: op.content_hash,
+            meta_hash: META_NONE,
+            mode: op.mode,
+            size: op.size,
+            vv: op.vv.clone(),
+        };
+        let mut staged: Vec<PlannedRow> = Vec::new();
+        let mut staged_paths: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            match self
+                .store
+                .resolve_rows(&op.path, remote.clone(), std::mem::take(&mut staged))
+                .await?
+            {
+                ResolveOutcome::Resolved => {
+                    tracing::info!(
+                        path = %op.path,
+                        origin = %hex::encode(&op.origin[..4]),
+                        "conflict resolved: winner + copies committed (FR-303)"
+                    );
+                    return Ok(());
+                }
+                ResolveOutcome::NotConcurrent(_) => {
+                    // Raced away (e.g. reconcile merged a peer's resolution).
+                    self.restore_paths(&staged_paths).await;
+                    return Ok(());
+                }
+                ResolveOutcome::Unresolvable => {
+                    tracing::error!(
+                        path = %op.path,
+                        "conflict copy chain too deep; keeping local (reconcile retries)"
+                    );
+                    self.restore_paths(&staged_paths).await;
+                    return Ok(());
+                }
+                ResolveOutcome::Stale { plan } => {
+                    for row in &plan {
+                        match self.stage_planned_row(row, op.origin).await {
+                            Ok(true) => staged_paths.push(row.path.clone()),
+                            Ok(false) => {}
+                            Err(e) if is_permanent(&e) => {
+                                tracing::error!(
+                                    path = %row.path,
+                                    error = %e,
+                                    "conflict copy unmaterializable; resolution deferred to reconcile"
+                                );
+                                self.restore_paths(&staged_paths).await;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                self.restore_paths(&staged_paths).await;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    staged = plan;
+                }
+            }
+        }
+        tracing::warn!(
+            path = %op.path,
+            "conflict resolution retries exhausted under local writes; reconcile retries"
+        );
+        self.restore_paths(&staged_paths).await;
+        Ok(())
+    }
+
+    /// Stage one planned row's content on disk (stage→fsync→verify→rename +
+    /// suppression — the only apply discipline). Content comes from the local
+    /// manifest + CAS when held (local writes chunk into the CAS at ingest;
+    /// just-fetched remote bytes are CAS-resident), else multi-source fetch,
+    /// origin first — under the same pause gate, transfer bound, and size cap
+    /// as a normal materialize. Returns whether the disk was touched.
+    async fn stage_planned_row(&self, row: &PlannedRow, origin: NodeId) -> Result<bool, NetError> {
+        if row.tombstone {
+            let share = self.cfg.share_dir.clone();
+            let rel = row.path.clone();
+            let suppress = self.suppress.clone();
+            tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
+            return Ok(true);
+        }
+        let Some(hash) = row.content_hash else {
+            return Err(NetError::Violation("live planned row without hash"));
+        };
+        // Already current on disk (e.g. the winner is the local content):
+        // the commit only moves the row's VV.
+        if let Some(cur) = self.store.load_row(&row.path).await? {
+            if !cur.tombstone && cur.content_hash == Some(hash) {
+                return Ok(false);
+            }
+        }
+        if row.size > self.cfg.max_file_bytes {
+            return Err(NetError::TooBig);
+        }
+        self.await_unpaused().await;
+        let _transfer_permit = self
+            .transfers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+        Stats::gauge_inc(&self.stats.inflight_transfers);
+        let result = self.stage_planned_content(row, origin, hash).await;
+        Stats::gauge_dec(&self.stats.inflight_transfers);
+        result?;
+        Ok(true)
+    }
+
+    async fn stage_planned_content(
+        &self,
+        row: &PlannedRow,
+        origin: NodeId,
+        hash: [u8; 32],
+    ) -> Result<(), NetError> {
+        let limits = self.fetch_limits();
+        let manifest = match self.store.manifest_for(hash).await? {
+            Some(m) => m,
+            None => {
+                crate::fetch::obtain_manifest(
+                    hash,
+                    &self.store,
+                    &self.conns,
+                    origin,
+                    &limits,
+                    &self.stats,
+                )
+                .await?
+            }
+        };
+        // Fetches only what the CAS lacks (no-op for local/just-fetched
+        // content).
+        crate::fetch::fetch_file_chunks(
+            &manifest,
+            &self.cas,
+            &self.conns,
+            origin,
+            &limits,
+            &self.stats,
+        )
+        .await?;
+        let share = self.cfg.share_dir.clone();
+        let rel = row.path.clone();
+        let mode = row.mode;
+        let suppress = self.suppress.clone();
+        let cas = self.cas.clone();
+        tokio::task::spawn_blocking(move || {
+            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Restore every path in `paths` from its committed row — the repair for
+    /// staged-but-not-committed resolution content.
+    async fn restore_paths(&self, paths: &[String]) {
+        for p in paths {
+            crate::merkle::restore_local_content(
+                &self.store,
+                &self.cas,
+                &self.cfg.share_dir,
+                &self.suppress,
+                p,
             )
             .await;
         }
-        Ok(())
     }
 
     /// Execute the filesystem side of a `Decision::Apply` over the chunked
@@ -2456,7 +2647,7 @@ mod tests {
     /// clobber from the already-performed rename must be repaired from the
     /// local row. No committed state may be lost.
     #[tokio::test]
-    async fn concurrent_local_write_during_transfer_is_not_clobbered() {
+    async fn concurrent_local_write_during_transfer_resolves_without_loss() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let id_a = generate_identity().unwrap();
@@ -2542,25 +2733,50 @@ mod tests {
         assert!(handled, "remote op never durably handled");
         assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 1);
 
-        // ...as Concurrent: the row keeps the LOCAL content and the remote
-        // VV component was NOT merged (no causal masking).
-        let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();
-        assert_eq!(row.content_hash, Some(local_hash), "row clobbered");
-        assert_eq!(row.vv.get(&A), 0, "remote VV merged: clobber masked");
-        assert_eq!(row.vv.get(&B), 1);
-
-        // And the DISK was repaired back to the local content.
-        let mut repaired = false;
-        for _ in 0..100 {
-            if std::fs::read(dir_b.path().join("race.bin"))
-                .is_ok_and(|d| d == local_data.as_slice())
-            {
-                repaired = true;
+        // ...and RESOLVED (M3, FR-303): deterministic winner by the content
+        // total order, both VV components absorbed, the loser preserved as a
+        // conflict copy — zero loss, no causal masking.
+        let remote_data = b"remote content R";
+        let remote_hash = *blake3::hash(remote_data).as_bytes();
+        let (win_hash, win_data, lose_hash, lose_data): (_, &[u8], _, &[u8]) =
+            if local_hash > remote_hash {
+                (local_hash, local_data, remote_hash, remote_data)
+            } else {
+                (remote_hash, remote_data, local_hash, local_data)
+            };
+        let copy_rel = crate::conflict::copy_path_for("race.bin", &lose_hash);
+        let mut resolved = false;
+        for _ in 0..200 {
+            let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();
+            if row.content_hash == Some(win_hash) && row.vv.get(&A) == 1 && row.vv.get(&B) == 1 {
+                resolved = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(repaired, "disk clobber was not repaired to local content");
+        assert!(resolved, "conflict was not resolved to the winner row");
+        let copy_row = engine_b.store.load_file(&copy_rel).await.unwrap().unwrap();
+        assert_eq!(copy_row.content_hash, Some(lose_hash), "loser not copied");
+        assert_eq!(
+            copy_row.vv,
+            crate::conflict::copy_vv(&copy_rel),
+            "copy row VV is not the deterministic synthetic vector"
+        );
+
+        // The DISK agrees: winner at the path, loser at the copy.
+        let mut disk_ok = false;
+        for _ in 0..100 {
+            let path_ok =
+                std::fs::read(dir_b.path().join("race.bin")).is_ok_and(|d| d == win_data.to_vec());
+            let copy_ok =
+                std::fs::read(dir_b.path().join(&copy_rel)).is_ok_and(|d| d == lose_data.to_vec());
+            if path_ok && copy_ok {
+                disk_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(disk_ok, "disk does not hold winner + conflict copy");
 
         // The stream continues past the conflict: a later op still lands.
         std::fs::write(dir_a.path().join("after.txt"), b"flows").unwrap();
