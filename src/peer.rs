@@ -104,55 +104,83 @@ impl PeerRegistry {
 }
 
 /// Live connections by peer, shared between subscriptions, fetchers, and
-/// reconcile sessions. An entry may be the inbound or the outbound connection
-/// to that peer — either serves ephemeral streams equally well.
+/// reconcile sessions. A peer can hold BOTH its inbound and its outbound
+/// connection at once (each side dials the other in the full mesh), so we keep
+/// ALL of them per peer — either direction serves ephemeral streams equally
+/// well, and on membership removal we must close every one of them
+/// ([`ConnRegistry::close_all`]). Tracking only one would leave the other
+/// direction (and the dialer side's detached serve task) alive after a removal.
 #[derive(Clone, Default)]
-pub struct ConnRegistry(Arc<RwLock<HashMap<NodeId, quinn::Connection>>>);
+pub struct ConnRegistry(Arc<RwLock<HashMap<NodeId, Vec<quinn::Connection>>>>);
 
 impl ConnRegistry {
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register a connection to `peer`. Idempotent per connection (dedup by
+    /// `stable_id`), so a re-registration of the same conn does not duplicate.
     pub fn insert(&self, peer: NodeId, conn: quinn::Connection) {
-        write_lock(&self.0).insert(peer, conn);
-    }
-
-    /// Remove `peer`'s entry only if it is still THIS connection — a newer
-    /// (re)connection must not be evicted by the old one's teardown.
-    pub fn remove_if_same(&self, peer: &NodeId, conn: &quinn::Connection) {
         let mut map = write_lock(&self.0);
-        if map
-            .get(peer)
-            .is_some_and(|c| c.stable_id() == conn.stable_id())
-        {
-            map.remove(peer);
+        let conns = map.entry(peer).or_default();
+        if !conns.iter().any(|c| c.stable_id() == conn.stable_id()) {
+            conns.push(conn);
         }
     }
 
-    pub fn get(&self, peer: &NodeId) -> Option<quinn::Connection> {
-        read_lock(&self.0).get(peer).cloned()
+    /// Remove exactly THIS connection (by `stable_id`) when its task exits — a
+    /// concurrent connection to the same peer (the other direction, or a
+    /// reconnection) is left untouched.
+    pub fn remove_if_same(&self, peer: &NodeId, conn: &quinn::Connection) {
+        let mut map = write_lock(&self.0);
+        if let Some(conns) = map.get_mut(peer) {
+            conns.retain(|c| c.stable_id() != conn.stable_id());
+            if conns.is_empty() {
+                map.remove(peer);
+            }
+        }
     }
 
-    /// Every live connection — gossip fan-out / control-plane fan-out.
+    /// One representative connection for `peer`, if any.
+    pub fn get(&self, peer: &NodeId) -> Option<quinn::Connection> {
+        read_lock(&self.0)
+            .get(peer)
+            .and_then(|v| v.first().cloned())
+    }
+
+    /// Close EVERY connection to `peer` and forget them (FR-1307 removal). The
+    /// `quinn` close propagates to all clones, so both the inbound `inbound_io`
+    /// task and the outbound side's detached `serve_streams` task unblock and
+    /// exit — there is no lingering data channel to a removed node.
+    pub fn close_all(&self, peer: &NodeId, code: quinn::VarInt, reason: &[u8]) {
+        if let Some(conns) = write_lock(&self.0).remove(peer) {
+            for conn in conns {
+                conn.close(code, reason);
+            }
+        }
+    }
+
+    /// Every live peer with ONE representative connection each — per-peer
+    /// fan-out (gossip / control-plane status / resync).
     pub fn all(&self) -> Vec<(NodeId, quinn::Connection)> {
         read_lock(&self.0)
             .iter()
-            .map(|(k, c)| (*k, c.clone()))
+            .filter_map(|(k, v)| v.first().map(|c| (*k, c.clone())))
             .collect()
     }
 
     /// Fetch candidates: `origin_first` (the node most likely to hold the
-    /// content) followed by every other live connection.
+    /// content) followed by every other live connection — ALL connections, so a
+    /// peer reachable on two links offers two fetch sources.
     pub fn candidates(&self, origin_first: &NodeId) -> Vec<(NodeId, quinn::Connection)> {
         let map = read_lock(&self.0);
-        let mut out: Vec<(NodeId, quinn::Connection)> = Vec::with_capacity(map.len());
-        if let Some(c) = map.get(origin_first) {
-            out.push((*origin_first, c.clone()));
+        let mut out: Vec<(NodeId, quinn::Connection)> = Vec::new();
+        if let Some(conns) = map.get(origin_first) {
+            out.extend(conns.iter().map(|c| (*origin_first, c.clone())));
         }
-        for (k, c) in map.iter() {
+        for (k, conns) in map.iter() {
             if k != origin_first {
-                out.push((*k, c.clone()));
+                out.extend(conns.iter().map(|c| (*k, c.clone())));
             }
         }
         out

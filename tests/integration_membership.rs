@@ -378,3 +378,123 @@ async fn removing_one_node_does_not_disrupt_another_link() {
         "A→B link disrupted by C's removal"
     );
 }
+
+/// Poll that `cond` stays false for ~`iters`*50ms (a negative assertion that
+/// something does NOT happen within a window).
+async fn stays_false<F, Fut>(iters: u32, mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..iters {
+        if cond().await {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+/// Item 1 / Item 2: an ALREADY-established node, connected in BOTH directions,
+/// has every channel severed after a signed Remove — it can neither push an op
+/// nor receive one. Pins the post-fix invariant (ConnRegistry::close_all closes
+/// every connection deterministically). NOTE: pre-fix, the single-registry-slot
+/// teardown left ONE direction alive, but *which* one depended on which
+/// connection won the slot (nondeterministic), so this caught the residual only
+/// ~half the time; close_all removes that nondeterminism. The deterministic hard
+/// guarantee (a removed fp is refused at TLS) is pinned in the net.rs unit test
+/// `removed_peer_handshake_is_refused`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn existing_connection_severed_on_removal() {
+    let admin = admin();
+    let a = Node::start(nid(0xA), &admin.pk, &[]);
+    let c = Node::start(nid(0xC), &admin.pk, &[&a]);
+    a.admin_add(&admin, &c);
+
+    // Both directions live: A→C (C receives A's ops) and C→A (A receives C's).
+    a.write("a2c.txt", b"x").await;
+    assert!(
+        eventually(|| c.has("a2c.txt", h(b"x"))).await,
+        "A→C link never came up"
+    );
+    c.write("c2a.txt", b"y").await;
+    assert!(
+        eventually(|| a.has("c2a.txt", h(b"y"))).await,
+        "C→A link never came up (no second connection to sever)"
+    );
+
+    // Remove C → every connection to C must be severed (both directions).
+    assert_eq!(a.admin_remove(&admin, &c), MergeOutcome::Applied);
+
+    // Neither direction carries data anymore.
+    a.write("after-a.txt", b"p").await;
+    c.write("after-c.txt", b"q").await;
+    assert!(
+        stays_false(80, || c.has("after-a.txt", h(b"p"))).await,
+        "A→C channel survived removal (removed node still receiving data)"
+    );
+    assert!(
+        stays_false(80, || a.has("after-c.txt", h(b"q"))).await,
+        "C→A channel survived removal (removed node still pushing ops)"
+    );
+}
+
+/// Item 2: after removal a node cannot re-establish — the verifier reads the
+/// LIVE allowlist, so C's fingerprint is gone and C never returns to Live
+/// despite its dial loop retrying. (The literal TLS-rejection assertion lives in
+/// the net.rs unit test `removed_peer_handshake_is_refused`; quinn does not
+/// surface the peer's TLS alert to the app layer here.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnect_refused_after_removal() {
+    let admin = admin();
+    let a = Node::start(nid(0xA), &admin.pk, &[]);
+    let c = Node::start(nid(0xC), &admin.pk, &[&a]);
+    a.admin_add(&admin, &c);
+
+    // C reaches Live toward A.
+    assert!(
+        eventually(|| {
+            let live =
+                c.engine.peer_registry().get(&a.id).state == replicore::peer::PeerState::Live;
+            async move { live }
+        })
+        .await,
+        "C never reached Live toward A"
+    );
+
+    assert_eq!(a.admin_remove(&admin, &c), MergeOutcome::Applied);
+
+    // (a) The exact state the per-handshake verifier reads: C's fp is gone.
+    assert!(
+        !a.engine
+            .membership()
+            .allowlist_handle()
+            .read()
+            .unwrap()
+            .contains(&c.fingerprint),
+        "removed node's fingerprint still in A's live TLS allowlist"
+    );
+
+    // (b) Wait for teardown, then assert C stays out of the data path: it never
+    // returns to Live toward A and A never re-registers a connection to it,
+    // even though C's dial loop keeps retrying.
+    assert!(
+        eventually(|| {
+            let down =
+                c.engine.peer_registry().get(&a.id).state != replicore::peer::PeerState::Live;
+            async move { down }
+        })
+        .await,
+        "C never dropped from Live after removal"
+    );
+    assert!(
+        stays_false(80, || {
+            let relive = c.engine.peer_registry().get(&a.id).state
+                == replicore::peer::PeerState::Live
+                || a.engine.conn_registry().get(&c.id).is_some();
+            async move { relive }
+        })
+        .await,
+        "removed node re-established a connection to A"
+    );
+}

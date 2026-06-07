@@ -735,16 +735,18 @@ impl Engine {
                 .collect();
             for id in removed {
                 if let Some((_, h)) = tasks.remove(&id) {
-                    h.abort();
+                    h.abort(); // stop reconnects (the dial loop would respin)
                 }
-                if let Some(conn) = self.conns.get(&id) {
-                    conn.close(0u32.into(), b"membership-remove");
-                    self.conns.remove_if_same(&id, &conn);
-                }
+                // Close EVERY connection to the removed node — both directions,
+                // including the dialer side's detached serve task — not just the
+                // single registry slot. The fingerprint is already out of the
+                // TLS allowlist (recompute, before this fires), so nothing can
+                // re-establish; close_all severs what is already open.
+                self.conns.close_all(&id, 0u32.into(), b"membership-remove");
                 self.peers_reg.set_state(id, PeerState::Disconnected);
                 tracing::info!(
                     node = %hex::encode(&id[..4]),
-                    "peer removed from mesh; dial loop and connection torn down"
+                    "peer removed from mesh; dial loop aborted and all connections severed"
                 );
             }
 
@@ -1892,6 +1894,135 @@ mod tests {
             .await
             .unwrap()
             .unwrap()
+    }
+
+    /// Admin-keyed engine + a signed Add for `member`, so its fingerprint is in
+    /// the live allowlist. Returns (engine, admin secret) for further churn.
+    fn admin_engine_with_member(
+        dir: &Path,
+        node_id: NodeId,
+        ident: &GeneratedIdentity,
+        member: NodeId,
+        member_addr: SocketAddr,
+        member_fp: [u8; 32],
+    ) -> (Arc<Engine>, crate::admin::AdminSecret) {
+        let (doc, pk) = crate::admin::generate_admin_key().unwrap();
+        let kp = dir.join(format!("admin-{}.sk", hex::encode(&node_id[..2])));
+        std::fs::write(&kp, &doc).unwrap();
+        let sk = crate::admin::AdminSecret::load(&kp).unwrap();
+
+        let mut cfg = test_config(node_id, "127.0.0.1:0".parse().unwrap(), dir, ident, vec![]);
+        cfg.admin_pubkey = Some(pk);
+        cfg.roster_path = dir.join(format!("roster-{}.json", hex::encode(&node_id[..2])));
+        let store = Store::open(Path::new(":memory:"), node_id).unwrap();
+        let cas = Cas::open(&cfg.cas_dir.join(hex::encode(&node_id[..2]))).unwrap();
+        let mem = crate::membership::Membership::load(&cfg).unwrap();
+        let engine = Engine::new(cfg, store, Suppressor::new(), cas, mem);
+
+        let add = signed_entry(
+            &sk,
+            member,
+            member_addr,
+            member_fp,
+            1,
+            crate::admin::EntryKind::Add,
+        );
+        assert_eq!(
+            engine.membership().merge_signed(add).unwrap(),
+            crate::membership::MergeOutcome::Applied
+        );
+        (engine, sk)
+    }
+
+    fn signed_entry(
+        sk: &crate::admin::AdminSecret,
+        node: NodeId,
+        addr: SocketAddr,
+        fp: [u8; 32],
+        epoch: u64,
+        kind: crate::admin::EntryKind,
+    ) -> crate::membership::SignedEntry {
+        let sig = crate::admin::sign_entry(sk, &node, &addr, &fp, epoch, kind);
+        crate::membership::SignedEntry {
+            node_id: node,
+            addr,
+            fingerprint: fp,
+            epoch,
+            kind,
+            sig,
+        }
+    }
+
+    /// THE removal-locks-out pin (FR-1307): the TLS verifiers read the LIVE
+    /// allowlist per handshake, so once an admin-signed Remove evicts a node's
+    /// fingerprint, a fresh handshake from that node is refused at TLS — even
+    /// though it handshook fine moments earlier. A refactor that snapshotted the
+    /// allowlist at endpoint-build time would regress this test.
+    #[tokio::test]
+    async fn removed_peer_handshake_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_c = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const C: NodeId = [0xc; 16];
+        let c_addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        // A: admin-keyed, with C admitted (its fp is in A's live allowlist).
+        let (engine_a, admin_sk) =
+            admin_engine_with_member(dir.path(), A, &id_a, C, c_addr, id_c.fingerprint);
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+
+        // Report each server-side handshake outcome (authoritative for client
+        // auth under TLS 1.3 — the client may finish before the server rejects).
+        let (res_tx, mut res_rx) = tokio::sync::mpsc::channel(4);
+        let accept = tokio::spawn({
+            let ep = ep_a.clone();
+            async move {
+                while let Some(incoming) = ep.accept().await {
+                    let tx = res_tx.clone();
+                    tokio::spawn(async move {
+                        let _ = tx.send(incoming.await.map(|_| ())).await;
+                    });
+                }
+            }
+        });
+
+        // C dials A; C pins A (A seeded into C's allowlist).
+        let engine_c = engine_on(dir.path(), C, &id_c, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_c = engine_c.build_endpoint().unwrap();
+
+        // Round 1 — C is a member: the server-side handshake succeeds.
+        let _ = ep_c.connect(addr_a, "replicore").unwrap().await;
+        let r1 = res_rx.recv().await.unwrap();
+        assert!(r1.is_ok(), "member C was refused before removal: {r1:?}");
+
+        // Admin-remove C: its fp leaves the SAME live allowlist Arc the already-
+        // built endpoint's verifier reads.
+        let next = engine_a.membership().next_epoch_for(&C);
+        let rm = signed_entry(
+            &admin_sk,
+            C,
+            c_addr,
+            id_c.fingerprint,
+            next,
+            crate::admin::EntryKind::Remove,
+        );
+        assert_eq!(
+            engine_a.membership().merge_signed(rm).unwrap(),
+            crate::membership::MergeOutcome::Applied
+        );
+
+        // Round 2 — a FRESH handshake from the now-removed C is refused at TLS.
+        let _ = ep_c.connect(addr_a, "replicore").unwrap().await;
+        let r2 = res_rx.recv().await.unwrap();
+        assert!(
+            r2.is_err(),
+            "removed peer completed a TLS handshake (allowlist not consulted live, \
+             or session resumption bypassed client-auth): {r2:?}"
+        );
+
+        accept.abort();
     }
 
     #[test]
