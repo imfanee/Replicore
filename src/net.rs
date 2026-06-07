@@ -3254,7 +3254,8 @@ mod tests {
             } else {
                 (remote_hash, remote_data, local_hash, local_data)
             };
-        let copy_rel = crate::conflict::copy_path_for("race.bin", &lose_hash);
+        let copy_rel =
+            crate::conflict::copy_path_for("race.bin", &lose_hash, &crate::conflict::META_NONE);
         let mut resolved = false;
         for _ in 0..200 {
             let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();

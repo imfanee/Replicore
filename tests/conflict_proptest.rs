@@ -20,6 +20,7 @@
 
 use proptest::prelude::*;
 use replicore::conflict::COPY_MARKER;
+use replicore::metadata::Meta;
 use replicore::replica::Replica;
 use replicore::state::FileRow;
 use replicore::vv::NodeId;
@@ -28,12 +29,17 @@ const NODES: [NodeId; 3] = [[0xaa; 16], [0xbb; 16], [0xcc; 16]];
 
 #[derive(Clone, Debug)]
 enum Action {
-    Write(u8),
+    /// (content byte, mode variant) — the mode dimension generates
+    /// META-ONLY conflicts (same bytes, different metadata), the S1 review
+    /// finding's class: the losing metadata snapshot must survive.
+    Write(u8, u8),
     Delete,
     /// Identity-preserving move to another pool slot (FR-205/FR-304:
     /// rename-vs-modify and rename-vs-rename interleavings).
     Rename(usize),
 }
+
+const MODES: [u32; 2] = [0o644, 0o600];
 
 /// Scripts over a SHARED namespace: every node writes the same few paths, so
 /// concurrent overlap (the thing under test) is dense, with deletes and
@@ -43,7 +49,7 @@ fn arb_script() -> impl Strategy<Value = Vec<(usize, Action)>> {
         (
             0usize..3, // shared path pool: p0..p2 — collisions are the point
             prop_oneof![
-                4 => (0u8..6).prop_map(Action::Write),
+                4 => (0u8..6, 0u8..2).prop_map(|(c, m)| Action::Write(c, m)),
                 1 => Just(Action::Delete),
                 1 => (0usize..3).prop_map(Action::Rename),
             ],
@@ -60,7 +66,10 @@ async fn run_script(
     for (idx, action) in script {
         let path = format!("shared/p{idx}");
         let emitted = match action {
-            Action::Write(c) => replica.local_write(&path, &[*c]).await.unwrap(),
+            Action::Write(c, m) => replica
+                .local_write_with_mode(&path, &[*c], MODES[*m as usize])
+                .await
+                .unwrap(),
             Action::Delete => replica.local_delete(&path).await.unwrap(),
             Action::Rename(to) => {
                 let target = format!("shared/p{to}");
@@ -186,41 +195,44 @@ proptest! {
                 r.assert_fs_matches_index().await.unwrap();
             }
 
-            // ZERO SILENT LOSS (FR-303): every content hash any node ever
-            // wrote either won a path, survives as a copy row, or was
-            // causally superseded BY ITS OWN AUTHOR (a later op on the same
-            // path from the same node — normal history, not a conflict).
-            let mut last_by_author: std::collections::BTreeMap<(String, NodeId), [u8; 32]> =
-                std::collections::BTreeMap::new();
+            // ZERO SILENT LOSS (FR-303), (content, META) PAIRS — the S1
+            // review finding's oracle: every (bytes, metadata) version any
+            // author finally wrote must survive at the path or in a copy
+            // row; metadata-only losers count as loss too.
+            let mut last_by_author: std::collections::BTreeMap<
+                (String, NodeId),
+                ([u8; 32], [u8; 32]),
+            > = std::collections::BTreeMap::new();
             for ops in &all_ops {
                 for op in ops {
                     if let Some(old_path) = &op.path_old {
                         last_by_author.remove(&(old_path.clone(), op.origin));
                     }
                     match op.content_hash {
-                        Some(h) => last_by_author.insert((op.path.clone(), op.origin), h),
+                        Some(h) => last_by_author.insert(
+                            (op.path.clone(), op.origin),
+                            (h, Meta::hash_of(&op.meta)),
+                        ),
                         None => last_by_author.remove(&(op.path.clone(), op.origin)),
                     };
                 }
             }
-            let surviving: std::collections::BTreeSet<[u8; 32]> = snaps[0]
+            let surviving: std::collections::BTreeSet<([u8; 32], [u8; 32])> = snaps[0]
                 .iter()
                 .filter(|r| !r.tombstone)
-                .filter_map(|r| r.content_hash)
+                .filter_map(|r| r.content_hash.map(|h| (h, Meta::hash_of(&r.meta))))
                 .collect();
-            for ((path, _author), hash) in &last_by_author {
-                // The author's final content for the path must survive
-                // somewhere — at the path or as a conflict copy — UNLESS the
-                // path's winner is a tombstone that causally dominated it
-                // (a delete that SAW this write and deleted it is history,
-                // not loss) ... which cannot happen here: a delete only
-                // dominates its own node's prior write, removing it from
-                // last_by_author above. A concurrent delete LOSES to a write
-                // (modify wins), so the write must be present.
+            for ((path, _author), pair) in &last_by_author {
+                // The author's final (content, meta) for the path must
+                // survive somewhere — at the path or as a conflict copy.
+                // (A delete only dominates its own node's prior write,
+                // removing it from last_by_author above; a concurrent
+                // delete LOSES to a write — modify wins.)
                 prop_assert!(
-                    surviving.contains(hash),
-                    "content {} written at {} by an author's final op was lost",
-                    hex::encode(&hash[..4]),
+                    surviving.contains(pair),
+                    "version (content {}, meta {}) written at {} by an author's final op was lost",
+                    hex::encode(&pair.0[..4]),
+                    hex::encode(&pair.1[..4]),
                     path
                 );
             }
@@ -237,9 +249,12 @@ proptest! {
                 // Reconstruct: original may have had an extension restored
                 // after the marker; accept either form.
                 let with_ext = row.path.rsplit('.').next().filter(|e| !e.contains('-'));
-                let candidate_a = replicore::conflict::copy_path_for(&original, &hash);
+                let mh = Meta::hash_of(&row.meta);
+                let candidate_a = replicore::conflict::copy_path_for(&original, &hash, &mh);
                 let candidate_b = with_ext
-                    .map(|e| replicore::conflict::copy_path_for(&format!("{original}.{e}"), &hash));
+                    .map(|e| {
+                        replicore::conflict::copy_path_for(&format!("{original}.{e}"), &hash, &mh)
+                    });
                 prop_assert!(
                     row.path == candidate_a || Some(row.path.clone()) == candidate_b,
                     "copy row {} does not match its derived name",

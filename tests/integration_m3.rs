@@ -255,8 +255,11 @@ fn run_partition_conflict_flow(b_wrapper: &[&str]) {
     std::thread::sleep(Duration::from_secs(90));
     heal("b");
 
-    // Deterministic resolution (FR-303): winner = larger content hash,
-    // loser preserved at the content-derived copy name — on BOTH nodes.
+    // Deterministic resolution (FR-303): winner = larger content hash, loser
+    // preserved under the derived copy name on BOTH nodes. The exact name is
+    // a function of the loser's content AND captured metadata (mtime!), so
+    // the test cannot precompute it — cross-node name determinism is exactly
+    // what the byte-identical-trees assertion (keys included) proves.
     let (ha, hb) = (
         *blake3::hash(side_a).as_bytes(),
         *blake3::hash(side_b).as_bytes(),
@@ -266,9 +269,12 @@ fn run_partition_conflict_flow(b_wrapper: &[&str]) {
     } else {
         (&side_b[..], ha)
     };
-    let copy_rel = replicore::conflict::copy_path_for("shared/p.txt", &lose_hash);
-    eprintln!("[test] expecting winner at shared/p.txt, loser at {copy_rel}");
-
+    let lose_hex = hex::encode(lose_hash);
+    let find_copy = |t: &BTreeMap<String, String>| {
+        t.iter()
+            .find(|(k, v)| k.contains(".sync-conflict-") && **v == lose_hex)
+            .map(|(k, _)| k.clone())
+    };
     wait_for(
         "trees converge with identical conflict copies",
         Duration::from_secs(120),
@@ -279,12 +285,11 @@ fn run_partition_conflict_flow(b_wrapper: &[&str]) {
                 && ta == tb
                 && ta.get("shared/p.txt").map(String::as_str)
                     == Some(blake3::hash(win).to_hex().as_str())
-                && ta.contains_key(&copy_rel)
+                && find_copy(&ta).is_some()
         },
     );
-    // Zero loss: the losing content survives byte-exact under the copy name.
-    let copy_bytes = std::fs::read(PathBuf::from(NODES[0].3).join(&copy_rel)).unwrap();
-    assert_eq!(*blake3::hash(&copy_bytes).as_bytes(), lose_hash);
+    let copy_rel = find_copy(&tree(NODES[0].3)).expect("loser copy");
+    eprintln!("[test] loser preserved at {copy_rel} on both nodes");
     // Both conflict counters saw it.
     assert!(metric("a", "replicore_conflicts_total") >= 1);
 }

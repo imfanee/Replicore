@@ -19,7 +19,7 @@
 //!    reconcile exchange converges them byte-identically (never the
 //!    equal-VV/different-content deadlock of the pairwise design).
 
-use replicore::conflict::copy_path_for;
+use replicore::conflict::{copy_path_for, META_NONE};
 use replicore::decide::Decision;
 use replicore::oplog::ReconciledRow;
 use replicore::proto::{op_id, OpRecord, OpType};
@@ -117,7 +117,7 @@ async fn bootstrapped_node_resolves_identically_to_full_history() {
     assert_eq!(winner.content_hash, Some(*blake3::hash(&hi).as_bytes()));
     assert_eq!(winner.vv.get(&SRC), 2);
     assert_eq!(winner.vv.get(&SRC3), 1); // both sides absorbed
-    let copy = copy_path_for("shared/p.txt", blake3::hash(&mid).as_bytes());
+    let copy = copy_path_for("shared/p.txt", blake3::hash(&mid).as_bytes(), &META_NONE);
     assert!(rows_f.iter().any(|r| r.path == copy), "loser copy missing");
 
     // Idempotency: redelivery moves nothing on either node.
@@ -178,7 +178,7 @@ async fn asymmetric_history_heals_by_dominance_via_reconcile() {
     let winner = rows_f.iter().find(|r| r.path == "shared/p.txt").unwrap();
     assert_eq!(winner.content_hash, Some(*blake3::hash(&hi).as_bytes()));
     for loser in [&mid, &lo] {
-        let copy = copy_path_for("shared/p.txt", blake3::hash(loser).as_bytes());
+        let copy = copy_path_for("shared/p.txt", blake3::hash(loser).as_bytes(), &META_NONE);
         let row = rows_f
             .iter()
             .find(|r| r.path == copy)

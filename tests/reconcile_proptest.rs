@@ -313,7 +313,8 @@ async fn reconcile_resolves_concurrent_identically() {
     } else {
         (b"version B", hash_a)
     };
-    let copy_rel = replicore::conflict::copy_path_for("shared/p", &lose);
+    let copy_rel =
+        replicore::conflict::copy_path_for("shared/p", &lose, &replicore::conflict::META_NONE);
 
     // A's pull witnesses the conflict and resolves it.
     let ra = pull(&a, &b).await;
@@ -446,7 +447,8 @@ async fn reconcile_resolves_concurrent_local_write_landing_during_fetch() {
     assert_eq!(row.content_hash, Some(*blake3::hash(win_data).as_bytes()));
     assert_eq!(row.vv.get(&NODE_A), 1);
     assert_eq!(row.vv.get(&NODE_B), 1);
-    let copy_rel = replicore::conflict::copy_path_for("race.bin", &lose_hash);
+    let copy_rel =
+        replicore::conflict::copy_path_for("race.bin", &lose_hash, &replicore::conflict::META_NONE);
     let copy_row = b.store.load_file(&copy_rel).await.unwrap().unwrap();
     assert_eq!(copy_row.content_hash, Some(lose_hash));
     // Disk agrees: winner at the path, loser at the copy.

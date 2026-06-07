@@ -15,6 +15,7 @@
 //! `tests/conflict_proptest.rs`.
 
 use proptest::prelude::*;
+use replicore::conflict::META_NONE;
 use replicore::decide::Decision;
 use replicore::proto::OpRecord;
 use replicore::replica::Replica;
@@ -184,7 +185,7 @@ proptest! {
             } else {
                 (hash_b, hash_a)
             };
-            let copy = replicore::conflict::copy_path_for("shared/p", &loser);
+            let copy = replicore::conflict::copy_path_for("shared/p", &loser, &META_NONE);
 
             let snap_a = a.snapshot().await.unwrap();
             let snap_b = b.snapshot().await.unwrap();

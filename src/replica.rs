@@ -106,6 +106,42 @@ impl Replica {
             .await
     }
 
+    /// A local write carrying real (deterministic, node-independent)
+    /// metadata — the meta-only-conflict dimension for the convergence
+    /// gates. `mode` is the varying field; everything else is fixed so two
+    /// replicas writing the same (content, mode) produce identical meta.
+    pub async fn local_write_with_mode(
+        &mut self,
+        path: &str,
+        content: &[u8],
+        mode: u32,
+    ) -> Result<Option<OpRecord>, StoreError> {
+        let hash = *blake3::hash(content).as_bytes();
+        self.fs.write(path, hash);
+        let meta = crate::metadata::Meta {
+            kind: crate::metadata::FileKind::Regular,
+            mode,
+            uid: 0,
+            gid: 0,
+            mtime_s: 0,
+            mtime_ns: 0,
+            symlink_target: None,
+            rdev: 0,
+            xattrs: Vec::new(),
+        };
+        self.store
+            .append_local(LocalChange {
+                path: path.to_string(),
+                op_type: OpType::Write,
+                mode,
+                size: content.len() as u64,
+                content_hash: Some(hash),
+                meta: Some(meta),
+                manifest: None,
+            })
+            .await
+    }
+
     /// A local application deletes `path`.
     pub async fn local_delete(&mut self, path: &str) -> Result<Option<OpRecord>, StoreError> {
         self.fs.delete(path);

@@ -7,7 +7,7 @@
 //! Drives the real store through its public API; the "fetch window" is the
 //! gap between obtaining the plan and committing it.
 
-use replicore::conflict::{copy_path_for, copy_vv};
+use replicore::conflict::{copy_path_for, copy_vv, META_NONE};
 use replicore::decide::{decide, Decision};
 use replicore::oplog::{LocalChange, ResolveOutcome, Store};
 use replicore::proto::{op_id, OpRecord, OpType};
@@ -146,7 +146,7 @@ async fn local_write_during_copy_fetch_is_caught_by_the_recheck() {
     assert_eq!(winner.content_hash, Some([0x0c; 32]));
     assert_eq!(winner.vv.get(&NODE_A), 2);
     assert_eq!(winner.vv.get(&NODE_B), 1); // both sides absorbed
-    let copy = copy_path_for("race/p", &[0x0b; 32]);
+    let copy = copy_path_for("race/p", &[0x0b; 32], &META_NONE);
     let copy_row = rows.iter().find(|r| r.path == copy).expect("loser copy");
     assert_eq!(copy_row.content_hash, Some([0x0b; 32]));
     assert_eq!(copy_row.vv, copy_vv(&copy));

@@ -243,23 +243,36 @@ pub fn plan_candidates<E>(
         let Some(hash) = loser.content_hash else {
             continue; // losing delete: nothing to preserve (modify wins)
         };
-        if winner.content_hash == Some(hash) {
-            continue; // identical content: the winner row already holds it
+        if loser.key() == winner.key() {
+            // Identical kind+content+META: truly interchangeable, nothing to
+            // preserve. A meta-only loser (same bytes, different meta) does
+            // NOT pass this test — its metadata snapshot is replicated state
+            // and gets a copy like any other loser (FR-303; review finding).
+            continue;
         }
         // The copy chain: each link is (copy path, the version whose content
         // lands there); a collision with a live row pushes the chain one
         // deterministic link further.
-        let mut link = Some((copy_path_for(path, &hash), (**loser).clone()));
+        let mut link = Some((
+            copy_path_for(path, &hash, &loser.meta_hash),
+            (**loser).clone(),
+        ));
         let mut depth = 0usize;
         while let Some((cp, content)) = link.take() {
             depth += 1;
             if depth > MAX_COPY_DEPTH {
                 return Ok(None);
             }
-            // A copy planned for this same resolution already? (Two losers
-            // with identical content — only possible via distinct meta.)
+            // A copy planned for this same resolution already? The name is a
+            // pure function of (content, meta), so a collision here means an
+            // identical version is already preserved.
             if let Some(planned) = rows.iter().find(|r| r.path == cp) {
                 debug_assert_eq!(planned.content_hash, content.content_hash);
+                debug_assert_eq!(
+                    Meta::hash_of(&planned.meta),
+                    content.meta_hash,
+                    "copy-name collision with differing meta"
+                );
                 break;
             }
             let cvv = copy_vv(&cp);
@@ -324,8 +337,8 @@ pub fn plan_candidates<E>(
                             meta: w.meta.clone(),
                         });
                         if let Some(lh) = l.content_hash {
-                            if w.content_hash != Some(lh) {
-                                link = Some((copy_path_for(&cp, &lh), l.clone()));
+                            if l.key() != w.key() {
+                                link = Some((copy_path_for(&cp, &lh, &l.meta_hash), l.clone()));
                             }
                         }
                     }
@@ -336,14 +349,20 @@ pub fn plan_candidates<E>(
     Ok(Some(rows))
 }
 
-/// Conflict-copy name for `path`'s losing content: a pure function of the
-/// losing content hash — never the clock, never node-local state.
+/// Conflict-copy name for a losing VERSION: a pure function of the losing
+/// content hash AND meta hash — never the clock, never node-local state.
+/// Meta participates because a meta-only loser (same bytes, different
+/// xattrs/owner/mode/mtime) is replicated state too (FR-303): it needs its
+/// own deterministic name, distinct from a content-loser sharing its bytes.
 ///
 /// `dir/report.txt` → `dir/report.sync-conflict-<hex16>.txt`. The extension is
 /// preserved (operators expect `.wav` to stay playable); a leading dot is not
 /// an extension (`.bashrc` → `.bashrc.sync-conflict-<hex16>`).
-pub fn copy_path_for(path: &str, loser_hash: &[u8; 32]) -> String {
-    let hex16 = hex::encode(&blake3::hash(loser_hash).as_bytes()[..8]);
+pub fn copy_path_for(path: &str, loser_hash: &[u8; 32], loser_meta: &[u8; 32]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(loser_hash);
+    h.update(loser_meta);
+    let hex16 = hex::encode(&h.finalize().as_bytes()[..8]);
     let (dir, name) = match path.rfind('/') {
         Some(i) => (&path[..=i], &path[i + 1..]),
         None => ("", path),
@@ -466,7 +485,10 @@ mod tests {
         assert_eq!(rows[0].path, "dir/f.txt");
         assert_eq!(rows[0].content_hash, Some([7u8; 32]));
         assert_eq!(rows[0].vv, vv(&[(1, 1), (2, 1)])); // merged: neither re-fires
-        assert_eq!(rows[1].path, copy_path_for("dir/f.txt", &[3u8; 32]));
+        assert_eq!(
+            rows[1].path,
+            copy_path_for("dir/f.txt", &[3u8; 32], &META_NONE)
+        );
         assert_eq!(rows[1].content_hash, Some([3u8; 32]));
         assert_eq!(rows[1].vv, copy_vv(&rows[1].path));
     }
@@ -511,15 +533,36 @@ mod tests {
     }
 
     #[test]
-    fn meta_hash_breaks_content_ties() {
+    fn meta_only_loser_is_preserved_with_its_metadata() {
+        // S1 review finding: concurrent metadata-only writes (same bytes,
+        // different xattrs/owner/mode/mtime) are replicated state — the
+        // losing snapshot must survive as a copy, not vanish (FR-303).
         let mut a = write(5, vv(&[(1, 1)]));
         let mut b = write(5, vv(&[(2, 1)]));
         a.meta_hash = [1u8; 32];
         b.meta_hash = [2u8; 32];
         let rows = plan("f", &[a.clone(), b.clone()]);
-        // Winner is b (larger meta_hash); identical content → no copy.
-        assert_eq!(rows.len(), 1);
+        assert_eq!(rows.len(), 2, "meta-only loser must be copied");
+        // Winner: larger meta_hash breaks the content tie.
+        assert_eq!(rows[0].content_hash, Some([5u8; 32]));
+        // The copy carries the LOSER's bytes AND its name embeds the losing
+        // meta hash (distinct from a copy of the same bytes under other
+        // meta); rows[1].meta is the loser's snapshot (None in this minimal
+        // harness, hashed as META_NONE would differ from [1;32] — the name
+        // is computed from meta_HASH which the Version carries).
+        assert_eq!(
+            rows[1].path,
+            copy_path_for("f", &[5u8; 32], &[1u8; 32]),
+            "copy name must embed the losing meta hash"
+        );
+        // Symmetric in either presentation order.
         assert_eq!(plan("f", &[b, a]), rows);
+        // Same bytes, IDENTICAL meta: interchangeable — still no copy.
+        let mut c = write(5, vv(&[(1, 1)]));
+        let mut d = write(5, vv(&[(2, 1)]));
+        c.meta_hash = [9u8; 32];
+        d.meta_hash = [9u8; 32];
+        assert_eq!(plan("g", &[c, d]).len(), 1);
     }
 
     #[test]
@@ -541,7 +584,7 @@ mod tests {
         // displaced content pushed one content-derived link further.
         let lo = write(3, vv(&[(1, 1)]));
         let hi = write(7, vv(&[(2, 1)]));
-        let cp = copy_path_for("f", &[3u8; 32]);
+        let cp = copy_path_for("f", &[3u8; 32], &META_NONE);
         let squatter = write(9, vv(&[(4, 2)])); // real row at the copy path
         let rows = match plan_candidates::<Infallible>("f", &[lo, hi], &mut |p| {
             Ok((p == cp).then(|| squatter.clone()))
@@ -557,7 +600,7 @@ mod tests {
         expect_vv.merge(&copy_vv(&cp));
         assert_eq!(&crow.vv, &expect_vv);
         // The displaced loser lands one link further, named by its content.
-        let cp2 = copy_path_for(&cp, &[3u8; 32]);
+        let cp2 = copy_path_for(&cp, &[3u8; 32], &META_NONE);
         let c2row = rows.iter().find(|r| r.path == cp2).unwrap();
         assert_eq!(c2row.content_hash, Some([3u8; 32]));
         assert_eq!(&c2row.vv, &copy_vv(&cp2));
@@ -569,7 +612,7 @@ mod tests {
         // is planned for it — idempotent.
         let lo = write(3, vv(&[(1, 1)]));
         let hi = write(7, vv(&[(2, 1)]));
-        let cp = copy_path_for("f", &[3u8; 32]);
+        let cp = copy_path_for("f", &[3u8; 32], &META_NONE);
         let existing = Version {
             tombstone: false,
             content_hash: Some([3u8; 32]),
@@ -594,7 +637,7 @@ mod tests {
         // dominates the synthetic one, so re-derivation leaves it alone.
         let lo = write(3, vv(&[(1, 1)]));
         let hi = write(7, vv(&[(2, 1)]));
-        let cp = copy_path_for("f", &[3u8; 32]);
+        let cp = copy_path_for("f", &[3u8; 32], &META_NONE);
         let mut edited_vv = copy_vv(&cp);
         edited_vv.increment(&nid(9));
         let edited = write(8, edited_vv);
@@ -611,12 +654,12 @@ mod tests {
         let h1 = [9u8; 32];
         let h2 = [10u8; 32];
         assert_eq!(
-            copy_path_for("a/b/f.txt", &h1),
-            copy_path_for("a/b/f.txt", &h1)
+            copy_path_for("a/b/f.txt", &h1, &META_NONE),
+            copy_path_for("a/b/f.txt", &h1, &META_NONE)
         );
         assert_ne!(
-            copy_path_for("a/b/f.txt", &h1),
-            copy_path_for("a/b/f.txt", &h2)
+            copy_path_for("a/b/f.txt", &h1, &META_NONE),
+            copy_path_for("a/b/f.txt", &h2, &META_NONE)
         );
         // Pure function of (path, losing content): no clock, no node input.
     }
@@ -624,29 +667,34 @@ mod tests {
     #[test]
     fn copy_name_formats() {
         let h = [0xabu8; 32];
-        let hex16 = hex::encode(&blake3::hash(&h).as_bytes()[..8]);
+        let hex16 = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&h);
+            hasher.update(&META_NONE);
+            hex::encode(&hasher.finalize().as_bytes()[..8])
+        };
         assert_eq!(
-            copy_path_for("dir/report.txt", &h),
+            copy_path_for("dir/report.txt", &h, &META_NONE),
             format!("dir/report.sync-conflict-{hex16}.txt")
         );
         // No extension: marker is appended.
         assert_eq!(
-            copy_path_for("dir/Makefile", &h),
+            copy_path_for("dir/Makefile", &h, &META_NONE),
             format!("dir/Makefile.sync-conflict-{hex16}")
         );
         // A leading dot is not an extension.
         assert_eq!(
-            copy_path_for(".bashrc", &h),
+            copy_path_for(".bashrc", &h, &META_NONE),
             format!(".bashrc.sync-conflict-{hex16}")
         );
         // Multi-dot: split on the LAST dot only.
         assert_eq!(
-            copy_path_for("a/archive.tar.gz", &h),
+            copy_path_for("a/archive.tar.gz", &h, &META_NONE),
             format!("a/archive.tar.sync-conflict-{hex16}.gz")
         );
         // Dots in directories never confuse the split.
         assert_eq!(
-            copy_path_for("v1.2/notes", &h),
+            copy_path_for("v1.2/notes", &h, &META_NONE),
             format!("v1.2/notes.sync-conflict-{hex16}")
         );
     }

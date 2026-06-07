@@ -189,8 +189,10 @@ permanent-error arm), never silently dropped.
   idempotent; "winner = max over the set" is well-defined independent of
   grouping or order, which is the algebraic core of §1–§2.
 - **Copy-chain termination**: each collision link moves from `cp` to
-  `copy_path_for(cp, loser_hash)` (`conflict.rs:299–303`) — a pure function
-  of (previous name, losing content), so the chain itself is deterministic;
+  `copy_path_for(cp, loser_hash, loser_meta_hash)` — a pure function of
+  (previous name, losing content, losing metadata), so the chain itself is
+  deterministic; *(naming gained the meta component with the S1 remediation:
+  meta-only losers are preserved under their own derived names)*;
   the explicit depth counter refuses at `MAX_COPY_DEPTH = 4` (`:245–248`)
   with `Ok(None)` → `ResolveOutcome::Unresolvable` (`oplog.rs:1370`), which
   every caller handles as detected-but-unresolved (logged, retried by the
@@ -212,4 +214,6 @@ permanent-error arm), never silently dropped.
   write between plan and commit returns `Stale`, nothing committed. ✓
 - Determinism inputs: no wall-clock, no node id, no op `(origin, seq)` in
   `key`, `copy_path_for`, or `copy_vv` — all are functions of replicated
-  content/paths (`conflict.rs:101, :324, :339, :352`). ✓
+  content/metadata/paths. ✓ *(Post-S1: copy names = f(content_hash ‖
+  meta_hash); metadata is replicated state, so cross-node determinism is
+  unchanged.)*
