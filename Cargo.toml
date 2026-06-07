@@ -37,6 +37,9 @@ hex = "0.4"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# Integration tests inspect connection state directly (deterministic teardown
+# assertions); the types are already public via ConnRegistry's API.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [profile.release]
 opt-level = 2

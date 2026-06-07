@@ -396,14 +396,14 @@ where
 }
 
 /// Item 1 / Item 2: an ALREADY-established node, connected in BOTH directions,
-/// has every channel severed after a signed Remove — it can neither push an op
-/// nor receive one. Pins the post-fix invariant (ConnRegistry::close_all closes
-/// every connection deterministically). NOTE: pre-fix, the single-registry-slot
-/// teardown left ONE direction alive, but *which* one depended on which
-/// connection won the slot (nondeterministic), so this caught the residual only
-/// ~half the time; close_all removes that nondeterminism. The deterministic hard
-/// guarantee (a removed fp is refused at TLS) is pinned in the net.rs unit test
-/// `removed_peer_handshake_is_refused`.
+/// has EVERY connection severed after a signed Remove. This asserts the teardown
+/// invariant DIRECTLY — the registry holds zero connections for the removed node
+/// and every connection A held to it is locally closed — instead of polling for
+/// replication to quiesce. The data-plane race (which direction won the single
+/// registry slot) is gone: `close_all` closes all of them, and we check the
+/// connection objects, not whether a write happened to propagate. The
+/// deterministic TLS guarantee for RECONNECT is pinned separately in the net.rs
+/// unit test `removed_peer_handshake_is_refused`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn existing_connection_severed_on_removal() {
     let admin = admin();
@@ -411,32 +411,56 @@ async fn existing_connection_severed_on_removal() {
     let c = Node::start(nid(0xC), &admin.pk, &[&a]);
     a.admin_add(&admin, &c);
 
-    // Both directions live: A→C (C receives A's ops) and C→A (A receives C's).
-    a.write("a2c.txt", b"x").await;
+    // Precondition: A holds BOTH connections to C (it dials C and C dials A), so
+    // there are two directions to sever. (Poll to reach this known state — the
+    // assertions below do not depend on replication timing.)
+    let conns_to_c = || {
+        a.engine
+            .conn_registry()
+            .candidates(&c.id)
+            .into_iter()
+            .filter(|(id, _)| *id == c.id)
+            .map(|(_, conn)| conn)
+            .collect::<Vec<_>>()
+    };
     assert!(
-        eventually(|| c.has("a2c.txt", h(b"x"))).await,
-        "A→C link never came up"
+        eventually(|| {
+            let n = conns_to_c().len();
+            async move { n >= 2 }
+        })
+        .await,
+        "both directions never established (need two connections to sever)"
     );
-    c.write("c2a.txt", b"y").await;
-    assert!(
-        eventually(|| a.has("c2a.txt", h(b"y"))).await,
-        "C→A link never came up (no second connection to sever)"
-    );
+    let captured = conns_to_c();
+    assert!(captured.len() >= 2, "expected >=2 connections to C");
 
-    // Remove C → every connection to C must be severed (both directions).
+    // Remove C.
     assert_eq!(a.admin_remove(&admin, &c), MergeOutcome::Applied);
 
-    // Neither direction carries data anymore.
-    a.write("after-a.txt", b"p").await;
-    c.write("after-c.txt", b"q").await;
+    // Deterministic assertion 1: the registry holds ZERO connections for C
+    // (close_all removed the key). Poll only for the supervisor to run the
+    // teardown — the asserted state itself is exact, not a propagation guess.
     assert!(
-        stays_false(80, || c.has("after-a.txt", h(b"p"))).await,
-        "A→C channel survived removal (removed node still receiving data)"
+        eventually(|| {
+            let gone = a.engine.conn_registry().get(&c.id).is_none();
+            async move { gone }
+        })
+        .await,
+        "registry still holds a connection to the removed node"
     );
-    assert!(
-        stays_false(80, || a.has("after-c.txt", h(b"q"))).await,
-        "C→A channel survived removal (removed node still pushing ops)"
-    );
+
+    // Deterministic assertion 2: EVERY connection A held to C was locally closed
+    // by the teardown — both directions, including the dialer side's detached
+    // serve task's connection. `closed()` resolves once the conn is closed.
+    for conn in captured {
+        let reason = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("a connection to the removed node was never closed");
+        assert!(
+            matches!(reason, quinn::ConnectionError::LocallyClosed),
+            "connection to removed node not locally closed: {reason:?}"
+        );
+    }
 }
 
 /// Item 2: after removal a node cannot re-establish — the verifier reads the
