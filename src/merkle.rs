@@ -69,6 +69,19 @@ fn leaf_error_is_skippable(e: &ReconcileError) -> bool {
     match e {
         ReconcileError::Apply(ApplyError::UnsafePath(_)) => true,
         ReconcileError::Apply(ApplyError::HashMismatch(_)) => true,
+        // A local directory squatting the leaf's path (review finding S6):
+        // retrying this session cannot fix it; skip the leaf, keep the
+        // session.
+        ReconcileError::Apply(ApplyError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            true
+        }
         ReconcileError::Fetch(f) => f.is_permanent(),
         ReconcileError::Violation(_) => true,
         _ => false,

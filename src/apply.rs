@@ -684,6 +684,55 @@ mod tests {
     }
 
     #[test]
+    fn dir_squatting_the_path_fails_with_a_directory_error_kind() {
+        // Review finding S6: a LOCAL directory occupying a replicated file's
+        // path must surface as a directory-shaped io error — the receive
+        // paths classify those PERMANENT (quarantine) instead of retrying
+        // the same poison op forever.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Suppressor::new();
+        std::fs::create_dir_all(dir.path().join("x")).unwrap();
+
+        // Write onto the dir: the publish rename hits EISDIR.
+        let data = b"file content";
+        let err = apply_write(
+            dir.path(),
+            "x",
+            0o644,
+            &hash_of(data),
+            data,
+            None,
+            OwnerPolicy::Skip,
+            &s,
+        )
+        .unwrap_err();
+        match &err {
+            ApplyError::Io { source, .. } => assert!(
+                matches!(
+                    source.kind(),
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::DirectoryNotEmpty
+                ),
+                "unexpected kind: {source:?}"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // No staged temp left behind.
+        assert!(!walk_has_tmp(dir.path()));
+
+        // Delete of the dir path: unlink hits EISDIR too.
+        let err = apply_delete(dir.path(), "x", &s).unwrap_err();
+        match &err {
+            ApplyError::Io { source, .. } => assert!(
+                matches!(source.kind(), std::io::ErrorKind::IsADirectory),
+                "unexpected kind: {source:?}"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // The directory survives untouched either way.
+        assert!(dir.path().join("x").is_dir());
+    }
+
+    #[test]
     fn delete_is_idempotent_and_registers_suppression() {
         let dir = tempfile::tempdir().unwrap();
         let s = Suppressor::new();

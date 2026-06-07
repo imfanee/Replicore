@@ -2482,6 +2482,21 @@ fn is_permanent(e: &NetError) -> bool {
         NetError::TooBig => true,
         // Path escapes are rejected per CLAUDE.md invariant 5, permanently.
         NetError::Apply(ApplyError::UnsafePath(_)) => true,
+        // A LOCAL DIRECTORY squats the op's path (dirs are unreplicated
+        // local state — the dir-lifecycle SEAM): create/rename/unlink at
+        // that path can never succeed by retrying, and the reconnect loop
+        // would pin the whole subscription on one poison op (review
+        // finding S6). Quarantine; a superseding op or the rescan repairs.
+        NetError::Apply(ApplyError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            true
+        }
         // The chunks individually verified but their composition does not
         // hash to the op's content: the manifest lied. Retrying re-fetches
         // the same manifest.
@@ -2585,6 +2600,28 @@ mod tests {
             .unwrap();
         // Re-tripping counts again; an already-paused engine is not re-paused.
         assert!(!engine.is_paused());
+    }
+
+    /// Review finding S6: directory-collision io kinds are PERMANENT (the
+    /// op quarantines and the stream advances) — and other io kinds stay
+    /// transient (reconnect + redeliver).
+    #[test]
+    fn dir_collision_errors_are_permanent_others_transient() {
+        let dir_err = |kind: std::io::ErrorKind| {
+            NetError::Apply(ApplyError::Io {
+                ctx: "rename",
+                path: std::path::PathBuf::from("x"),
+                source: std::io::Error::new(kind, "squatted"),
+            })
+        };
+        assert!(is_permanent(&dir_err(std::io::ErrorKind::IsADirectory)));
+        assert!(is_permanent(&dir_err(std::io::ErrorKind::NotADirectory)));
+        assert!(is_permanent(&dir_err(
+            std::io::ErrorKind::DirectoryNotEmpty
+        )));
+        // Genuine transients keep the retry semantics.
+        assert!(!is_permanent(&dir_err(std::io::ErrorKind::Interrupted)));
+        assert!(!is_permanent(&dir_err(std::io::ErrorKind::StorageFull)));
     }
 
     fn engine_on(
