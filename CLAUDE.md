@@ -117,3 +117,27 @@ the rescan path on the assumption that fanotify catches everything.
   frontier map + `peer_cursors`, FID watcher).
 - Reconcile gate: a node never applies a peer's live ops before completing an
   anti-entropy session with it (`SubscribeOps`). Do not weaken this ordering.
+
+## Wire/state compatibility notes (M2.5)
+
+- Protocol v3 (`replicore/3` ALPN) is a flag-day bump over v2: `RootIs` carries
+  the snapshot's per-origin op frontier and `SubscribeOps` carries the
+  post-reconcile resume map. Upgrade the whole mesh as a unit.
+- **Two configs, one owner each.** Intent (`replicore.toml`) is human-owned and
+  the daemon NEVER writes it; the roster (`roster_path`, default
+  `<db>.roster.json`) is daemon-owned. `[[peers]]` (alias `[[seed_peers]]`) is
+  the seed/bootstrap list; learned members live in the roster.
+- **Membership is an epoch-versioned LWW register, not an OR-Set** — own that in
+  any change to `membership.rs`. Merge winner = `max(epoch, rank(kind),
+  blake3(canonical))`; the tie-break hashes canonical bytes, never the signature.
+- The join frontier handoff resumes the live stream from `SubscribeOps`, NOT the
+  pre-gate `Hello`. Do not revert that — it is what stops a fresh joiner
+  re-streaming all of history (see the crash table in `net.rs::subscription_io`).
+- Control socket (`control_socket`, default `<db>.sock`): 0700 dir / 0600 sock +
+  `SO_PEERCRED` uid check. `replicorectl member add/remove` signs entries
+  client-side; the daemon never holds the admin secret.
+- M2.5 SEAMs (grep `SEAM(`): indirect ping-req gossip (matters only off a full
+  mesh); remote CONTROL over the mesh, FR-1409 (only read-side `status --all`
+  fans out today); removed-node data disposition, FR-1308 (data is RETAINED;
+  drop policy deferred); reload applies only the hot peer/trust view —
+  everything else is honestly restart-required.
