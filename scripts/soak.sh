@@ -67,7 +67,16 @@ start_node() {
   PID[$1]=$!
 }
 
+FINISHED=0
 cleanup() {
+  local code=$?
+  # A soak that dies must still leave a verdict: set -e aborts on any
+  # unguarded failure, and a week-long run ending in silence is
+  # indistinguishable from "still going" (learned the hard way: a teardown
+  # race killed a run with no verdict).
+  if [ "$FINISHED" = 0 ] && [ ! -s "$VERDICT" ] 2>/dev/null; then
+    echo "SOAK FAIL cause=script-aborted-exit-$code ts=$(date +%s)" | tee "$VERDICT" 2>/dev/null || true
+  fi
   for n in "${NODES[@]}"; do kill -9 "${PID[$n]:-0}" 2>/dev/null || true; done
   "$TESTBED" down >/dev/null 2>&1 || true
 }
@@ -106,6 +115,7 @@ lag_spread() {
 }
 
 fail_soak() { # cause
+  FINISHED=1
   local line="SOAK FAIL cause=$1 ts=$(date +%s)"
   echo "$line" | tee "$VERDICT"
   exit 1
@@ -157,9 +167,12 @@ while :; do
   # --- traffic ---
   n=${NODES[$((RANDOM % 3))]}
   rec="recordings/$(date +%s)-$i.wav"
-  mkdir -p "${DIR[$n]}/recordings"
-  head -c $(((RANDOM % 600 + 200) * 1024)) /dev/urandom >"${DIR[$n]}/$rec"
-  RECORDINGS+=("$rec")
+  mkdir -p "${DIR[$n]}/recordings" 2>/dev/null || true
+  if head -c $(((RANDOM % 600 + 200) * 1024)) /dev/urandom >"${DIR[$n]}/$rec" 2>/dev/null; then
+    RECORDINGS+=("$rec")
+  else
+    echo "[soak] WARN: write failed for ${DIR[$n]}/$rec (transient?)"
+  fi
 
   if [ $((i % 6)) -eq 0 ]; then
     mkdir -p "${DIR[$n]}/prompts"
