@@ -319,8 +319,16 @@ async fn handle_leaf<T: ReconcileTransport>(
             Ok(())
         }
         Decision::Apply => match apply_remote_leaf(path, &rleaf, remote, ctx).await {
-            Ok(()) => {
+            // The committing re-check inside reconcile_upsert may downgrade
+            // a stale Apply (a concurrent local write landed during the
+            // content fetch); the disk clobber was repaired inside
+            // apply_remote_leaf — count it as the conflict it is.
+            Ok(Decision::Apply) => {
                 report.applied += 1;
+                Ok(())
+            }
+            Ok(_) => {
+                report.skipped_concurrent += 1;
                 Ok(())
             }
             Err(e) if leaf_error_is_skippable(&e) => {
@@ -339,13 +347,15 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
     rleaf: &RemoteLeaf,
     remote: &mut T,
     ctx: &ReconcileCtx<'_>,
-) -> Result<(), ReconcileError> {
+) -> Result<Decision, ReconcileError> {
+    let effective;
     if rleaf.tombstone {
         let share = ctx.share.to_path_buf();
         let rel = path.to_string();
         let suppress = ctx.suppress.clone();
         tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
-        ctx.store
+        effective = ctx
+            .store
             .reconcile_upsert(ReconciledRow {
                 path: path.to_string(),
                 content_hash: None,
@@ -355,35 +365,116 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
                 tombstone: true,
             })
             .await?;
-        return Ok(());
+    } else {
+        let hash = rleaf
+            .content_hash
+            .ok_or(ReconcileError::Violation("live leaf without content hash"))?;
+        let manifest = remote.ensure_content(hash, ctx.cas).await?;
+        {
+            let share = ctx.share.to_path_buf();
+            let rel = path.to_string();
+            let mode = rleaf.mode;
+            let suppress = ctx.suppress.clone();
+            let cas = ctx.cas.clone();
+            tokio::task::spawn_blocking(move || {
+                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+            })
+            .await??;
+        }
+        effective = ctx
+            .store
+            .reconcile_upsert(ReconciledRow {
+                path: path.to_string(),
+                content_hash: Some(hash),
+                mode: rleaf.mode,
+                size: rleaf.size,
+                vv: rleaf.vv.clone(),
+                tombstone: false,
+            })
+            .await?;
     }
+    if effective != Decision::Apply {
+        // Stale decision: the unlink/rename above clobbered a concurrent
+        // local write — put the committed local state back on disk.
+        tracing::warn!(
+            path,
+            ?effective,
+            "reconcile: concurrent local write landed during fetch; restoring local content"
+        );
+        restore_local_content(ctx.store, ctx.cas, ctx.share, ctx.suppress, path).await;
+    }
+    Ok(effective)
+}
 
-    let hash = rleaf
-        .content_hash
-        .ok_or(ReconcileError::Violation("live leaf without content hash"))?;
-    let manifest = remote.ensure_content(hash, ctx.cas).await?;
-    {
-        let share = ctx.share.to_path_buf();
-        let rel = path.to_string();
-        let mode = rleaf.mode;
-        let suppress = ctx.suppress.clone();
-        let cas = ctx.cas.clone();
-        tokio::task::spawn_blocking(move || {
-            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
-        })
-        .await??;
+/// Re-materialize `path`'s on-disk content from the LOCAL committed row —
+/// the repair for a stale-decision downgrade, where a remote rename/unlink
+/// already clobbered a concurrent local write before the committing
+/// re-check caught it. Live row → re-assemble from its manifest + the CAS
+/// (local writes chunk into the CAS at ingest, so the bytes are present);
+/// tombstone/absent row → ensure the file is gone. Failures are logged, not
+/// fatal: the skip is already durably recorded and the scanner remains the
+/// convergence backstop.
+pub(crate) async fn restore_local_content(
+    store: &Store,
+    cas: &Cas,
+    share: &Path,
+    suppress: &Suppressor,
+    path: &str,
+) {
+    let row = match store.load_file(path).await {
+        Ok(row) => row,
+        Err(e) => {
+            tracing::error!(path, error = %e, "restore: cannot load local row");
+            return;
+        }
+    };
+    match row {
+        Some(local) if !local.tombstone => {
+            let Some(hash) = local.content_hash else {
+                tracing::error!(path, "restore: live row without content hash");
+                return;
+            };
+            let manifest = match store.manifest_for(hash).await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    tracing::error!(path, "restore: local manifest missing; scanner will heal");
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!(path, error = %e, "restore: manifest lookup failed");
+                    return;
+                }
+            };
+            let share = share.to_path_buf();
+            let rel = path.to_string();
+            let mode = local.mode;
+            let suppress = suppress.clone();
+            let cas = cas.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => tracing::info!(path, "restored local content after clobber"),
+                Ok(Err(e)) => tracing::error!(path, error = %e, "restore: assembly failed"),
+                Err(e) => tracing::error!(path, error = %e, "restore: task failed"),
+            }
+        }
+        // Local state is "deleted" (tombstone) or unknown: the file must
+        // not exist.
+        _ => {
+            let share = share.to_path_buf();
+            let rel = path.to_string();
+            let suppress = suppress.clone();
+            let result =
+                tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await;
+            match result {
+                Ok(Ok(())) => tracing::info!(path, "restored local absence after clobber"),
+                Ok(Err(e)) => tracing::error!(path, error = %e, "restore: delete failed"),
+                Err(e) => tracing::error!(path, error = %e, "restore: task failed"),
+            }
+        }
     }
-    ctx.store
-        .reconcile_upsert(ReconciledRow {
-            path: path.to_string(),
-            content_hash: Some(hash),
-            mode: rleaf.mode,
-            size: rleaf.size,
-            vv: rleaf.vv.clone(),
-            tombstone: false,
-        })
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]

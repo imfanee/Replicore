@@ -315,6 +315,113 @@ async fn reconcile_detects_concurrent_without_clobbering() {
     );
 }
 
+/// The stale-decision race, reconcile flavor: handle_leaf decides Apply,
+/// then a concurrent local write to the same path lands during the content
+/// fetch (injected inside ensure_content), then apply_assembled clobbers the
+/// disk and reconcile_upsert runs. The committing re-check must downgrade,
+/// the row must keep the local content un-merged, and the disk must be
+/// repaired from the local row.
+#[tokio::test]
+async fn reconcile_does_not_clobber_concurrent_local_write() {
+    /// Like TestTransport, but lands a local write on `dst` from inside the
+    /// content fetch — the exact hazard window.
+    struct RacingTransport<'a> {
+        tree: MerkleTree,
+        src: &'a Node,
+        dst: &'a Node,
+        injected: std::cell::Cell<bool>,
+    }
+
+    impl ReconcileTransport for RacingTransport<'_> {
+        async fn root(&mut self) -> Result<[u8; 32], ReconcileError> {
+            Ok(self.tree.root())
+        }
+        async fn children(&mut self, prefix: &str) -> Result<Vec<WireChild>, ReconcileError> {
+            let (children, more) = self.tree.children_page(prefix, "", usize::MAX);
+            assert!(!more);
+            Ok(children)
+        }
+        async fn leaf(&mut self, path: &str) -> Result<Option<RemoteLeaf>, ReconcileError> {
+            Ok(self.tree.leaf(path).map(|row| RemoteLeaf {
+                tombstone: row.tombstone,
+                content_hash: row.content_hash,
+                vv: row.vv.clone(),
+                mode: row.mode,
+                size: row.size,
+            }))
+        }
+        async fn ensure_content(
+            &mut self,
+            content_hash: [u8; 32],
+            cas: &Cas,
+        ) -> Result<Manifest, ReconcileError> {
+            // THE INTERLEAVE: the local application writes the same path
+            // while the session is fetching the remote content.
+            if !self.injected.replace(true) {
+                self.dst.local_write("race.bin", b"local content X").await;
+            }
+            let manifest = self
+                .src
+                .store
+                .manifest_for(content_hash)
+                .await?
+                .ok_or(replicore::fetch::FetchError::Unavailable)?;
+            for entry in &manifest.chunks {
+                if !cas.has(&entry.hash) {
+                    let bytes = self
+                        .src
+                        .cas
+                        .read(&entry.hash)
+                        .map_err(replicore::fetch::FetchError::Cas)?;
+                    cas.put_verified(&entry.hash, &bytes)
+                        .map_err(replicore::fetch::FetchError::Cas)?;
+                }
+            }
+            Ok(manifest)
+        }
+    }
+
+    let a = Node::new(NODE_A);
+    let b = Node::new(NODE_B);
+    a.local_write("race.bin", b"remote content R").await;
+
+    let local_tree = MerkleTree::build(b.store.all_files().await.unwrap());
+    let mut transport = RacingTransport {
+        tree: MerkleTree::build(a.store.all_files().await.unwrap()),
+        src: &a,
+        dst: &b,
+        injected: std::cell::Cell::new(false),
+    };
+    let ctx = ReconcileCtx {
+        store: &b.store,
+        cas: &b.cas,
+        share: &b.share,
+        suppress: &b.suppress,
+    };
+    let report = reconcile_pull(&local_tree, &mut transport, &ctx)
+        .await
+        .unwrap();
+
+    // Downgrade detected and counted; nothing applied for the raced leaf.
+    assert_eq!(report.skipped_concurrent, 1);
+    assert_eq!(report.applied, 0);
+
+    // Row keeps the LOCAL content, remote VV NOT merged (no masking)...
+    let row = b.store.load_file("race.bin").await.unwrap().unwrap();
+    assert_eq!(
+        row.content_hash,
+        Some(*blake3::hash(b"local content X").as_bytes())
+    );
+    assert_eq!(row.vv.get(&NODE_A), 0, "remote VV merged: masking");
+    assert_eq!(row.vv.get(&NODE_B), 1);
+    // ...and the disk was repaired back to the local content after the
+    // session's rename clobbered it.
+    assert_eq!(
+        std::fs::read(b.share.join("race.bin")).unwrap(),
+        b"local content X"
+    );
+}
+
 /// Tombstones propagate via reconcile and stale content cannot resurrect.
 #[tokio::test]
 async fn reconcile_propagates_tombstones() {

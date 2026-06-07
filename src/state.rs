@@ -42,22 +42,24 @@ fn blob32(blob: Vec<u8>, what: &'static str) -> Result<[u8; 32], StoreError> {
 pub(crate) fn load_file(conn: &Connection, path: &str) -> Result<Option<LocalFile>, StoreError> {
     let row = conn
         .query_row(
-            "SELECT content_hash, vv, tombstone FROM files WHERE path = ?1",
+            "SELECT content_hash, vv, tombstone, mode FROM files WHERE path = ?1",
             [path],
             |row| {
                 Ok((
                     row.get::<_, Option<Vec<u8>>>(0)?,
                     row.get::<_, Vec<u8>>(1)?,
                     row.get::<_, bool>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(hash, vv_blob, tombstone)| {
+    row.map(|(hash, vv_blob, tombstone, mode)| {
         Ok(LocalFile {
             vv: decode_vv(&vv_blob)?,
             tombstone,
             content_hash: hash.map(|h| blob32(h, "files.content_hash")).transpose()?,
+            mode: mode as u32,
         })
     })
     .transpose()

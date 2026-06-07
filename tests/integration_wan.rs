@@ -200,11 +200,20 @@ struct Bed {
     cfg_b: PathBuf,
     fp_a: String,
     addr_a: String,
+    /// Declared last: drops after `_rig` runs `down`, releasing the rig to
+    /// the other test only once the namespaces are gone.
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
+
+/// Both tests in this binary own the one host rig; cargo runs test fns in
+/// parallel threads by default, so an unfiltered `--ignored` invocation
+/// would have them tear down each other's namespaces mid-run. Serialize.
+static RIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Tear down any stale rig, bring up a fresh one (netem per MODE), wipe state
 /// dirs, generate identities, and write both configs.
 fn setup() -> Bed {
+    let lock = RIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
         panic!("this test must run as root (sudo -E)");
@@ -249,6 +258,7 @@ fn setup() -> Bed {
         cfg_b,
         fp_a,
         addr_a,
+        _lock: lock,
     }
 }
 

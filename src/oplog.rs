@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::chunk::Manifest;
-use crate::decide::{Decision, LocalFile};
+use crate::decide::{decide, Decision, LocalFile};
 use crate::proto::{op_id, OpRecord, OpType};
 use crate::state::{self, FileRow, LiveFile};
 use crate::vv::NodeId;
@@ -75,7 +75,7 @@ enum StoreCmd {
     ApplyRemote {
         op: Box<OpRecord>,
         decision: Decision,
-        reply: oneshot::Sender<Result<(), StoreError>>,
+        reply: oneshot::Sender<Result<Decision, StoreError>>,
     },
     LoadFile {
         path: String,
@@ -127,7 +127,7 @@ enum StoreCmd {
     },
     ReconcileUpsert {
         row: Box<ReconciledRow>,
-        reply: oneshot::Sender<Result<(), StoreError>>,
+        reply: oneshot::Sender<Result<Decision, StoreError>>,
     },
 }
 
@@ -258,10 +258,21 @@ impl Store {
             .await
     }
 
-    /// Durably record the handling of a remote op (any decision) and, when
-    /// `Decision::Apply`, materialize it. One transaction; idempotent on
-    /// redelivery. MUST be awaited before acking the op (FR-801).
-    pub async fn apply_remote(&self, op: OpRecord, decision: Decision) -> Result<(), StoreError> {
+    /// Durably record the handling of a remote op and, when the decision
+    /// still holds under the committing transaction, materialize it. One
+    /// transaction; idempotent on redelivery. MUST be awaited before acking
+    /// the op (FR-801).
+    ///
+    /// Returns the EFFECTIVE decision: an `Apply` computed before a long
+    /// fetch is re-validated against the current row and downgraded to
+    /// `Concurrent`/`Ignore` if a concurrent local write landed meanwhile —
+    /// in that case the caller must repair the on-disk clobber (the rename
+    /// already happened) via `merkle::restore_local_content`.
+    pub async fn apply_remote(
+        &self,
+        op: OpRecord,
+        decision: Decision,
+    ) -> Result<Decision, StoreError> {
         self.call(|reply| StoreCmd::ApplyRemote {
             op: Box::new(op),
             decision,
@@ -364,7 +375,9 @@ impl Store {
     }
 
     /// Anti-entropy state apply — see [`ReconciledRow`] for the contract.
-    pub async fn reconcile_upsert(&self, row: ReconciledRow) -> Result<(), StoreError> {
+    /// Returns the effective decision (re-validated in the committing tx);
+    /// on downgrade the caller repairs the disk.
+    pub async fn reconcile_upsert(&self, row: ReconciledRow) -> Result<Decision, StoreError> {
         self.call(|reply| StoreCmd::ReconcileUpsert {
             row: Box::new(row),
             reply,
@@ -574,8 +587,9 @@ fn apply_remote(
     conn: &mut Connection,
     op: &OpRecord,
     decision: Decision,
-) -> Result<(), StoreError> {
+) -> Result<Decision, StoreError> {
     let tx = conn.transaction()?;
+    let mut effective = decision;
 
     // Idempotency inside the tx (no TOCTOU): a redelivered op only re-bumps
     // the cursor, never re-mutates files and never re-merges the VV.
@@ -583,27 +597,42 @@ fn apply_remote(
         insert_op(&tx, op)?;
         if decision == Decision::Apply {
             let local = state::load_file(&tx, &op.path)?;
-            let mut vv = local.map(|l| l.vv).unwrap_or_default();
-            vv.merge(&op.vv);
-            match op.op_type {
-                OpType::Write => state::upsert_file(
-                    &tx,
-                    &op.path,
-                    op.content_hash.as_ref(),
-                    op.mode,
-                    op.size,
-                    &vv,
-                    false,
-                )?,
-                // Tombstone, never a hard delete (FR-204).
-                OpType::Delete => state::upsert_file(&tx, &op.path, None, op.mode, 0, &vv, true)?,
+            // RE-VALIDATE under the committing transaction. The caller's
+            // decision was computed before a multi-second chunk fetch; a
+            // concurrent local write (or reconcile) to this path may have
+            // landed since. Trusting the stale Apply would overwrite the
+            // newer row AND merge the remote VV over it — making a clobber
+            // look causally resolved instead of concurrent. A downgrade is
+            // recorded like any skip; the caller repairs the disk.
+            // (Never UPGRADE a non-Apply caller decision: its content was
+            // never fetched, so there is nothing on disk to ratify.)
+            effective = decide(local.as_ref(), &op.vv);
+            if effective == Decision::Apply {
+                let mut vv = local.map(|l| l.vv).unwrap_or_default();
+                vv.merge(&op.vv);
+                match op.op_type {
+                    OpType::Write => state::upsert_file(
+                        &tx,
+                        &op.path,
+                        op.content_hash.as_ref(),
+                        op.mode,
+                        op.size,
+                        &vv,
+                        false,
+                    )?,
+                    // Tombstone, never a hard delete (FR-204).
+                    OpType::Delete => {
+                        state::upsert_file(&tx, &op.path, None, op.mode, 0, &vv, true)?
+                    }
+                }
             }
         }
-        // Decision::Ignore / ::Concurrent / ::Quarantined: the op is recorded
-        // (oplog + applied + cursor) but files is untouched — the skip
-        // *decision* is what's durable, so restart never re-fetches the op.
-        // Quarantined ops leave the local VV behind the origin's, which is
-        // exactly what lets a later superseding op apply normally.
+        // Decision::Ignore / ::Concurrent / ::Quarantined (incl. an Apply
+        // downgraded above): the op is recorded (oplog + applied + cursor)
+        // but files is untouched — the skip *decision* is what's durable,
+        // so restart never re-fetches the op. Quarantined ops leave the
+        // local VV behind the origin's, which is exactly what lets a later
+        // superseding op apply normally.
         tx.execute(
             "INSERT OR IGNORE INTO applied (op_id) VALUES (?1)",
             [op.op_id.as_slice()],
@@ -620,7 +649,7 @@ fn apply_remote(
         params![op.origin_seq, op.origin.as_slice()],
     )?;
     tx.commit()?; // THE durability point — the ack may only be sent after this
-    Ok(())
+    Ok(effective)
 }
 
 fn has_applied(conn: &Connection, op_id: &[u8; 32]) -> Result<bool, StoreError> {
@@ -728,25 +757,32 @@ fn advance_ack(
     Ok(())
 }
 
-/// State-plane apply for anti-entropy (see [`ReconciledRow`]). One tx: merge
-/// the remote VV with the current local row's and upsert `files`. Nothing
-/// else — structurally incapable of disturbing op cursors or idempotency.
-fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<(), StoreError> {
+/// State-plane apply for anti-entropy (see [`ReconciledRow`]). One tx:
+/// RE-VALIDATE dominance against the current row (the session's decide ran
+/// before a long content fetch — same stale-decision hazard as the op path),
+/// then merge + upsert only if the remote still dominates. Returns the
+/// effective decision so the caller can repair a disk clobber on downgrade.
+/// Nothing else — structurally incapable of disturbing op cursors or
+/// idempotency.
+fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decision, StoreError> {
     let tx = conn.transaction()?;
     let local = state::load_file(&tx, &row.path)?;
-    let mut vv = local.map(|l| l.vv).unwrap_or_default();
-    vv.merge(&row.vv);
-    state::upsert_file(
-        &tx,
-        &row.path,
-        row.content_hash.as_ref(),
-        row.mode,
-        row.size,
-        &vv,
-        row.tombstone,
-    )?;
+    let effective = decide(local.as_ref(), &row.vv);
+    if effective == Decision::Apply {
+        let mut vv = local.map(|l| l.vv).unwrap_or_default();
+        vv.merge(&row.vv);
+        state::upsert_file(
+            &tx,
+            &row.path,
+            row.content_hash.as_ref(),
+            row.mode,
+            row.size,
+            &vv,
+            row.tombstone,
+        )?;
+    }
     tx.commit()?;
-    Ok(())
+    Ok(effective)
 }
 
 fn op_count(conn: &Connection) -> Result<i64, StoreError> {
@@ -1056,8 +1092,16 @@ mod tests {
             vv: [(NODE_B, 2u64)].into_iter().collect(),
             tombstone: false,
         };
-        store.reconcile_upsert(row.clone()).await.unwrap();
-        store.reconcile_upsert(row.clone()).await.unwrap(); // idempotent merge
+        assert_eq!(
+            store.reconcile_upsert(row.clone()).await.unwrap(),
+            Decision::Apply
+        );
+        // Re-applying the identical row is Equal under the in-tx re-check:
+        // recorded as Ignore, state untouched.
+        assert_eq!(
+            store.reconcile_upsert(row.clone()).await.unwrap(),
+            Decision::Ignore
+        );
 
         let local = store.load_file("healed/f").await.unwrap().unwrap();
         assert_eq!(local.content_hash, Some([3; 32]));
@@ -1065,20 +1109,97 @@ mod tests {
         // The state plane NEVER disturbs the op machinery:
         assert_eq!(store.op_count().await.unwrap(), 0); // no oplog row
         assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 0); // no cursor
-                                                                 // VV merge with an existing row, not replace:
-        store
-            .reconcile_upsert(ReconciledRow {
-                vv: [(NODE_A, 1u64)].into_iter().collect(),
-                tombstone: true,
-                content_hash: None,
-                ..row
-            })
-            .await
-            .unwrap();
+
+        // A CONCURRENT row (each side ahead on a different component) must
+        // NOT clobber or merge — the committing re-check downgrades it.
+        // (This exact upsert used to merge unconditionally: the masking bug.)
+        assert_eq!(
+            store
+                .reconcile_upsert(ReconciledRow {
+                    vv: [(NODE_A, 1u64)].into_iter().collect(),
+                    tombstone: true,
+                    content_hash: None,
+                    ..row.clone()
+                })
+                .await
+                .unwrap(),
+            Decision::Concurrent
+        );
+        let local = store.load_file("healed/f").await.unwrap().unwrap();
+        assert!(!local.tombstone, "concurrent tombstone clobbered the row");
+        assert_eq!(local.vv.get(&NODE_A), 0); // NOT merged — no masking
+        assert_eq!(local.content_hash, Some([3; 32]));
+
+        // A genuinely DOMINATING tombstone still applies, with the merge.
+        assert_eq!(
+            store
+                .reconcile_upsert(ReconciledRow {
+                    vv: [(NODE_A, 1u64), (NODE_B, 2u64)].into_iter().collect(),
+                    tombstone: true,
+                    content_hash: None,
+                    ..row
+                })
+                .await
+                .unwrap(),
+            Decision::Apply
+        );
         let local = store.load_file("healed/f").await.unwrap().unwrap();
         assert!(local.tombstone);
         assert_eq!(local.vv.get(&NODE_A), 1);
         assert_eq!(local.vv.get(&NODE_B), 2); // merged, not lost
+    }
+
+    /// THE stale-decision regression (receive path): decide() said Apply,
+    /// then a local write to the same path landed during the (long) fetch,
+    /// then the commit ran. The committing re-check must downgrade — no
+    /// disk-state ratification, no VV masking.
+    #[tokio::test]
+    async fn apply_remote_downgrades_stale_apply_decision() {
+        let store = mem_store(NODE_A);
+
+        // T0: receive path reads local state (absent) and decides Apply.
+        let remote = OpRecord {
+            op_id: op_id(&NODE_B, 1),
+            origin: NODE_B,
+            origin_seq: 1,
+            op_type: OpType::Write,
+            path: "race/p".into(),
+            mode: 0o644,
+            size: 8,
+            content_hash: Some([0xbb; 32]),
+            vv: [(NODE_B, 1u64)].into_iter().collect(),
+        };
+        let stale_local = store.load_file("race/p").await.unwrap();
+        let decision = crate::decide::decide(stale_local.as_ref(), &remote.vv);
+        assert_eq!(decision, Decision::Apply);
+
+        // T1 (during the "fetch"): a concurrent LOCAL write lands.
+        store
+            .append_local(write_change("race/p", [0xaa; 32]))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // T2: the commit re-validates and downgrades.
+        let effective = store.apply_remote(remote.clone(), decision).await.unwrap();
+        assert_eq!(effective, Decision::Concurrent);
+
+        // No clobber, no masking: the row keeps the LOCAL content and the
+        // remote VV component was NOT merged.
+        let local = store.load_file("race/p").await.unwrap().unwrap();
+        assert_eq!(local.content_hash, Some([0xaa; 32]));
+        assert_eq!(local.vv.get(&NODE_A), 1);
+        assert_eq!(local.vv.get(&NODE_B), 0, "remote VV merged: masking");
+
+        // The op is still durably handled: recorded, cursor advanced,
+        // redelivery a pure no-op.
+        assert!(store.has_applied(remote.op_id).await.unwrap());
+        assert_eq!(store.recv_cursor(NODE_B).await.unwrap(), 1);
+        let again = store.apply_remote(remote, Decision::Apply).await.unwrap();
+        assert_eq!(again, Decision::Apply); // already-applied: no mutation either way
+        let local = store.load_file("race/p").await.unwrap().unwrap();
+        assert_eq!(local.content_hash, Some([0xaa; 32]));
+        assert_eq!(local.vv.get(&NODE_B), 0);
     }
 
     #[tokio::test]

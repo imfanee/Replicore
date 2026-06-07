@@ -1001,7 +1001,29 @@ impl Engine {
             );
         }
         // THE durability point (fsynced WAL commit). Ack happens after.
-        self.store.apply_remote(op, decision).await?;
+        // The store RE-VALIDATES an Apply under the committing transaction:
+        // if a concurrent local write landed during the (multi-second) fetch
+        // window, the decision comes back downgraded and the rename that
+        // already hit the disk must be repaired from the local row.
+        let path = op.path.clone();
+        let origin = op.origin;
+        let effective = self.store.apply_remote(op, decision).await?;
+        if decision == Decision::Apply && effective != Decision::Apply {
+            tracing::warn!(
+                path = %path,
+                origin = %hex::encode(&origin[..4]),
+                ?effective,
+                "concurrent local write landed during transfer; restoring local content, remote recorded (resolution is M3)"
+            );
+            crate::merkle::restore_local_content(
+                &self.store,
+                &self.cas,
+                &self.cfg.share_dir,
+                &self.suppress,
+                &path,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1671,6 +1693,134 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.is_permanent(), "expected permanent, got {err:?}");
+    }
+
+    /// THE stale-decision race, end to end over real sockets: a remote
+    /// Apply for path P whose transfer is delayed (deterministically, by
+    /// draining B's `transfers` semaphore — acquired inside materialize
+    /// AFTER decide), with a local write to P landing during the delay.
+    /// The committing re-check must record Concurrent, and the on-disk
+    /// clobber from the already-performed rename must be repaired from the
+    /// local row. No committed state may be lost.
+    #[tokio::test]
+    async fn concurrent_local_write_during_transfer_is_not_clobbered() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let id_a = generate_identity().unwrap();
+        let id_b = generate_identity().unwrap();
+        const A: NodeId = [0xa; 16];
+        const B: NodeId = [0xb; 16];
+
+        let engine_a = engine_on(
+            dir_a.path(),
+            A,
+            &id_a,
+            vec![(B, "127.0.0.1:1".parse().unwrap(), id_b.fingerprint)],
+        );
+        let ep_a = engine_a.build_endpoint().unwrap();
+        let addr_a = ep_a.local_addr().unwrap();
+        tokio::spawn({
+            let engine = engine_a.clone();
+            async move {
+                while let Some(incoming) = ep_a.accept().await {
+                    let engine = engine.clone();
+                    tokio::spawn(async move {
+                        let _ = engine.handle_inbound(incoming).await;
+                    });
+                }
+            }
+        });
+
+        // B subscribes (gate reconcile runs against an empty A — fast).
+        let engine_b = engine_on(dir_b.path(), B, &id_b, vec![(A, addr_a, id_a.fingerprint)]);
+        let ep_b = engine_b.build_endpoint().unwrap();
+        let peer_a = engine_b.cfg.peers[0].clone();
+        tokio::spawn({
+            let engine = engine_b.clone();
+            async move {
+                let mut attempt: u32 = 0;
+                let _ = engine.subscribe_once(&ep_b, &peer_a, &mut attempt).await;
+            }
+        });
+        // Let the subscription reach Live.
+        let mut live = false;
+        for _ in 0..100 {
+            if engine_b.peers_reg.get(&A).state == PeerState::Live {
+                live = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(live, "subscription never reached Live");
+
+        // Drain B's transfer permits: the next materialize will park AFTER
+        // decide(), holding a stale Apply — the exact hazard window.
+        let gate = engine_b
+            .transfers
+            .clone()
+            .acquire_many_owned(engine_b.cfg.max_concurrent_transfers as u32)
+            .await
+            .unwrap();
+
+        // A writes the racing remote op (content R).
+        let remote_op = append_served(&engine_a, "race.bin", b"remote content R").await;
+        // Give B time to receive the push, decide Apply, and park.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The concurrent LOCAL write on B (content X): file + chunks + op.
+        let local_data = b"local content X";
+        let local_hash = *blake3::hash(local_data).as_bytes();
+        std::fs::write(dir_b.path().join("race.bin"), local_data).unwrap();
+        append_served(&engine_b, "race.bin", local_data).await;
+
+        // Release the window: fetch + assemble (the rename clobbers the
+        // disk!) + the committing re-check + the repair.
+        drop(gate);
+
+        // The remote op must end durably handled (stream advanced)...
+        let mut handled = false;
+        for _ in 0..200 {
+            if engine_b.store.has_applied(remote_op.op_id).await.unwrap() {
+                handled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(handled, "remote op never durably handled");
+        assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 1);
+
+        // ...as Concurrent: the row keeps the LOCAL content and the remote
+        // VV component was NOT merged (no causal masking).
+        let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();
+        assert_eq!(row.content_hash, Some(local_hash), "row clobbered");
+        assert_eq!(row.vv.get(&A), 0, "remote VV merged: clobber masked");
+        assert_eq!(row.vv.get(&B), 1);
+
+        // And the DISK was repaired back to the local content.
+        let mut repaired = false;
+        for _ in 0..100 {
+            if std::fs::read(dir_b.path().join("race.bin"))
+                .is_ok_and(|d| d == local_data.as_slice())
+            {
+                repaired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(repaired, "disk clobber was not repaired to local content");
+
+        // The stream continues past the conflict: a later op still lands.
+        std::fs::write(dir_a.path().join("after.txt"), b"flows").unwrap();
+        append_served(&engine_a, "after.txt", b"flows").await;
+        let mut flowed = false;
+        for _ in 0..200 {
+            if std::fs::read(dir_b.path().join("after.txt")).is_ok_and(|d| d == b"flows") {
+                flowed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(flowed, "stream did not continue after the conflict");
     }
 
     #[tokio::test]

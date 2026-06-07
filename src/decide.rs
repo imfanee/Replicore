@@ -24,6 +24,9 @@ pub struct LocalFile {
     pub vv: VersionVector,
     pub tombstone: bool,
     pub content_hash: Option<[u8; 32]>,
+    /// Not a decision input (metadata fidelity is M3); carried so the
+    /// stale-decision repair can restore a clobbered file faithfully.
+    pub mode: u32,
 }
 
 /// What to do with a remote op for one path.
@@ -84,6 +87,7 @@ mod tests {
             vv,
             tombstone,
             content_hash: if tombstone { None } else { Some([0u8; 32]) },
+            mode: 0o644,
         }
     }
 

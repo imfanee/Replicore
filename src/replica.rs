@@ -92,8 +92,10 @@ impl Replica {
     }
 
     /// The full receive path for one remote op (minus real bytes/network):
-    /// idempotency fast path → decide → fs effect → durable apply_remote.
-    /// Returns the decision that was made (`None` = duplicate, dropped).
+    /// idempotency fast path → decide → fs effect → durable apply_remote
+    /// (which re-validates the decision in the committing tx). Returns the
+    /// EFFECTIVE decision (`None` = duplicate, dropped). On a downgrade the
+    /// fake fs is repaired from the committed row, mirroring production.
     pub async fn receive(&mut self, op: &OpRecord) -> Result<Option<Decision>, StoreError> {
         if self.store.has_applied(op.op_id).await? {
             return Ok(None); // already durably handled: would just re-ack
@@ -110,8 +112,20 @@ impl Replica {
                 OpType::Delete => self.fs.delete(&op.path),
             }
         }
-        self.store.apply_remote(op.clone(), decision).await?;
-        Ok(Some(decision))
+        let effective = self.store.apply_remote(op.clone(), decision).await?;
+        if decision == Decision::Apply && effective != Decision::Apply {
+            // Repair the clobber from the committed row (production runs
+            // merkle::restore_local_content here).
+            match self.store.load_file(&op.path).await? {
+                Some(row) if !row.tombstone => {
+                    if let Some(hash) = row.content_hash {
+                        self.fs.write(&op.path, hash);
+                    }
+                }
+                _ => self.fs.delete(&op.path),
+            }
+        }
+        Ok(Some(effective))
     }
 
     /// Materialized state: path → (content_hash, tombstone, vv). Two
