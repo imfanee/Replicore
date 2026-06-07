@@ -231,12 +231,44 @@ mod tests {
 
         let addr: SocketAddr = "10.0.0.9:7000".parse().unwrap();
         let sig = sign_entry(&sk, &nid(1), &addr, &[2; 32], 3, EntryKind::Add);
-        assert!(verify_entry(&pk, &nid(1), &addr, &[2; 32], 3, EntryKind::Add, &sig));
+        assert!(verify_entry(
+            &pk,
+            &nid(1),
+            &addr,
+            &[2; 32],
+            3,
+            EntryKind::Add,
+            &sig
+        ));
 
         // Any field change invalidates the signature.
-        assert!(!verify_entry(&pk, &nid(9), &addr, &[2; 32], 3, EntryKind::Add, &sig));
-        assert!(!verify_entry(&pk, &nid(1), &addr, &[9; 32], 3, EntryKind::Add, &sig));
-        assert!(!verify_entry(&pk, &nid(1), &addr, &[2; 32], 4, EntryKind::Add, &sig));
+        assert!(!verify_entry(
+            &pk,
+            &nid(9),
+            &addr,
+            &[2; 32],
+            3,
+            EntryKind::Add,
+            &sig
+        ));
+        assert!(!verify_entry(
+            &pk,
+            &nid(1),
+            &addr,
+            &[9; 32],
+            3,
+            EntryKind::Add,
+            &sig
+        ));
+        assert!(!verify_entry(
+            &pk,
+            &nid(1),
+            &addr,
+            &[2; 32],
+            4,
+            EntryKind::Add,
+            &sig
+        ));
         assert!(!verify_entry(
             &pk,
             &nid(1),
@@ -247,7 +279,15 @@ mod tests {
             &sig
         ));
         let other: SocketAddr = "10.0.0.9:7001".parse().unwrap();
-        assert!(!verify_entry(&pk, &nid(1), &other, &[2; 32], 3, EntryKind::Add, &sig));
+        assert!(!verify_entry(
+            &pk,
+            &nid(1),
+            &other,
+            &[2; 32],
+            3,
+            EntryKind::Add,
+            &sig
+        ));
 
         // A different admin key's signature is rejected (forgery test).
         let (_, other_pk) = generate_admin_key().unwrap();
