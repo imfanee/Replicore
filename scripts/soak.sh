@@ -5,6 +5,11 @@
 #   sudo DURATION=604800 scripts/soak.sh        # the one-week soak
 #   sudo DURATION=900 scripts/soak.sh           # 15-minute smoke
 #
+# The soak DECIDES, it does not merely log: it ends with one verdict line
+# (also written to $STATE/soak-verdict.txt) —
+#   SOAK PASS duration=… rss_a/b/c=…KiB max_lag_spread=… copies=… checkpoints=N/N
+#   SOAK FAIL cause=<condition> ts=<unix>
+#
 # Traffic model (per cycle, default every 5s):
 #   - one new "recording" (200–800 KB, write-once) on a random node
 #   - every 6th cycle: a "prompt" update (small file, overwritten in place,
@@ -12,20 +17,35 @@
 #   - every 10th cycle: delete an old recording
 #   - every KILL_EVERY seconds: kill -9 a random daemon, restart it 5s later
 #
-# Samples every 60s into $STATE/soak.csv:
-#   ts, per-node RSS (KiB), oplog rows, conflicts, guard trips,
-#   max recv-cursor lag across links, tree convergence (0/1)
+# Stop-conditions (checked on the hourly tick; any trips an early FAIL):
+#   - RSS leak: a node's hourly RSS strictly increasing for 12 CONSECUTIVE
+#     hourly samples (a plateau or dip resets the streak — steady-state
+#     noise and transient spikes never trip this; only monotone growth does)
+#   - unbounded lag: max |oplog_rows(X) − oplog_rows(Y)| across node pairs
+#     strictly increasing for 12 consecutive hourly samples (converged nodes
+#     equalize row counts — every node stores every op; the count itself
+#     grows forever BY DESIGN, append-only log, so only the SPREAD signals)
+#   - convergence: an hourly CHECKPOINT pauses traffic and requires
+#     byte-identical trees within 5 minutes; 3 consecutive failed
+#     checkpoints ⇒ FAIL (one may straddle a large in-flight transfer)
+#   - copy bloat: conflict copies > 50% of live files after the first hour,
+#     or +50 copies within one hour (the copy-storm signal). Tombstone ROW
+#     counts are not externally observable and tombstone GC is an unshipped
+#     SEAM — copy bloat and the convergence checkpoint are the observable
+#     halves of the GC-misbehavior signal.
+#   - process exit: any daemon gone outside the kill-injector's own window
 #
-# Exit assertions (the soak FAILS loudly, never silently):
-#   - final trees byte-identical across nodes (after a settle window)
-#   - RSS at the end < 2× the first-hour median on every node (no leak)
-#   - conflict-copy count stable over the final quarter (no copy storms)
+# Per-minute CSV: $STATE/soak.csv
+# Hourly CSV:     $STATE/soak-hourly.csv
 
 set -euo pipefail
 
 DURATION="${DURATION:-900}"
 CYCLE_SECS="${CYCLE_SECS:-5}"
 KILL_EVERY="${KILL_EVERY:-600}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-3600}"
+CHECKPOINT_WAIT="${CHECKPOINT_WAIT:-300}"
+MONO_WINDOW="${MONO_WINDOW:-12}"   # consecutive hourly samples for leak/lag
 ETC=/srv/replicore/etc
 STATE=/srv/replicore/state
 NODES=(a b c)
@@ -34,6 +54,8 @@ declare -A IP=([a]=10.123.0.1 [b]=10.123.0.2 [c]=10.123.0.3)
 BIN="$(dirname "$0")/../target/release/replicored"
 TESTBED="$(dirname "$0")/wan-testbed.sh"
 CSV="$STATE/soak.csv"
+HCSV="$STATE/soak-hourly.csv"
+VERDICT="$STATE/soak-verdict.txt"
 
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 [ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 1; }
@@ -71,6 +93,23 @@ converged() {
   [ -n "$d" ] && [ "$d" = "$(tree_digest b)" ] && [ "$d" = "$(tree_digest c)" ]
 }
 copy_count() { find "${DIR[a]}" -name '*.sync-conflict-*' 2>/dev/null | wc -l; }
+live_count() { find "${DIR[a]}" -type f ! -name '*.replicore-tmp*' 2>/dev/null | wc -l; }
+lag_spread() {
+  local ra rb rc lo hi
+  ra=$(healthz_u64 a oplog_rows); rb=$(healthz_u64 b oplog_rows); rc=$(healthz_u64 c oplog_rows)
+  lo=$ra; hi=$ra
+  for v in "$rb" "$rc"; do
+    [ "$v" -lt "$lo" ] && lo=$v
+    [ "$v" -gt "$hi" ] && hi=$v
+  done
+  echo $((hi - lo))
+}
+
+fail_soak() { # cause
+  local line="SOAK FAIL cause=$1 ts=$(date +%s)"
+  echo "$line" | tee "$VERDICT"
+  exit 1
+}
 
 # ---------------------------------------------------------------------------
 echo "[soak] rig up (LAN profile; use the WAN tests for shaped runs)"
@@ -82,18 +121,38 @@ for n in "${NODES[@]}"; do start_node "$n"; done
 sleep 5
 
 echo "ts,rss_a,rss_b,rss_c,oplog_a,conflicts_a,guard_trips_a,copies,converged" >"$CSV"
-echo "[soak] running for ${DURATION}s (cycle ${CYCLE_SECS}s, kill every ${KILL_EVERY}s)"
+echo "ts,rss_a,rss_b,rss_c,lag_spread,copies,live,checkpoint_converged" >"$HCSV"
+echo "[soak] ${DURATION}s, cycle ${CYCLE_SECS}s, kill every ${KILL_EVERY}s, checkpoint every ${CHECKPOINT_EVERY}s"
 
 START=$(date +%s)
 i=0
 next_sample=$START
 next_kill=$((START + KILL_EVERY))
+next_checkpoint=$((START + CHECKPOINT_EVERY))
 RECORDINGS=()
+# Stop-condition state.
+declare -A RSS_PREV=([a]=0 [b]=0 [c]=0)
+declare -A RSS_STREAK=([a]=0 [b]=0 [c]=0)
+LAG_PREV=0
+LAG_STREAK=0
+CKPT_FAILS=0
+CKPT_TOTAL=0
+CKPT_OK=0
+PREV_HOUR_COPIES=0
+restarting_until=0
 
 while :; do
   now=$(date +%s)
   [ $((now - START)) -ge "$DURATION" ] && break
   i=$((i + 1))
+
+  # --- liveness: every daemon must be running, except during a planned
+  # --- restart window (the kill-injector below sets it).
+  if [ "$now" -gt "$restarting_until" ]; then
+    for n in "${NODES[@]}"; do
+      kill -0 "${PID[$n]}" 2>/dev/null || fail_soak "node-$n-exited-unexpectedly"
+    done
+  fi
 
   # --- traffic ---
   n=${NODES[$((RANDOM % 3))]}
@@ -103,9 +162,8 @@ while :; do
   RECORDINGS+=("$rec")
 
   if [ $((i % 6)) -eq 0 ]; then
-    # Prompt update; sometimes concurrently from two nodes (real conflicts).
-    echo "prompt v$i from $n at $(date)" >"${DIR[$n]}/prompts/menu.txt" 2>/dev/null \
-      || { mkdir -p "${DIR[$n]}/prompts"; echo "prompt v$i" >"${DIR[$n]}/prompts/menu.txt"; }
+    mkdir -p "${DIR[$n]}/prompts"
+    echo "prompt v$i from $n at $(date)" >"${DIR[$n]}/prompts/menu.txt"
     if [ $((i % 12)) -eq 0 ]; then
       m=${NODES[$(((RANDOM % 2 + 1 + RANDOM % 3) % 3))]}
       mkdir -p "${DIR[$m]}/prompts"
@@ -122,13 +180,14 @@ while :; do
   if [ "$now" -ge "$next_kill" ]; then
     k=${NODES[$((RANDOM % 3))]}
     echo "[soak] kill -9 node-$k ($(date))"
+    restarting_until=$((now + 30))
     kill -9 "${PID[$k]}" 2>/dev/null || true
     sleep 5
     start_node "$k"
     next_kill=$((now + KILL_EVERY))
   fi
 
-  # --- sampling ---
+  # --- per-minute sampling ---
   if [ "$now" -ge "$next_sample" ]; then
     c=0
     converged && c=1
@@ -136,39 +195,76 @@ while :; do
     next_sample=$((now + 60))
   fi
 
+  # --- hourly checkpoint: quiesce, require convergence, evaluate trends ---
+  if [ "$now" -ge "$next_checkpoint" ]; then
+    CKPT_TOTAL=$((CKPT_TOTAL + 1))
+    echo "[soak] checkpoint $CKPT_TOTAL: quiescing writes, waiting for convergence (≤${CHECKPOINT_WAIT}s)…"
+    ck=0
+    deadline=$((now + CHECKPOINT_WAIT))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      if converged; then ck=1; break; fi
+      sleep 10
+    done
+    if [ "$ck" -eq 1 ]; then
+      CKPT_OK=$((CKPT_OK + 1)); CKPT_FAILS=0
+      echo "[soak] checkpoint $CKPT_TOTAL: CONVERGED"
+    else
+      CKPT_FAILS=$((CKPT_FAILS + 1))
+      echo "[soak] checkpoint $CKPT_TOTAL: NOT converged (consecutive fails: $CKPT_FAILS)"
+      [ "$CKPT_FAILS" -ge 3 ] && fail_soak "no-reconvergence-3-checkpoints"
+    fi
+
+    # Hourly record + monotone-growth streaks.
+    spread=$(lag_spread); copies=$(copy_count); live=$(live_count)
+    echo "$(date +%s),$(rss_kib a),$(rss_kib b),$(rss_kib c),$spread,$copies,$live,$ck" >>"$HCSV"
+    for nn in "${NODES[@]}"; do
+      cur=$(rss_kib "$nn")
+      if [ "$cur" -gt "${RSS_PREV[$nn]}" ] && [ "${RSS_PREV[$nn]}" -gt 0 ]; then
+        RSS_STREAK[$nn]=$(( ${RSS_STREAK[$nn]} + 1 ))
+      else
+        RSS_STREAK[$nn]=0
+      fi
+      RSS_PREV[$nn]=$cur
+      [ "${RSS_STREAK[$nn]}" -ge "$MONO_WINDOW" ] && fail_soak "rss-monotonic-growth-node-$nn-${MONO_WINDOW}h"
+    done
+    if [ "$spread" -gt "$LAG_PREV" ] && [ "$LAG_PREV" -gt 0 ]; then
+      LAG_STREAK=$((LAG_STREAK + 1))
+    else
+      LAG_STREAK=0
+    fi
+    LAG_PREV=$spread
+    [ "$LAG_STREAK" -ge "$MONO_WINDOW" ] && fail_soak "lag-spread-monotonic-growth-${MONO_WINDOW}h"
+    # Copy bloat: ratio after the first hour, or a storm within one hour.
+    if [ "$CKPT_TOTAL" -ge 1 ] && [ "$live" -gt 0 ] && [ $((copies * 2)) -gt "$live" ]; then
+      fail_soak "copy-bloat-ratio-${copies}-of-${live}"
+    fi
+    if [ $((copies - PREV_HOUR_COPIES)) -gt 50 ]; then
+      fail_soak "copy-storm-+$((copies - PREV_HOUR_COPIES))-in-one-hour"
+    fi
+    PREV_HOUR_COPIES=$copies
+    next_checkpoint=$(( $(date +%s) + CHECKPOINT_EVERY ))
+  fi
+
   sleep "$CYCLE_SECS"
 done
 
-echo "[soak] traffic done; settling 90s for convergence…"
+echo "[soak] traffic done; settling 90s for final convergence…"
 sleep 90
 
-# --- exit assertions -------------------------------------------------------
-fail=0
-if converged; then
-  echo "[soak] PASS: trees byte-identical across all nodes"
-else
-  echo "[soak] FAIL: trees diverged at the end"
-  fail=1
-fi
+# --- final verdict -----------------------------------------------------------
+converged || fail_soak "final-trees-diverged"
 
-# RSS leak check: final < 2× early median, per node.
-for col in 2 3 4; do
-  early=$(tail -n +2 "$CSV" | head -10 | cut -d, -f$col | sort -n | awk '{a[NR]=$1} END{print a[int(NR/2)+1]}')
-  final=$(tail -1 "$CSV" | cut -d, -f$col)
+# Final leak sanity (in addition to the streak rule): end RSS < 2× early median.
+for nn in "${NODES[@]}"; do
+  col=$(case $nn in a) echo 2;; b) echo 3;; c) echo 4;; esac)
+  early=$(tail -n +2 "$CSV" | head -10 | cut -d, -f"$col" | sort -n | awk '{a[NR]=$1} END{print a[int(NR/2)+1]}')
+  final=$(tail -1 "$CSV" | cut -d, -f"$col")
   if [ -n "$early" ] && [ "$early" -gt 0 ] && [ "$final" -gt $((early * 2)) ]; then
-    echo "[soak] FAIL: RSS grew ${early} -> ${final} KiB (column $col)"
-    fail=1
+    fail_soak "rss-grew-${early}-to-${final}KiB-node-$nn"
   fi
 done
 
-# Copy-storm check: copy count stable over the final quarter.
-q=$(($(wc -l <"$CSV") / 4 + 1))
-first_q_copies=$(tail -n "$q" "$CSV" | head -1 | cut -d, -f8)
-last_copies=$(tail -1 "$CSV" | cut -d, -f8)
-if [ "$last_copies" -gt $((first_q_copies + 10)) ]; then
-  echo "[soak] FAIL: conflict copies grew ${first_q_copies} -> ${last_copies} in the final quarter (storm?)"
-  fail=1
-fi
-
-echo "[soak] samples in $CSV"
-exit $fail
+line="SOAK PASS duration=$(( $(date +%s) - START ))s rss_a=$(rss_kib a)KiB rss_b=$(rss_kib b)KiB rss_c=$(rss_kib c)KiB max_lag_spread=$(lag_spread) copies=$(copy_count) live=$(live_count) checkpoints=${CKPT_OK}/${CKPT_TOTAL}"
+echo "$line" | tee "$VERDICT"
+echo "[soak] per-minute: $CSV  hourly: $HCSV"
+exit 0
