@@ -109,3 +109,17 @@ fully-committed file re-observed is a no-op; an orphaned-but-correct file
 (crash after rename, before commit) re-attributes to ONE bounded op, never
 clobbers content, and converges byte-identically with the redelivered op
 (zero loss, op count reaches a fixed point).
+
+## 4. A real bug the 15× clean loop surfaced: partial-manifest wedge (FIXED)
+
+Running the combined suite 15× clean (to confirm findings 1–2 don't recur)
+turned up a genuine, separate product bug at 1/10–1/15: a node killed -9
+during the receiver's manifest persist left a partial manifest, and
+`manifest_for` then returned a hard `Corrupt` on every read — the node
+wedged in a permanent reconnect loop and never re-converged (the
+`kill_during` convergence timeout). The standalone `put_manifest` path was
+non-atomic (separate autocommit statements). Fixed: atomic persist +
+self-healing read (commit `36022fa`, `tests/manifest_crash.rs`); 1/10 wedge
+→ 12/12 pass. This is the kind of crash-injection bug the QA findings
+were adjacent to — found by treating the nondeterministic failure as real
+and looping hard, exactly as instructed.
