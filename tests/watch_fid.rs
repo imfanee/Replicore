@@ -237,6 +237,9 @@ async fn fid_rename_becomes_one_identity_preserving_op() {
         max_concurrent_transfers: 4,
         serve_concurrency: 8,
         owner_policy: replicore::metadata::OwnerPolicy::Skip,
+        bandwidth: Default::default(),
+        reserve_bytes: 0,
+        reserve_percent: 0.0,
     };
     let cas = Cas::open(&cfg.cas_dir).unwrap();
     let suppress = Suppressor::new();

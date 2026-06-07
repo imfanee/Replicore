@@ -33,6 +33,7 @@ thiserror = "2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 toml = "0.8"
 hex = "0.4"
+prometheus = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
 proptest = "1"
@@ -44,6 +45,8 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 # fixture the write-path grep-gate must not see inside src/).
 rusqlite = { version = "0.37", features = ["bundled"] }
 bincode = "1.3"
+# start_paused virtual-clock tests for the QoS token buckets.
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 2

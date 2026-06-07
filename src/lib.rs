@@ -23,6 +23,7 @@ pub mod net;
 pub mod oplog;
 pub mod peer;
 pub mod proto;
+pub mod qos;
 pub mod replica;
 pub mod scanner;
 pub mod state;

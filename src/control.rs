@@ -79,7 +79,12 @@ pub enum CtlRequest {
     },
     Pause,
     Resume,
-    Bandwidth,
+    /// `None` = show the live rates; `Some` = retune at runtime (FR-1105).
+    /// Runtime overrides last until the next schedule tick or reload — the
+    /// intent file stays the durable source of policy (FR-1302 discipline).
+    Bandwidth {
+        set: Option<(u64, u64)>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -99,6 +104,10 @@ pub enum CtlResponse {
     },
     Ok(String),
     Error(String),
+    Bandwidth {
+        global_bps: u64,
+        per_peer_bps: u64,
+    },
 }
 
 /// A single node's self-reported status (also the CTLQUERY mesh reply).
@@ -340,9 +349,16 @@ async fn dispatch(engine: &Arc<Engine>, req: CtlRequest) -> CtlResponse {
             engine.resume();
             CtlResponse::Ok("replication resumed".into())
         }
-        CtlRequest::Bandwidth => CtlResponse::Error(
-            "bandwidth limiting lands with M3 QoS (FR-1103); not yet enforced".into(),
-        ),
+        CtlRequest::Bandwidth { set } => {
+            if let Some((global, per_peer)) = set {
+                engine.set_bandwidth(global, per_peer);
+            }
+            let (global_bps, per_peer_bps) = engine.bandwidth_rates();
+            CtlResponse::Bandwidth {
+                global_bps,
+                per_peer_bps,
+            }
+        }
     }
 }
 

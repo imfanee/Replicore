@@ -36,6 +36,14 @@ pub struct Stats {
     /// local and records the remote as concurrent. Surfaced by
     /// `replicorectl conflicts` until M3 adds conflict copies.
     pub conflicts: AtomicU64,
+    /// Chunks a fetch skipped because the CAS already held them (the cache
+    /// hit rate's numerator, FR-1101).
+    pub chunks_cache_hits: AtomicU64,
+    /// Free-space guard activations (FR-1107): transfers paused to protect
+    /// the reserve.
+    pub freespace_trips: AtomicU64,
+    /// Reconcile sessions that resolved at least one conflict (FR-305).
+    pub apply_errors: AtomicU64,
 }
 
 impl Stats {

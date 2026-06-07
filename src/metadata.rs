@@ -54,6 +54,15 @@ use serde::{Deserialize, Serialize};
 /// `meta_hash` for "no metadata" (deletes, pre-v4 rows).
 pub const META_NONE: [u8; 32] = [0u8; 32];
 
+/// Process-wide count of skipped ownership applies (policy or EPERM) —
+/// surfaced as `replicore_meta_owner_skips_total` (FR-106/FR-1101). A static
+/// because the apply layer is deliberately engine-free.
+static OWNER_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn owner_skips() -> u64 {
+    OWNER_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FileKind {
     Regular,
@@ -267,7 +276,10 @@ pub fn apply_meta(path: &Path, meta: &Meta, policy: OwnerPolicy) -> io::Result<M
 
     // 2. ownership — before mode (chown clears setuid/setgid; chmod restores).
     match policy {
-        OwnerPolicy::Skip => applied.owner_skipped = true,
+        OwnerPolicy::Skip => {
+            applied.owner_skipped = true;
+            OWNER_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         OwnerPolicy::Numeric => {
             // SAFETY: c is a valid NUL-terminated path.
             let rc = unsafe { libc::lchown(c.as_ptr(), meta.uid, meta.gid) };
@@ -277,6 +289,7 @@ pub fn apply_meta(path: &Path, meta: &Meta, policy: OwnerPolicy) -> io::Result<M
                     // Unprivileged daemon: skip whole ownership, never a
                     // half-applied uid-without-gid (FR-106).
                     applied.owner_skipped = true;
+                    OWNER_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::warn!(path = %path.display(),
                         "ownership not applied (CAP_CHOWN missing); owner_policy=numeric needs a privileged daemon");
                 } else {

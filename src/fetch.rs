@@ -67,11 +67,16 @@ impl FetchError {
 }
 
 /// Limits threaded from config.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct FetchLimits {
     pub per_file_chunk_concurrency: usize,
     pub max_chunk_bytes: u32,
     pub max_file_bytes: u64,
+    /// Ingress bandwidth limiter (FR-1103); `None` in contexts without an
+    /// engine (tests, tools).
+    pub qos: Option<std::sync::Arc<crate::qos::Limiter>>,
+    /// Which queue this file's chunks ride (FR-1104).
+    pub lane: crate::qos::Lane,
 }
 
 /// Get the manifest for `content_hash`: local db first, then the origin,
@@ -205,12 +210,23 @@ pub async fn fetch_file_chunks(
     // Dedup within the manifest (repeated content costs one fetch) and skip
     // everything already present — THE resume step.
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
+    let mut cache_hits = 0u64;
     let missing: Vec<ChunkEntry> = manifest
         .chunks
         .iter()
-        .filter(|c| seen.insert(c.hash) && !cas.has(&c.hash))
+        .filter(|c| {
+            if !seen.insert(c.hash) {
+                return false;
+            }
+            if cas.has(&c.hash) {
+                cache_hits += 1; // resume / dedup: already local (FR-1101)
+                return false;
+            }
+            true
+        })
         .copied()
         .collect();
+    Stats::add(&stats.chunks_cache_hits, cache_hits);
     if missing.is_empty() {
         return Ok(());
     }
@@ -230,7 +246,7 @@ pub async fn fetch_file_chunks(
             .map_err(|_| FetchError::NoUsablePeer)?;
         let cas = cas.clone();
         let registry = registry.clone();
-        let limits = *limits;
+        let limits = limits.clone();
         let stats = stats.clone();
         tasks.spawn(async move {
             let _permit = permit; // bounds in-flight chunks (FR-1106)
@@ -285,6 +301,11 @@ async fn fetch_one_chunk(
     }
     let mut any_not_found = false;
     for (peer, conn) in candidates {
+        // Ingress cap (FR-1103/1104): admit the chunk's bytes from this
+        // peer before pulling them.
+        if let Some(qos) = &limits.qos {
+            qos.acquire(limits.lane, &peer, entry.len as u64).await;
+        }
         match chunk_from_peer(&conn, &entry).await {
             Ok(Some(bytes)) => {
                 // Verified by chunk_from_peer; put_verified re-checks and is

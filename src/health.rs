@@ -1,10 +1,13 @@
-//! health.rs — hand-rolled HTTP/1.1 health endpoint (FR-1102), no deps.
+//! health.rs — hand-rolled HTTP/1.1 health + metrics endpoint (FR-1102/1101).
 //!
 //! `GET /healthz` returns a JSON snapshot: per-peer state + cursors, transfer
-//! counters, CAS stats, queue gauges. Everything else is a 404; requests over
-//! 8 KiB are rejected (bound every buffer — even on localhost). JSON is built
-//! by hand: every value is a number, bool, hex string, or fixed enum string,
-//! so no escaping is ever needed. Full metrics (prometheus) land in M3.
+//! counters, CAS stats, queue gauges. `GET /metrics` exposes the same state
+//! (plus per-peer lag, cache hit rate, conflicts, guard trips, owner skips)
+//! in Prometheus text format — built at scrape time from the live atomics
+//! via a transient registry, so no double bookkeeping exists. Everything
+//! else is a 404; requests over 8 KiB are rejected (bound every buffer —
+//! even on localhost). Bind `health_listen` to a management interface: both
+//! endpoints are intentionally unauthenticated, Prometheus-style.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,7 +63,13 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let mut n = 0;
     loop {
         if n == buf.len() {
-            return respond(sock, "431 Request Header Fields Too Large", "{}").await;
+            return respond(
+                sock,
+                "431 Request Header Fields Too Large",
+                "application/json",
+                "{}",
+            )
+            .await;
         }
         let read = sock.read(&mut buf[n..]).await?;
         if read == 0 {
@@ -74,20 +83,41 @@ pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
     let head = String::from_utf8_lossy(&buf[..n]);
     let request_line = head.lines().next().unwrap_or("");
     let path = request_line.split_whitespace().nth(1).unwrap_or("");
-    if !request_line.starts_with("GET ") || path != "/healthz" {
-        return respond(sock, "404 Not Found", "{\"error\":\"not found\"}").await;
+    match (request_line.starts_with("GET "), path) {
+        (true, "/healthz") => {
+            let body = render(ctx).await;
+            respond(sock, "200 OK", "application/json", &body).await
+        }
+        (true, "/metrics") => {
+            let body = render_metrics(ctx).await;
+            respond(
+                sock,
+                "200 OK",
+                "text/plain; version=0.0.4; charset=utf-8",
+                &body,
+            )
+            .await
+        }
+        _ => {
+            respond(
+                sock,
+                "404 Not Found",
+                "application/json",
+                "{\"error\":\"not found\"}",
+            )
+            .await
+        }
     }
-    let body = render(ctx).await;
-    respond(sock, "200 OK", &body).await
 }
 
 async fn respond<S: AsyncWrite + Unpin>(
     sock: &mut S,
     status: &str,
+    content_type: &str,
     body: &str,
 ) -> std::io::Result<()> {
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     sock.write_all(head.as_bytes()).await?;
@@ -144,6 +174,136 @@ async fn render(ctx: &HealthCtx) -> String {
     )
 }
 
+/// Prometheus text exposition (FR-1101), built at scrape time from the live
+/// atomics: counters, gauges, per-peer lag, cache hit rate inputs, conflict
+/// count, free-space guard trips, ownership-apply skips.
+async fn render_metrics(ctx: &HealthCtx) -> String {
+    use prometheus::{Encoder, IntCounter, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
+    let r = Registry::new();
+    let counter = |name: &str, help: &str, v: u64| {
+        if let Ok(c) = IntCounter::new(format!("replicore_{name}"), help.to_string()) {
+            c.inc_by(v);
+            let _ = r.register(Box::new(c));
+        }
+    };
+    let gauge = |name: &str, help: &str, v: i64| {
+        if let Ok(g) = IntGauge::new(format!("replicore_{name}"), help.to_string()) {
+            g.set(v);
+            let _ = r.register(Box::new(g));
+        }
+    };
+    counter(
+        "chunks_fetched_total",
+        "Chunks fetched from peers (CAS misses)",
+        Stats::get(&ctx.stats.chunks_fetched),
+    );
+    counter(
+        "chunks_cache_hits_total",
+        "Chunks a fetch skipped because the CAS held them (FR-1101 cache hit rate)",
+        Stats::get(&ctx.stats.chunks_cache_hits),
+    );
+    counter(
+        "chunks_served_total",
+        "Chunks served to peers",
+        Stats::get(&ctx.stats.chunks_served),
+    );
+    counter(
+        "bytes_in_total",
+        "Chunk payload bytes received",
+        Stats::get(&ctx.stats.bytes_in),
+    );
+    counter(
+        "bytes_out_total",
+        "Chunk payload bytes served",
+        Stats::get(&ctx.stats.bytes_out),
+    );
+    counter(
+        "manifests_fetched_total",
+        "Manifests fetched from peers",
+        Stats::get(&ctx.stats.manifests_fetched),
+    );
+    counter(
+        "reconcile_runs_total",
+        "Anti-entropy sessions completed",
+        Stats::get(&ctx.stats.reconcile_runs),
+    );
+    counter(
+        "conflicts_total",
+        "Concurrent-version detections (FR-303/305)",
+        Stats::get(&ctx.stats.conflicts),
+    );
+    counter(
+        "freespace_guard_trips_total",
+        "Transfer pauses to protect the free-space reserve (FR-1107)",
+        Stats::get(&ctx.stats.freespace_trips),
+    );
+    counter(
+        "apply_errors_total",
+        "Op materializations quarantined permanently",
+        Stats::get(&ctx.stats.apply_errors),
+    );
+    counter(
+        "meta_owner_skips_total",
+        "Ownership applies skipped (policy or missing CAP_CHOWN, FR-106)",
+        crate::metadata::owner_skips(),
+    );
+    gauge(
+        "inflight_transfers",
+        "Files in the fetch+assemble pipeline",
+        Stats::get_gauge(&ctx.stats.inflight_transfers),
+    );
+    gauge(
+        "events_queued",
+        "Watcher/scanner events waiting for ingest",
+        ctx.events_tx
+            .max_capacity()
+            .saturating_sub(ctx.events_tx.capacity()) as i64,
+    );
+    gauge(
+        "live_connections",
+        "Connected peers",
+        ctx.conns.len() as i64,
+    );
+    gauge(
+        "oplog_rows",
+        "Total op-log rows",
+        ctx.store.op_count().await.unwrap_or(-1),
+    );
+
+    // Per-peer replication lag (FR-1101): cursor of their ops we hold, and
+    // the highest of OUR ops they have acked.
+    if let Ok(lag) = IntGaugeVec::new(
+        Opts::new(
+            "replicore_peer_recv_cursor",
+            "Highest origin_seq of this peer's ops durably handled here",
+        ),
+        &["peer"],
+    ) {
+        for peer in &ctx.configured_peers {
+            let v = ctx.store.recv_cursor(*peer).await.unwrap_or(0);
+            lag.with_label_values(&[&hex::encode(peer)]).set(v);
+        }
+        let _ = r.register(Box::new(lag));
+    }
+    if let Ok(acked) = IntGaugeVec::new(
+        Opts::new(
+            "replicore_peer_acked_seq",
+            "Highest of our origin_seq this peer has durably acked",
+        ),
+        &["peer"],
+    ) {
+        for peer in &ctx.configured_peers {
+            let v = ctx.store.last_acked(*peer).await.unwrap_or(0);
+            acked.with_label_values(&[&hex::encode(peer)]).set(v);
+        }
+        let _ = r.register(Box::new(acked));
+    }
+
+    let mut out = Vec::new();
+    let _ = TextEncoder::new().encode(&r.gather(), &mut out);
+    String::from_utf8(out).unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +345,17 @@ mod tests {
         assert!(resp.contains("\"peers\":[{\"node_id\":\"bbbb"));
         assert!(resp.contains("\"state\":\"disconnected\""));
         assert!(resp.contains("\"cas\":{\"chunks\":0,\"bytes\":0}"));
+    }
+
+    #[tokio::test]
+    async fn metrics_exposes_prometheus_text() {
+        let resp = roundtrip(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+        assert!(resp.contains("text/plain"));
+        assert!(resp.contains("# TYPE replicore_chunks_fetched_total counter"));
+        assert!(resp.contains("replicore_conflicts_total 0"));
+        assert!(resp.contains("replicore_freespace_guard_trips_total 0"));
+        assert!(resp.contains("replicore_peer_recv_cursor{peer=\"bbbb"));
     }
 
     #[tokio::test]

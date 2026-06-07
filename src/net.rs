@@ -341,6 +341,17 @@ pub struct Engine {
     /// Operator pause gate (FR-1404): when set, push and new transfers wait;
     /// in-flight transfers finish. Resume wakes the waiters.
     paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Bandwidth limiter (FR-1103/1104); retuned by schedule/reload/ctl.
+    qos: Arc<crate::qos::Limiter>,
+    /// The hot half of `[bandwidth]` (reload replaces it atomically): base
+    /// rates, lane threshold, schedule.
+    bandwidth_policy: Arc<StdRwLock<crate::config::BandwidthCfg>>,
+    /// The free-space guard tripped the pause (FR-1107): auto-resume may
+    /// clear it; an operator pause is never auto-resumed.
+    guard_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Hot-reloadable guard thresholds (reserve_percent in basis points).
+    reserve_bytes: Arc<std::sync::atomic::AtomicU64>,
+    reserve_pct_bp: Arc<std::sync::atomic::AtomicU64>,
     resume_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -358,6 +369,15 @@ impl Engine {
         // Promotion is gated on the CURRENT effective set, not just the seeds.
         let expected = membership.effective_peers().into_iter().map(|p| p.node_id);
         let join = crate::join::JoinTracker::new(store.clone(), expected);
+        let qos = Arc::new(crate::qos::Limiter::new(
+            cfg.bandwidth.global_bps,
+            cfg.bandwidth.per_peer_bps,
+        ));
+        let bandwidth_policy = Arc::new(StdRwLock::new(cfg.bandwidth.clone()));
+        let reserve_bytes = Arc::new(std::sync::atomic::AtomicU64::new(cfg.reserve_bytes));
+        let reserve_pct_bp = Arc::new(std::sync::atomic::AtomicU64::new(
+            (cfg.reserve_percent * 100.0) as u64,
+        ));
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
@@ -370,6 +390,11 @@ impl Engine {
             join,
             membership,
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qos,
+            bandwidth_policy,
+            guard_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reserve_bytes,
+            reserve_pct_bp,
             resume_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -553,7 +578,30 @@ impl Engine {
     ) -> Result<Vec<crate::config::ConfigChange>, crate::membership::MembershipError> {
         let changes = self.cfg.diff(candidate);
         self.membership.apply_reload(candidate)?;
+        // HOT (FR-1406 discipline — validated candidate or nothing): the
+        // bandwidth policy and free-space reserve retune live.
+        *self
+            .bandwidth_policy
+            .write()
+            .expect("bandwidth policy lock poisoned") = candidate.bandwidth.clone();
+        self.qos.set_rates(
+            candidate.bandwidth.global_bps,
+            candidate.bandwidth.per_peer_bps,
+        );
+        self.reserve_bytes
+            .store(candidate.reserve_bytes, Ordering::Relaxed);
+        self.reserve_pct_bp.store(
+            (candidate.reserve_percent * 100.0) as u64,
+            Ordering::Relaxed,
+        );
         Ok(changes)
+    }
+
+    fn bandwidth_policy(&self) -> crate::config::BandwidthCfg {
+        self.bandwidth_policy
+            .read()
+            .expect("bandwidth policy lock poisoned")
+            .clone()
     }
 
     /// On-demand anti-entropy (FR-1405): reconcile now with `node` (or every
@@ -648,6 +696,7 @@ impl Engine {
             }
         });
         tokio::spawn(self.clone().gossip_driver());
+        self.spawn_policy_tasks();
         self.supervise(endpoint).await
     }
 
@@ -955,6 +1004,10 @@ impl Engine {
     /// unbounded spawn-per-stream: a peer hammering us with streams waits for
     /// a slot instead of growing our task count without limit.
     async fn serve_streams(self: &Arc<Engine>, conn: quinn::Connection) -> Result<(), NetError> {
+        // Egress attribution (FR-1103): the authenticated peer behind this
+        // connection, from the same pinned-cert identity the data path runs
+        // on. Unknown (should not happen post-auth) attributes to the zero id.
+        let peer = self.peer_of(&conn);
         let slots = Arc::new(tokio::sync::Semaphore::new(
             self.cfg.serve_concurrency.max(1),
         ));
@@ -967,11 +1020,104 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the stream's lifetime
-                if let Err(e) = engine.serve_one_stream(send, recv).await {
+                if let Err(e) = engine.serve_one_stream(send, recv, peer).await {
                     tracing::debug!(error = %e, "serve stream ended");
                 }
             });
         }
+    }
+
+    /// FR-1107: block until `incoming` bytes fit above the reserve on both
+    /// the CAS and share filesystems. A shortfall trips the pause gate
+    /// (counted + logged); the prober task auto-resumes once space recovers.
+    /// statvfs FAILURE also trips — a broken guard must fail closed.
+    async fn guard_free_space(&self, incoming: u64) {
+        loop {
+            if self.free_space_ok(incoming) {
+                return;
+            }
+            if !self.guard_paused.swap(true, Ordering::SeqCst) && !self.is_paused() {
+                Stats::inc(&self.stats.freespace_trips);
+                tracing::error!(
+                    incoming,
+                    "free-space guard: reserve would be breached; pausing transfers (FR-1107)"
+                );
+                self.pause();
+            }
+            self.await_unpaused().await;
+        }
+    }
+
+    fn free_space_ok(&self, incoming: u64) -> bool {
+        let reserve = self.reserve_bytes.load(Ordering::Relaxed);
+        let pct = self.reserve_pct_bp.load(Ordering::Relaxed) as f64 / 100.0;
+        for fs in [&self.cfg.cas_dir, &self.cfg.share_dir] {
+            match crate::qos::available_above_reserve(fs, reserve, pct) {
+                Ok(avail) if avail >= incoming => {}
+                Ok(_) => return false,
+                Err(e) => {
+                    tracing::error!(path = %fs.display(), error = %e,
+                        "free-space guard: statvfs failed; failing CLOSED");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Background policy tasks: the bandwidth schedule evaluator (FR-1103)
+    /// and the free-space auto-resume prober (FR-1107).
+    fn spawn_policy_tasks(self: &Arc<Engine>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // Schedule (the one legitimate wall-clock read: policy).
+                let policy = engine.bandwidth_policy();
+                if !policy.schedule.is_empty() {
+                    let (wd, min) = crate::qos::local_clock();
+                    let base = (policy.global_bps, policy.per_peer_bps);
+                    let (g, p) = crate::qos::active_rates(&policy.schedule, base, wd, min);
+                    if (g, p) != engine.qos.rates() {
+                        tracing::info!(
+                            global_bps = g,
+                            per_peer_bps = p,
+                            "bandwidth schedule: retuning (FR-1103)"
+                        );
+                        engine.qos.set_rates(g, p);
+                    }
+                }
+                // Guard auto-resume: only a guard-initiated pause, and only
+                // once a healthy margin is back.
+                if engine.guard_paused.load(Ordering::SeqCst) && engine.free_space_ok(1 << 20) {
+                    engine.guard_paused.store(false, Ordering::SeqCst);
+                    engine.resume();
+                    tracing::info!("free-space guard: space recovered; resuming");
+                }
+            }
+        });
+    }
+
+    /// Runtime bandwidth control (FR-1105): `replicorectl bandwidth`.
+    pub fn bandwidth_rates(&self) -> (u64, u64) {
+        self.qos.rates()
+    }
+
+    pub fn set_bandwidth(&self, global_bps: u64, per_peer_bps: u64) {
+        tracing::info!(global_bps, per_peer_bps, "bandwidth set via control socket");
+        self.qos.set_rates(global_bps, per_peer_bps);
+    }
+
+    /// The peer NodeId a connection is registered under (egress accounting).
+    fn peer_of(&self, conn: &quinn::Connection) -> NodeId {
+        for (id, c) in self.conns.all() {
+            if c.stable_id() == conn.stable_id() {
+                return id;
+            }
+        }
+        [0u8; 16]
     }
 
     /// Dispatch one ephemeral stream by its leading tag byte.
@@ -979,11 +1125,12 @@ impl Engine {
         &self,
         send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        peer: NodeId,
     ) -> Result<(), NetError> {
         let mut tag = [0u8; 1];
         recv.read_exact(&mut tag).await?;
         match tag[0] {
-            STREAM_TAG_CHUNK => self.serve_chunk(send, recv).await,
+            STREAM_TAG_CHUNK => self.serve_chunk(send, recv, peer).await,
             STREAM_TAG_MANIFEST => self.serve_manifest(send, recv).await,
             STREAM_TAG_RECONCILE => self.serve_reconcile(send, recv).await,
             STREAM_TAG_ROSTER => crate::gossip::serve_roster(&self.membership, send, recv)
@@ -1078,6 +1225,7 @@ impl Engine {
         &self,
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        peer: NodeId,
     ) -> Result<(), NetError> {
         let req: ChunkReq = read_msg(&mut recv).await?;
         let opened = {
@@ -1094,6 +1242,15 @@ impl Engine {
                     },
                 )
                 .await?;
+                // Egress cap (FR-1103/1104): single chunks at or under the
+                // small-asset size ride the priority lane (a small file IS
+                // its one chunk).
+                let lane = if len <= self.bandwidth_policy().small_asset_bytes {
+                    crate::qos::Lane::Priority
+                } else {
+                    crate::qos::Lane::Bulk
+                };
+                self.qos.acquire(lane, &peer, len).await;
                 let mut reader = tokio::fs::File::from_std(file);
                 tokio::io::copy(&mut reader, &mut send)
                     .await
@@ -1441,6 +1598,7 @@ impl Engine {
                         error = %e,
                         "op cannot be materialized; quarantining (a superseding op or rescan repairs)"
                     );
+                    Stats::inc(&self.stats.apply_errors);
                     decision = Decision::Quarantined;
                 }
                 // Transient (I/O, stream, store): drop the connection; the
@@ -1730,7 +1888,8 @@ impl Engine {
         origin: NodeId,
         hash: [u8; 32],
     ) -> Result<(), NetError> {
-        let limits = self.fetch_limits();
+        self.guard_free_space(row.size).await;
+        let limits = self.fetch_limits_for(row.size);
         let manifest = match self.store.manifest_for(hash).await? {
             Some(m) => m,
             None => {
@@ -1989,7 +2148,8 @@ impl Engine {
 
     /// Manifest -> missing chunks -> CAS -> streamed atomic assembly.
     async fn fetch_and_assemble(&self, op: &OpRecord, hash: [u8; 32]) -> Result<(), NetError> {
-        let limits = self.fetch_limits();
+        self.guard_free_space(op.size).await;
+        let limits = self.fetch_limits_for(op.size);
         // Multi-source: candidates come from the shared registry, origin
         // first — not just this subscription's connection.
         let manifest = crate::fetch::obtain_manifest(
@@ -2048,10 +2208,22 @@ impl Engine {
     }
 
     fn fetch_limits(&self) -> crate::fetch::FetchLimits {
+        self.fetch_limits_for(u64::MAX) // bulk lane by default
+    }
+
+    /// Limits for fetching one file of `size` bytes: small assets ride the
+    /// priority lane (FR-1104).
+    fn fetch_limits_for(&self, size: u64) -> crate::fetch::FetchLimits {
         crate::fetch::FetchLimits {
             per_file_chunk_concurrency: self.cfg.per_file_chunk_concurrency,
             max_chunk_bytes: self.cfg.chunk_max_bytes,
             max_file_bytes: self.cfg.max_file_bytes,
+            qos: Some(self.qos.clone()),
+            lane: if size <= self.bandwidth_policy().small_asset_bytes {
+                crate::qos::Lane::Priority
+            } else {
+                crate::qos::Lane::Bulk
+            },
         }
     }
 
@@ -2327,7 +2499,48 @@ mod tests {
             max_concurrent_transfers: 4,
             serve_concurrency: 8,
             owner_policy: crate::metadata::OwnerPolicy::Skip,
+            bandwidth: Default::default(),
+            reserve_bytes: 0,
+            reserve_percent: 0.0,
         }
+    }
+
+    /// FR-1107: the free-space guard trips the pause gate, counts it, and
+    /// the transfer path blocks until space recovers (here: the prober's
+    /// release sequence, applied directly).
+    #[tokio::test]
+    async fn free_space_guard_trips_pauses_and_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let ident = generate_identity().unwrap();
+        let engine = engine_on(dir.path(), [0xa; 16], &ident, vec![]);
+        // An impossible reserve: every filesystem is "full".
+        engine.reserve_bytes.store(u64::MAX, Ordering::Relaxed);
+
+        let blocked = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.guard_free_space(1).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(engine.is_paused(), "guard did not pause");
+        assert!(
+            !blocked.is_finished(),
+            "guard admitted a transfer with no space"
+        );
+        assert_eq!(Stats::get(&engine.stats.freespace_trips), 1);
+
+        // Space "recovers": what the prober does on its tick.
+        engine.reserve_bytes.store(0, Ordering::Relaxed);
+        assert!(engine.free_space_ok(1 << 20));
+        engine.guard_paused.store(false, Ordering::SeqCst);
+        engine.resume();
+        tokio::time::timeout(Duration::from_secs(5), blocked)
+            .await
+            .expect("guard did not release after recovery")
+            .unwrap();
+        // Re-tripping counts again; an already-paused engine is not re-paused.
+        assert!(!engine.is_paused());
     }
 
     fn engine_on(

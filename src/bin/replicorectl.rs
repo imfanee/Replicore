@@ -60,7 +60,10 @@ async fn run() -> Result<ExitCode, String> {
         ("version", _) => Some(CtlRequest::Version),
         ("pause", _) => Some(CtlRequest::Pause),
         ("resume", _) => Some(CtlRequest::Resume),
-        ("bandwidth", _) => Some(CtlRequest::Bandwidth),
+        ("bandwidth", []) => Some(CtlRequest::Bandwidth { set: None }),
+        ("bandwidth", r) if r.len() == 3 && r[0] == "set" => Some(CtlRequest::Bandwidth {
+            set: Some((parse_bps(&r[1])?, parse_bps(&r[2])?)),
+        }),
         ("resync", r) => Some(CtlRequest::Resync {
             node: r.first().map(|s| parse_node_id(s)).transpose()?,
         }),
@@ -88,8 +91,23 @@ fn usage() -> String {
      config validate|diff|reload <file>\n  \
      member add <node_id> <addr> <fingerprint> --admin-key <path>\n  \
      member remove <node_id> --admin-key <path>\n  \
-     resync [<node_id>] | pause | resume | bandwidth"
+     resync [<node_id>] | pause | resume
+  \
+     bandwidth [set <global_bps> <per_peer_bps>]   (0 = unlimited)"
         .to_string()
+}
+
+/// Bytes/sec with optional k/m/g suffix (decimal); 0 = unlimited.
+fn parse_bps(s: &str) -> Result<u64, String> {
+    let (num, mult) = match s.to_ascii_lowercase() {
+        ref v if v.ends_with('k') => (v[..v.len() - 1].to_string(), 1_000),
+        ref v if v.ends_with('m') => (v[..v.len() - 1].to_string(), 1_000_000),
+        ref v if v.ends_with('g') => (v[..v.len() - 1].to_string(), 1_000_000_000),
+        v => (v, 1),
+    };
+    num.parse::<u64>()
+        .map(|n| n * mult)
+        .map_err(|_| format!("not a rate: {s} (use bytes/sec, k/m/g suffixes, 0 = unlimited)"))
 }
 
 fn config_request(r: &[String]) -> Result<CtlRequest, String> {
@@ -234,6 +252,23 @@ fn render(resp: &CtlResponse, json: bool) -> ExitCode {
             }
         }
         CtlResponse::Conflicts(n) => println!("conflicts: {n}"),
+        CtlResponse::Bandwidth {
+            global_bps,
+            per_peer_bps,
+        } => {
+            let show = |v: &u64| {
+                if *v == 0 {
+                    "unlimited".to_string()
+                } else {
+                    format!("{v} B/s")
+                }
+            };
+            println!(
+                "global={} per_peer={}",
+                show(global_bps),
+                show(per_peer_bps)
+            );
+        }
         CtlResponse::Transfers(t) => {
             println!(
                 "inflight={} chunks_fetched={} chunks_served={} bytes_in={} bytes_out={}",
