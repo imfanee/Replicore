@@ -14,10 +14,20 @@ db_path   = "/var/lib/replicore/a.db"           # WAL-backed op-log + index
 cert_path = "/etc/replicore/node-a.cert.pem"
 key_path  = "/etc/replicore/node-a.key.pem"
 
+# cas_dir       = "/var/lib/replicore/a.cas"  # chunk store (default <db_path>.cas; outside the share!)
+# health_listen = "127.0.0.1:8080"             # GET /healthz JSON; absent = disabled (FR-1102)
+
 # Optional tuning (defaults shown):
-# quiesce_ms         = 300    # per-path settle window before a write becomes an op (FR-105)
-# scan_interval_secs = 5      # authoritative rescan cadence (FR-103)
-# max_file_bytes     = 67108864  # whole-file transfer cap; chunking is M2 (FR-402)
+# quiesce_ms              = 300       # per-path settle window before a write becomes an op (FR-105)
+# scan_interval_secs      = 5         # authoritative rescan cadence (FR-103)
+# reconcile_interval_secs = 300       # periodic anti-entropy per peer (FR-702)
+# max_file_bytes          = 67108864  # single-file cap
+# chunk_min_bytes         = 262144    # fastcdc bounds (FR-402); max is also the wire guard
+# chunk_avg_bytes         = 1048576
+# chunk_max_bytes         = 4194304
+# per_file_chunk_concurrency = 6      # parallel chunk fetches within one file (FR-403)
+# max_concurrent_transfers   = 8      # engine-wide transfer bound (FR-1106)
+# serve_concurrency          = 16     # serve streams granted per peer connection (FR-1106)
 
 [[peers]]
 node_id     = "101112131415161718191a1b1c1d1e1f"

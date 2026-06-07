@@ -74,8 +74,9 @@ replicorectl config reload                  # atomic; reject-on-invalid
 replicorectl member add|remove <node>
 replicorectl resync | pause | resume | bandwidth ...
 
-# two-node + emulated-WAN integration rig (root + sch_netem on host):
-sudo scripts/wan-testbed.sh up | status | down
+# three-node + emulated-WAN integration rig (root + sch_netem on host):
+sudo scripts/wan-testbed.sh up | status | certs | run-a | run-b | run-c | down
+# health endpoint (when health_listen is configured): GET /healthz -> JSON
 ```
 
 ## Conventions
@@ -106,7 +107,13 @@ for the agent's assumptions: the watcher is **best-effort** for writes arriving
 via `nfsd`; the **rescan is authoritative** for NFS-exported shares. Do not weaken
 the rescan path on the assumption that fanotify catches everything.
 
-## Toolchain note
+## Wire/state compatibility notes (M2)
 
-`Cargo.toml` pins `time` and `blake3` only for the older apt `cargo` (Rust 1.75).
-Remove those pins on a current toolchain.
+- Protocol v2 (`replicore/2` ALPN) is a flag-day bump: M1 (v1) peers are
+  refused. Upgrade the whole mesh as a unit.
+- The chunk CAS (`cas_dir`, default `<db>.cas`) is persistent and never GC'd
+  in M2 — SEAM(M3): refcounted GC via `manifest_chunks`. Other seams: grep
+  `SEAM(` (incremental Merkle subtree hashes, relay/forwarding via the Hello
+  frontier map + `peer_cursors`, FID watcher).
+- Reconcile gate: a node never applies a peer's live ops before completing an
+  anti-entropy session with it (`SubscribeOps`). Do not weaken this ordering.

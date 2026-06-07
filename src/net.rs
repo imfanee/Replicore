@@ -345,6 +345,13 @@ impl Engine {
 
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(Some(Duration::from_secs(5)));
+        // WAN tuning (FR-502): quinn's default 1.25 MiB stream window cannot
+        // fill a long-fat pipe (BDP at 150 ms RTT × 100 Mbit ≈ 2 MiB), and
+        // chunk transfers run several streams in parallel. Size the windows
+        // for chunk_max × per-file concurrency with headroom.
+        transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
+        transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+        transport.send_window(64 * 1024 * 1024);
         let transport = Arc::new(transport);
 
         let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -523,6 +530,7 @@ impl Engine {
                 .store
                 .ops_since(self.cfg.node_id, cursor, PUSH_BATCH)
                 .await?;
+            tracing::debug!(cursor, count = ops.len(), "push_ops poll");
             if ops.is_empty() {
                 // Nothing new: sleep until the next local append.
                 if latest.changed().await.is_err() {
@@ -782,8 +790,25 @@ impl Engine {
 
         // Authenticated: make this connection borrowable for multi-source
         // fetch, and guarantee deregistration on every exit path below.
+        //
+        // The registry keeps ONE connection per peer (last insert wins), and
+        // the peer's fetches may arrive on EITHER its inbound connection or
+        // this outbound one — so the dialer side must serve ephemeral
+        // streams too. (Without this, a request stream opened toward a
+        // dialer-only endpoint sits unaccepted forever and wedges the peer's
+        // receive path — found as a 3-node startup race.)
         self.conns.insert(peer.node_id, conn.clone());
+        let serve = tokio::spawn({
+            let engine = self.clone();
+            let conn = conn.clone();
+            async move {
+                if let Err(e) = engine.serve_streams(conn).await {
+                    tracing::debug!(error = %e, "outbound-side serving ended");
+                }
+            }
+        });
         let result = self.subscription_io(&conn, peer, attempt).await;
+        serve.abort();
         self.conns.remove_if_same(&peer.node_id, &conn);
         self.peers_reg
             .set_state(peer.node_id, PeerState::Disconnected);
@@ -895,6 +920,7 @@ impl Engine {
                 match read_msg::<_, Frame>(&mut ctl_recv).await {
                     Ok(Frame::OplogPush(op)) => {
                         let seq = op.origin_seq;
+                        tracing::debug!(seq, "op received");
                         if op.origin != peer.node_id {
                             // Full-mesh peers push only their own ops;
                             // forwarding arrives with the relay policy
@@ -940,6 +966,7 @@ impl Engine {
         }
         let local = self.store.load_file(&op.path).await?;
         let mut decision = decide(local.as_ref(), &op.vv);
+        tracing::debug!(seq = op.origin_seq, ?decision, "op decision");
         if decision == Decision::Apply {
             match self.materialize(conn, &op, local.as_ref()).await {
                 Ok(()) => {}
