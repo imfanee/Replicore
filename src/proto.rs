@@ -13,6 +13,7 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::metadata::Meta;
 use crate::vv::{NodeId, VersionVector};
 
 /// Negotiated in `Hello`; mismatch closes the connection cleanly (FR-504).
@@ -71,8 +72,11 @@ pub struct OpRecord {
     /// Unix permission bits (full metadata fidelity is M3, FR-106).
     pub mode: u32,
     pub size: u64,
-    /// BLAKE3 of the full content; `None` for deletes.
+    /// BLAKE3 of the full content; `None` for deletes. For symlinks: the
+    /// hash of the raw target bytes (the target itself rides in `meta`).
     pub content_hash: Option<[u8; 32]>,
+    /// Full metadata snapshot (FR-106); `None` for deletes.
+    pub meta: Option<Meta>,
     /// Per-file version vector at the time of the op (FR-301).
     pub vv: VersionVector,
 }
@@ -104,7 +108,9 @@ pub enum Frame {
         proto_version: u16,
         node_id: NodeId,
     },
-    OplogPush(OpRecord),
+    // Boxed: OpRecord carries full metadata since v4 and dwarfs the other
+    // variants (bincode encodes Box<T> exactly like T — no wire change).
+    OplogPush(Box<OpRecord>),
     /// Contiguous per-origin ack: every `origin`-origin op with
     /// `origin_seq <= up_to_seq` is durably handled (persisted **before**
     /// this frame is sent — FR-801). In the M2 full mesh `origin` is always
@@ -240,6 +246,7 @@ pub enum ReconcileFrame {
         mode: u32,
         size: u64,
         uuid: Option<[u8; 16]>,
+        meta: Option<Meta>,
     },
     Done,
 }
@@ -322,6 +329,7 @@ mod tests {
             mode: 0o644,
             size: 12345,
             content_hash: Some([9u8; 32]),
+            meta: None,
             vv: [(origin, 3u64)].into_iter().collect(),
         }
     }
@@ -335,13 +343,13 @@ mod tests {
                 node_id: [1u8; 16],
                 resume: vec![([2u8; 16], 17), ([3u8; 16], 0)],
             },
-            Frame::OplogPush(sample_op()),
-            Frame::OplogPush(OpRecord {
+            Frame::OplogPush(Box::new(sample_op())),
+            Frame::OplogPush(Box::new(OpRecord {
                 op_type: OpType::Rename,
                 path: "a/b/d.wav".into(),
                 path_old: Some("a/b/c.wav".into()),
                 ..sample_op()
-            }),
+            })),
             Frame::OplogAck {
                 origin: [2u8; 16],
                 up_to_seq: 42,
@@ -456,6 +464,7 @@ mod tests {
                 mode: 0o644,
                 size: 123,
                 uuid: Some([4u8; 16]),
+                meta: None,
             },
             ReconcileFrame::Done,
         ];

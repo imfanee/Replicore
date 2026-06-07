@@ -200,6 +200,7 @@ impl Node {
                 mode: 0o644,
                 size: data.len() as u64,
                 content_hash: Some(hash),
+                meta: None,
                 manifest: Some(manifest),
             })
             .await

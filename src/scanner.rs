@@ -118,8 +118,9 @@ pub async fn scan_once(
     Ok(stats)
 }
 
-/// Collect every regular file under `root`, skipping our own staging temps.
-/// Symlinks are not followed (M3 fidelity, FR-106).
+/// Collect every replicated node under `root` — regular files, symlinks
+/// (never followed), FIFOs and device nodes — skipping our own staging temps
+/// and sockets (runtime endpoints, not data; FR-106).
 fn walk(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -140,10 +141,18 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, ScanError> {
             })?;
             if ftype.is_dir() {
                 stack.push(path);
-            } else if ftype.is_file() && !is_tmp(&path) {
-                out.push(path);
+            } else if !is_tmp(&path) {
+                use std::os::unix::fs::FileTypeExt;
+                if ftype.is_file()
+                    || ftype.is_symlink()
+                    || ftype.is_fifo()
+                    || ftype.is_char_device()
+                    || ftype.is_block_device()
+                {
+                    out.push(path);
+                }
+                // Sockets: runtime endpoints, never replicated.
             }
-            // Symlinks / special files: skipped until M3 (FR-106).
         }
     }
     Ok(out)
@@ -250,6 +259,7 @@ mod tests {
                 mode: 0o644,
                 size: 1,
                 content_hash: Some(*blake3::hash(b"a").as_bytes()),
+                meta: None,
                 manifest: None,
             })
             .await
@@ -275,6 +285,7 @@ mod tests {
                 mode: 0,
                 size: 0,
                 content_hash: None,
+                meta: None,
                 manifest: None,
             })
             .await

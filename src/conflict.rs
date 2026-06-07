@@ -70,6 +70,7 @@
 //! another conflict resolved by this same machinery — no node-local existence
 //! probe (that input would diverge names across nodes).
 
+use crate::metadata::Meta;
 use crate::state::FileRow;
 use crate::vv::{NodeId, Ord3, VersionVector};
 
@@ -77,10 +78,8 @@ use crate::vv::{NodeId, Ord3, VersionVector};
 /// replicated files; the marker exists for operators and tests, not the engine.
 pub const COPY_MARKER: &str = ".sync-conflict-";
 
-/// Placeholder meta hash until metadata fidelity (M3 phase 3c) wires the real
-/// `meta_hash` through `files`/ops. All-zero on every node, so it cannot break
-/// determinism — it just makes meta a non-discriminating tie level for now.
-pub const META_NONE: [u8; 32] = [0u8; 32];
+/// `meta_hash` for versions without metadata (deletes, pre-v4 rows).
+pub use crate::metadata::META_NONE;
 
 /// A full version descriptor: one candidate in a resolution. Op history rows,
 /// the current `files` row, and reconcile leaves all reduce to this.
@@ -89,8 +88,11 @@ pub struct Version {
     pub tombstone: bool,
     /// `None` only for tombstones (a delete carries no content).
     pub content_hash: Option<[u8; 32]>,
-    /// `META_NONE` until phase 3c supplies real metadata hashes.
+    /// Canonical hash of `meta` ([`META_NONE`] when absent): the third level
+    /// of the winner key, so meta-only conflicts resolve deterministically.
     pub meta_hash: [u8; 32],
+    /// The metadata itself — committed with the row the version wins.
+    pub meta: Option<Meta>,
     pub mode: u32,
     pub size: u64,
     pub vv: VersionVector,
@@ -116,7 +118,8 @@ impl Version {
         Version {
             tombstone: row.tombstone,
             content_hash: row.content_hash,
-            meta_hash: META_NONE,
+            meta_hash: Meta::hash_of(&row.meta),
+            meta: row.meta.clone(),
             mode: row.mode,
             size: row.size,
             vv: row.vv.clone(),
@@ -138,6 +141,7 @@ pub struct PlannedRow {
     pub tombstone: bool,
     pub vv: VersionVector,
     pub uuid: Option<[u8; 16]>,
+    pub meta: Option<Meta>,
 }
 
 /// Copy chains longer than this are refused (`plan_candidates` returns
@@ -223,6 +227,13 @@ pub fn plan_candidates<E>(
         tombstone: winner.tombstone,
         vv,
         uuid,
+        // Equal keys ⇒ equal meta_hash ⇒ identical canonical meta: no
+        // normalization needed beyond the winner's own.
+        meta: if winner.tombstone {
+            None
+        } else {
+            winner.meta.clone()
+        },
     }];
 
     // Losers with content of their own become copies. The antichain is key-
@@ -265,6 +276,7 @@ pub fn plan_candidates<E>(
                     tombstone: false,
                     vv: cvv,
                     uuid: cuuid,
+                    meta: content.meta.clone(),
                 }),
                 Some(existing) => match cvv.compare(&existing.vv) {
                     // Empty-history row only; treat like absent.
@@ -276,6 +288,7 @@ pub fn plan_candidates<E>(
                         tombstone: false,
                         vv: cvv,
                         uuid: cuuid,
+                        meta: content.meta.clone(),
                     }),
                     // Idempotent re-derivation (Equal) or the copy was since
                     // edited by a user (Dominated): the existing row stands.
@@ -308,6 +321,7 @@ pub fn plan_candidates<E>(
                             } else {
                                 w.uuid.or(cuuid)
                             },
+                            meta: w.meta.clone(),
                         });
                         if let Some(lh) = l.content_hash {
                             if w.content_hash != Some(lh) {
@@ -382,6 +396,7 @@ mod tests {
             size: 1,
             vv: v,
             uuid: None,
+            meta: None,
         }
     }
 
@@ -394,6 +409,7 @@ mod tests {
             size: 0,
             vv: v,
             uuid: None,
+            meta: None,
         }
     }
 
@@ -562,6 +578,7 @@ mod tests {
             size: 1,
             vv: copy_vv(&cp),
             uuid: None,
+            meta: None,
         };
         let rows = match plan_candidates::<Infallible>("f", &[lo, hi], &mut |p| {
             Ok((p == cp).then(|| existing.clone()))

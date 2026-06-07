@@ -65,6 +65,7 @@ impl Node {
                 mode: 0o644,
                 size: content.len() as u64,
                 content_hash: Some(manifest.content_hash),
+                meta: None,
                 manifest: Some(manifest),
             })
             .await
@@ -80,6 +81,7 @@ impl Node {
                 mode: 0,
                 size: 0,
                 content_hash: None,
+                meta: None,
                 manifest: None,
             })
             .await
@@ -112,6 +114,7 @@ impl ReconcileTransport for TestTransport<'_> {
             mode: row.mode,
             size: row.size,
             uuid: row.uuid,
+            meta: row.meta.clone(),
         }))
     }
 
@@ -153,6 +156,7 @@ async fn pull(dst: &Node, src: &Node) -> replicore::merkle::ReconcileReport {
         cas: &dst.cas,
         share: &dst.share,
         suppress: &dst.suppress,
+        policy: replicore::metadata::OwnerPolicy::Skip,
     };
     reconcile_pull(&local, &mut transport, &ctx).await.unwrap()
 }
@@ -368,6 +372,7 @@ async fn reconcile_resolves_concurrent_local_write_landing_during_fetch() {
                 mode: row.mode,
                 size: row.size,
                 uuid: row.uuid,
+                meta: row.meta.clone(),
             }))
         }
         async fn ensure_content(
@@ -417,6 +422,7 @@ async fn reconcile_resolves_concurrent_local_write_landing_during_fetch() {
         cas: &b.cas,
         share: &b.share,
         suppress: &b.suppress,
+        policy: replicore::metadata::OwnerPolicy::Skip,
     };
     let report = reconcile_pull(&local_tree, &mut transport, &ctx)
         .await

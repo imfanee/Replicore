@@ -18,6 +18,7 @@ pub mod ingest;
 pub mod join;
 pub mod membership;
 pub mod merkle;
+pub mod metadata;
 pub mod net;
 pub mod oplog;
 pub mod peer;

@@ -40,7 +40,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::apply::{apply_assembled, apply_delete, apply_rename, ApplyError};
+use crate::apply::{apply_delete, apply_meta_only, apply_rename, apply_version, ApplyError};
 use crate::chunk::Cas;
 use crate::config::{Config, Peer};
 use crate::conflict::{PlannedRow, Version, META_NONE};
@@ -51,6 +51,7 @@ use crate::merkle::{
     reconcile_pull, MerkleTree, ReconcileCtx, ReconcileError, ReconcileReport, ReconcileTransport,
     RemoteLeaf,
 };
+use crate::metadata::{FileKind, Meta};
 use crate::oplog::{ResolveOutcome, Store, StoreError};
 use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
@@ -908,7 +909,7 @@ impl Engine {
             }
             for op in ops {
                 cursor = op.origin_seq;
-                write_msg(&mut ctl_send, &Frame::OplogPush(op)).await?;
+                write_msg(&mut ctl_send, &Frame::OplogPush(Box::new(op))).await?;
                 // Publish after the frame is written: an honest ack can only
                 // arrive after the peer received it, i.e. after this store.
                 sent_frontier.store(cursor, Ordering::Release);
@@ -1048,6 +1049,7 @@ impl Engine {
                             mode: row.mode,
                             size: row.size,
                             uuid: row.uuid,
+                            meta: row.meta.clone(),
                         },
                         None => ReconcileFrame::LeafResp {
                             found: false,
@@ -1057,6 +1059,7 @@ impl Engine {
                             mode: 0,
                             size: 0,
                             uuid: None,
+                            meta: None,
                         },
                     };
                     write_msg(&mut send, &resp).await?;
@@ -1372,6 +1375,7 @@ impl Engine {
             loop {
                 match read_msg::<_, Frame>(&mut ctl_recv).await {
                     Ok(Frame::OplogPush(op)) => {
+                        let op = *op;
                         let seq = op.origin_seq;
                         tracing::debug!(seq, "op received");
                         if op.origin != peer.node_id {
@@ -1531,6 +1535,7 @@ impl Engine {
                             tombstone: true,
                             content_hash: None,
                             meta_hash: META_NONE,
+                            meta: None,
                             mode: 0,
                             size: 0,
                             vv: resolved_op.vv.clone(),
@@ -1563,7 +1568,8 @@ impl Engine {
         let remote = Version {
             tombstone: op.op_type == OpType::Delete,
             content_hash: op.content_hash,
-            meta_hash: META_NONE,
+            meta_hash: Meta::hash_of(&op.meta),
+            meta: op.meta.clone(),
             mode: op.mode,
             size: op.size,
             vv: op.vv.clone(),
@@ -1657,16 +1663,50 @@ impl Engine {
             tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
             return Ok(true);
         }
-        let Some(hash) = row.content_hash else {
-            return Err(NetError::Violation("live planned row without hash"));
-        };
         // Already current on disk (e.g. the winner is the local content):
-        // the commit only moves the row's VV.
+        // the commit only moves the row's VV — but metadata may differ.
         if let Some(cur) = self.store.load_row(&row.path).await? {
-            if !cur.tombstone && cur.content_hash == Some(hash) {
+            if !cur.tombstone
+                && cur.content_hash == row.content_hash
+                && Meta::hash_of(&cur.meta) == Meta::hash_of(&row.meta)
+            {
                 return Ok(false);
             }
         }
+        // Symlinks/specials rebuild from the meta; no chunk plane.
+        let kind = row
+            .meta
+            .as_ref()
+            .map(|m| m.kind)
+            .unwrap_or(FileKind::Regular);
+        if kind != FileKind::Regular {
+            let share = self.cfg.share_dir.clone();
+            let rel = row.path.clone();
+            let mode = row.mode;
+            let hash = row.content_hash;
+            let meta = row.meta.clone();
+            let policy = self.cfg.owner_policy;
+            let suppress = self.suppress.clone();
+            let cas = self.cas.clone();
+            tokio::task::spawn_blocking(move || {
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    None,
+                    &cas,
+                    meta.as_ref(),
+                    policy,
+                    &suppress,
+                )
+            })
+            .await??;
+            return Ok(true);
+        }
+        let Some(hash) = row.content_hash else {
+            return Err(NetError::Violation("live planned row without hash"));
+        };
         if row.size > self.cfg.max_file_bytes {
             return Err(NetError::TooBig);
         }
@@ -1719,10 +1759,22 @@ impl Engine {
         let share = self.cfg.share_dir.clone();
         let rel = row.path.clone();
         let mode = row.mode;
+        let meta = row.meta.clone();
+        let policy = self.cfg.owner_policy;
         let suppress = self.suppress.clone();
         let cas = self.cas.clone();
         tokio::task::spawn_blocking(move || {
-            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+            apply_version(
+                &share,
+                &rel,
+                mode,
+                Some(&hash),
+                Some(&manifest),
+                &cas,
+                meta.as_ref(),
+                policy,
+                &suppress,
+            )
         })
         .await??;
         Ok(())
@@ -1754,6 +1806,38 @@ impl Engine {
     ) -> Result<(), NetError> {
         match op.op_type {
             OpType::Write => {
+                // Symlinks and special nodes carry their payload in the
+                // metadata — no chunk plane (FR-106).
+                let kind = op
+                    .meta
+                    .as_ref()
+                    .map(|m| m.kind)
+                    .unwrap_or(FileKind::Regular);
+                if kind != FileKind::Regular {
+                    let share = self.cfg.share_dir.clone();
+                    let rel = op.path.clone();
+                    let mode = op.mode;
+                    let hash = op.content_hash;
+                    let meta = op.meta.clone();
+                    let policy = self.cfg.owner_policy;
+                    let suppress = self.suppress.clone();
+                    let cas = self.cas.clone();
+                    tokio::task::spawn_blocking(move || {
+                        apply_version(
+                            &share,
+                            &rel,
+                            mode,
+                            hash.as_ref(),
+                            None,
+                            &cas,
+                            meta.as_ref(),
+                            policy,
+                            &suppress,
+                        )
+                    })
+                    .await??;
+                    return Ok(());
+                }
                 let hash = op
                     .content_hash
                     .ok_or(NetError::Violation("write op without content hash"))?;
@@ -1779,6 +1863,19 @@ impl Engine {
                     let result = self.fetch_and_assemble(op, hash).await;
                     Stats::gauge_dec(&self.stats.inflight_transfers);
                     result?;
+                } else if let Some(meta) = &op.meta {
+                    // Meta-only op (same bytes, new xattrs/mode/owner/mtime):
+                    // the content stays in place, the metadata applies to it
+                    // (FR-106 — an xattr-only change must replicate).
+                    let share = self.cfg.share_dir.clone();
+                    let rel = op.path.clone();
+                    let meta = meta.clone();
+                    let policy = self.cfg.owner_policy;
+                    let suppress = self.suppress.clone();
+                    tokio::task::spawn_blocking(move || {
+                        apply_meta_only(&share, &rel, Some(&hash), &meta, policy, &suppress)
+                    })
+                    .await??;
                 }
             }
             OpType::Delete => {
@@ -1804,35 +1901,78 @@ impl Engine {
                 let old_local = self.store.load_file(&old_rel).await?;
                 let old_dominated = decide(old_local.as_ref(), &op.vv) == Decision::Apply;
                 let have = local.is_some_and(|l| !l.tombstone && l.content_hash == Some(hash));
+                let kind = op
+                    .meta
+                    .as_ref()
+                    .map(|m| m.kind)
+                    .unwrap_or(FileKind::Regular);
                 if !have {
-                    let moved = if old_dominated {
+                    // rename(2) fast path only for regular files (the
+                    // readback verify follows symlinks); other kinds rebuild
+                    // from the meta below.
+                    let moved = if old_dominated && kind == FileKind::Regular {
                         let share = self.cfg.share_dir.clone();
                         let old = old_rel.clone();
                         let new = op.path.clone();
                         let mode = op.mode;
+                        let meta = op.meta.clone();
+                        let policy = self.cfg.owner_policy;
                         let suppress = self.suppress.clone();
                         tokio::task::spawn_blocking(move || {
-                            apply_rename(&share, &old, &new, mode, &hash, &suppress)
+                            apply_rename(
+                                &share,
+                                &old,
+                                &new,
+                                mode,
+                                &hash,
+                                meta.as_ref(),
+                                policy,
+                                &suppress,
+                            )
                         })
                         .await??
                     } else {
                         false
                     };
                     if !moved {
-                        if op.size > self.cfg.max_file_bytes {
-                            return Err(NetError::TooBig);
+                        if kind != FileKind::Regular {
+                            let share = self.cfg.share_dir.clone();
+                            let rel = op.path.clone();
+                            let mode = op.mode;
+                            let meta = op.meta.clone();
+                            let policy = self.cfg.owner_policy;
+                            let suppress = self.suppress.clone();
+                            let cas = self.cas.clone();
+                            tokio::task::spawn_blocking(move || {
+                                apply_version(
+                                    &share,
+                                    &rel,
+                                    mode,
+                                    Some(&hash),
+                                    None,
+                                    &cas,
+                                    meta.as_ref(),
+                                    policy,
+                                    &suppress,
+                                )
+                            })
+                            .await??;
+                        } else {
+                            if op.size > self.cfg.max_file_bytes {
+                                return Err(NetError::TooBig);
+                            }
+                            self.await_unpaused().await;
+                            let _transfer_permit = self
+                                .transfers
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+                            Stats::gauge_inc(&self.stats.inflight_transfers);
+                            let result = self.fetch_and_assemble(op, hash).await;
+                            Stats::gauge_dec(&self.stats.inflight_transfers);
+                            result?;
                         }
-                        self.await_unpaused().await;
-                        let _transfer_permit = self
-                            .transfers
-                            .clone()
-                            .acquire_owned()
-                            .await
-                            .map_err(|_| NetError::Violation("transfer limiter closed"))?;
-                        Stats::gauge_inc(&self.stats.inflight_transfers);
-                        let result = self.fetch_and_assemble(op, hash).await;
-                        Stats::gauge_dec(&self.stats.inflight_transfers);
-                        result?;
                     }
                 }
                 if old_dominated {
@@ -1873,11 +2013,23 @@ impl Engine {
         let share = self.cfg.share_dir.clone();
         let rel = op.path.clone();
         let mode = op.mode;
+        let meta = op.meta.clone();
+        let policy = self.cfg.owner_policy;
         let suppress = self.suppress.clone();
         let cas = self.cas.clone();
         // fsync-heavy: keep it off the async runtime.
         tokio::task::spawn_blocking(move || {
-            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+            apply_version(
+                &share,
+                &rel,
+                mode,
+                Some(&hash),
+                Some(&manifest),
+                &cas,
+                meta.as_ref(),
+                policy,
+                &suppress,
+            )
         })
         .await??;
         Ok(())
@@ -1929,6 +2081,7 @@ impl Engine {
             cas: &self.cas,
             share: &self.cfg.share_dir,
             suppress: &self.suppress,
+            policy: self.cfg.owner_policy,
         };
         let report = reconcile_pull(&local, &mut transport, &ctx).await?;
         let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
@@ -2057,6 +2210,7 @@ impl ReconcileTransport for QuicReconcile<'_> {
                 mode,
                 size,
                 uuid,
+                meta,
             } => Ok(Some(RemoteLeaf {
                 tombstone,
                 content_hash,
@@ -2064,6 +2218,7 @@ impl ReconcileTransport for QuicReconcile<'_> {
                 mode,
                 size,
                 uuid,
+                meta,
             })),
             _ => Err(ReconcileError::Violation("expected LeafResp")),
         }
@@ -2171,6 +2326,7 @@ mod tests {
             per_file_chunk_concurrency: 4,
             max_concurrent_transfers: 4,
             serve_concurrency: 8,
+            owner_policy: crate::metadata::OwnerPolicy::Skip,
         }
     }
 
@@ -2208,6 +2364,7 @@ mod tests {
                 mode: 0o644,
                 size: data.len() as u64,
                 content_hash: Some(hash),
+                meta: None,
                 manifest: Some(manifest),
             })
             .await

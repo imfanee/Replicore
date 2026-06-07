@@ -272,19 +272,38 @@ pub fn assemble_from_cas(
     cas: &Cas,
     out: &mut std::fs::File,
 ) -> Result<[u8; 32], CasError> {
+    use std::io::Seek;
+    let io = |ctx: &'static str| {
+        move |e| CasError::Io {
+            ctx,
+            path: PathBuf::from("<assembly>"),
+            source: e,
+        }
+    };
     let mut whole = blake3::Hasher::new();
+    let mut offset: u64 = 0;
     for entry in &manifest.chunks {
         let bytes = cas.read(&entry.hash)?;
         if bytes.len() as u32 != entry.len {
             return Err(CasError::HashMismatch); // structure lied about length
         }
-        out.write_all(&bytes).map_err(|e| CasError::Io {
-            ctx: "write",
-            path: PathBuf::from("<assembly>"),
-            source: e,
-        })?;
+        // Sparse files stay sparse (FR-106): an all-zero chunk becomes a
+        // hole — seek over it instead of writing zeros. The whole-file hash
+        // still covers the zeros (holes read back as zeros), so the verify
+        // discipline is unchanged.
+        if bytes.iter().all(|&b| b == 0) {
+            offset += bytes.len() as u64;
+            out.seek(std::io::SeekFrom::Start(offset))
+                .map_err(io("seek"))?;
+        } else {
+            out.write_all(&bytes).map_err(io("write"))?;
+            offset += bytes.len() as u64;
+        }
         whole.update(&bytes);
     }
+    // Realize a trailing hole: without this, a file ending in zeros would
+    // come out short.
+    out.set_len(offset).map_err(io("truncate"))?;
     Ok(*whole.finalize().as_bytes())
 }
 

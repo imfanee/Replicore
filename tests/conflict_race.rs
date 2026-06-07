@@ -27,6 +27,7 @@ fn write_change(path: &str, hash: [u8; 32]) -> LocalChange {
         mode: 0o644,
         size: 8,
         content_hash: Some(hash),
+        meta: None,
         manifest: None,
     }
 }
@@ -43,6 +44,7 @@ fn remote_op(path: &str, hash: [u8; 32]) -> OpRecord {
         mode: 0o644,
         size: 8,
         content_hash: Some(hash),
+        meta: None,
         vv: [(NODE_B, 1u64)].into_iter().collect(),
     }
 }
@@ -56,6 +58,7 @@ fn op_version(op: &OpRecord) -> replicore::conflict::Version {
         size: op.size,
         vv: op.vv.clone(),
         uuid: op.uuid,
+        meta: op.meta.clone(),
     }
 }
 
@@ -196,6 +199,7 @@ async fn resolution_superseded_by_a_dominating_row_is_refused() {
             vv: merged_vv.clone(),
             tombstone: false,
             uuid: None,
+            meta: None,
         })
         .await
         .unwrap();

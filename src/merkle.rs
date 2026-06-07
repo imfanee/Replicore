@@ -1,10 +1,11 @@
 //! merkle.rs — Merkle-tree anti-entropy (FR-701/702/703).
 //!
-//! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ vv)` — metadata
-//! beyond the tombstone flag is deliberately EXCLUDED (mode/size fidelity is
-//! M3; hashing fields we do not reconcile would make trees differ forever).
-//! Directory nodes hash their sorted children. Two replicas in the same
-//! causal state therefore have identical roots, tombstones included.
+//! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ uuid ‖ meta_hash
+//! ‖ vv)` (the v4 formula — identity and full metadata are reconciled state
+//! as of M3/FR-106; `mode`/`size` ride the rows but stay out of the hash, as
+//! they are summaries of `meta`/content). Directory nodes hash their sorted
+//! children. Two replicas in the same causal state have identical roots,
+//! tombstones included.
 //!
 //! The tree is built per session from the `files` index (db rows only — no
 //! file I/O), O(files) locally; **network descent is O(differences)**: a
@@ -30,11 +31,13 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::apply::{apply_delete, apply_version, ApplyError};
 use crate::chunk::{Cas, Manifest};
-use crate::conflict::{PlannedRow, Version, META_NONE};
+use crate::conflict::PlannedRow;
+use crate::conflict::Version;
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
+use crate::metadata::{Meta, OwnerPolicy};
 use crate::oplog::{ReconciledRow, ResolveOutcome, Store, StoreError};
 use crate::proto::{ProtoError, WireChild};
 use crate::state::FileRow;
@@ -72,13 +75,18 @@ fn leaf_error_is_skippable(e: &ReconcileError) -> bool {
     }
 }
 
-/// Merkle leaf hash. Pure; field-sensitivity is unit-tested.
+/// Merkle leaf hash (v4 formula). Pure; field-sensitivity is unit-tested.
+/// Identity and metadata joined the leaf in M3 — they are reconciled state
+/// now, so differing uuid/meta MUST make trees differ (FR-106: a metadata-
+/// only divergence heals through anti-entropy like any other).
 pub fn leaf_hash(row: &FileRow) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(row.path.as_bytes());
     h.update(&[0x00]);
     h.update(&[row.tombstone as u8]);
     h.update(row.content_hash.as_ref().unwrap_or(&[0u8; 32]));
+    h.update(row.uuid.as_ref().unwrap_or(&[0u8; 16]));
+    h.update(&Meta::hash_of(&row.meta));
     // BTreeMap-backed VV: bincode encoding is deterministic.
     if let Ok(vv) = bincode::serialize(&row.vv) {
         h.update(&vv);
@@ -222,6 +230,7 @@ pub struct RemoteLeaf {
     pub mode: u32,
     pub size: u64,
     pub uuid: Option<[u8; 16]>,
+    pub meta: Option<Meta>,
 }
 
 /// Session transport, abstracted so the convergence property test can drive
@@ -248,6 +257,8 @@ pub struct ReconcileCtx<'a> {
     pub cas: &'a Cas,
     pub share: &'a Path,
     pub suppress: &'a Suppressor,
+    /// Ownership apply policy (FR-106) — uniform mesh-wide.
+    pub policy: OwnerPolicy,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -392,7 +403,8 @@ async fn resolve_concurrent_leaf<T: ReconcileTransport>(
     let rv = Version {
         tombstone: rleaf.tombstone,
         content_hash: rleaf.content_hash,
-        meta_hash: META_NONE,
+        meta_hash: Meta::hash_of(&rleaf.meta),
+        meta: rleaf.meta.clone(),
         mode: rleaf.mode,
         size: rleaf.size,
         vv: rleaf.vv.clone(),
@@ -462,34 +474,57 @@ async fn stage_planned_row<T: ReconcileTransport>(
         tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
         return Ok(true);
     }
-    let Some(hash) = row.content_hash else {
-        return Err(ReconcileError::Violation("live planned row without hash"));
-    };
     // Already current on disk (e.g. the winner is the local content): the
-    // commit only moves the row's VV.
+    // commit only moves the row's VV — but metadata may still differ.
+    let meta_kind_regular = row
+        .meta
+        .as_ref()
+        .map(|m| m.kind == crate::metadata::FileKind::Regular)
+        .unwrap_or(true);
     if let Some(cur) = ctx.store.load_row(&row.path).await? {
-        if !cur.tombstone && cur.content_hash == Some(hash) {
+        if !cur.tombstone
+            && cur.content_hash == row.content_hash
+            && Meta::hash_of(&cur.meta) == Meta::hash_of(&row.meta)
+        {
             return Ok(false);
         }
     }
-    let manifest = match ctx.store.manifest_for(hash).await? {
-        Some(m) => m,
-        None => {
-            let m = remote.ensure_content(hash, ctx.cas).await?;
-            // Persist the structure: a committed copy row must be SERVABLE
-            // (peers pull copy rows via reconcile — that is how copies reach
-            // nodes that never witnessed the conflict). Idempotent.
-            ctx.store.put_manifest(m.clone()).await?;
-            m
-        }
+    // Regular content needs its manifest (and possibly a fetch); symlinks
+    // and special nodes build from the meta alone.
+    let manifest = match (row.content_hash, meta_kind_regular) {
+        (Some(hash), true) => Some(match ctx.store.manifest_for(hash).await? {
+            Some(m) => m,
+            None => {
+                let m = remote.ensure_content(hash, ctx.cas).await?;
+                // Persist the structure: a committed copy row must be
+                // SERVABLE (peers pull copy rows via reconcile — that is how
+                // copies reach nodes that never witnessed the conflict).
+                ctx.store.put_manifest(m.clone()).await?;
+                m
+            }
+        }),
+        _ => None,
     };
     let share = ctx.share.to_path_buf();
     let rel = row.path.clone();
     let mode = row.mode;
+    let hash = row.content_hash;
+    let meta = row.meta.clone();
+    let policy = ctx.policy;
     let suppress = ctx.suppress.clone();
     let cas = ctx.cas.clone();
     tokio::task::spawn_blocking(move || {
-        apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+        apply_version(
+            &share,
+            &rel,
+            mode,
+            hash.as_ref(),
+            manifest.as_ref(),
+            &cas,
+            meta.as_ref(),
+            policy,
+            &suppress,
+        )
     })
     .await??;
     Ok(true)
@@ -525,21 +560,45 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
                 vv: rleaf.vv.clone(),
                 tombstone: true,
                 uuid: rleaf.uuid,
+                meta: None,
             })
             .await?;
     } else {
-        let hash = rleaf
-            .content_hash
-            .ok_or(ReconcileError::Violation("live leaf without content hash"))?;
-        let manifest = remote.ensure_content(hash, ctx.cas).await?;
+        let regular = rleaf
+            .meta
+            .as_ref()
+            .map(|m| m.kind == crate::metadata::FileKind::Regular)
+            .unwrap_or(true);
+        let manifest = match (rleaf.content_hash, regular) {
+            (Some(hash), true) => Some(remote.ensure_content(hash, ctx.cas).await?),
+            (None, true) => {
+                return Err(ReconcileError::Violation(
+                    "regular leaf without content hash",
+                ))
+            }
+            _ => None, // symlink/special: payload rides in the meta
+        };
         {
             let share = ctx.share.to_path_buf();
             let rel = path.to_string();
             let mode = rleaf.mode;
+            let hash = rleaf.content_hash;
+            let meta = rleaf.meta.clone();
+            let policy = ctx.policy;
             let suppress = ctx.suppress.clone();
             let cas = ctx.cas.clone();
             tokio::task::spawn_blocking(move || {
-                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    manifest.as_ref(),
+                    &cas,
+                    meta.as_ref(),
+                    policy,
+                    &suppress,
+                )
             })
             .await??;
         }
@@ -547,12 +606,13 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
             .store
             .reconcile_upsert(ReconciledRow {
                 path: path.to_string(),
-                content_hash: Some(hash),
+                content_hash: rleaf.content_hash,
                 mode: rleaf.mode,
                 size: rleaf.size,
                 vv: rleaf.vv.clone(),
                 tombstone: false,
                 uuid: rleaf.uuid,
+                meta: rleaf.meta.clone(),
             })
             .await?;
     }
@@ -592,7 +652,7 @@ pub(crate) async fn restore_local_content(
     suppress: &Suppressor,
     path: &str,
 ) {
-    let row = match store.load_file(path).await {
+    let row = match store.load_row(path).await {
         Ok(row) => row,
         Err(e) => {
             tracing::error!(path, error = %e, "restore: cannot load local row");
@@ -601,28 +661,51 @@ pub(crate) async fn restore_local_content(
     };
     match row {
         Some(local) if !local.tombstone => {
-            let Some(hash) = local.content_hash else {
-                tracing::error!(path, "restore: live row without content hash");
-                return;
-            };
-            let manifest = match store.manifest_for(hash).await {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    tracing::error!(path, "restore: local manifest missing; scanner will heal");
+            let regular = local
+                .meta
+                .as_ref()
+                .map(|m| m.kind == crate::metadata::FileKind::Regular)
+                .unwrap_or(true);
+            let manifest = match (local.content_hash, regular) {
+                (Some(hash), true) => match store.manifest_for(hash).await {
+                    Ok(Some(m)) => Some(m),
+                    Ok(None) => {
+                        tracing::error!(path, "restore: local manifest missing; scanner will heal");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(path, error = %e, "restore: manifest lookup failed");
+                        return;
+                    }
+                },
+                (None, true) => {
+                    tracing::error!(path, "restore: live row without content hash");
                     return;
                 }
-                Err(e) => {
-                    tracing::error!(path, error = %e, "restore: manifest lookup failed");
-                    return;
-                }
+                _ => None, // symlink/special rebuild from the meta
             };
             let share = share.to_path_buf();
             let rel = path.to_string();
             let mode = local.mode;
+            let hash = local.content_hash;
+            let meta = local.meta.clone();
             let suppress = suppress.clone();
             let cas = cas.clone();
             let result = tokio::task::spawn_blocking(move || {
-                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    manifest.as_ref(),
+                    &cas,
+                    meta.as_ref(),
+                    // Restore is repair of OUR OWN disk from OUR row: numeric
+                    // is always faithful here (the row's meta was captured or
+                    // applied under the mesh policy already).
+                    OwnerPolicy::Numeric,
+                    &suppress,
+                )
             })
             .await;
             match result {
@@ -668,6 +751,7 @@ mod tests {
             tombstone,
             vv: [(nid(1), vva)].into_iter().collect(),
             uuid: None,
+            meta: None,
         }
     }
 
@@ -687,7 +771,25 @@ mod tests {
         let mut other = base.clone();
         other.vv = [(nid(1), 2u64)].into_iter().collect();
         assert_ne!(leaf_hash(&base), leaf_hash(&other));
-        // Mode/size are NOT hashed (M3 fidelity — no reconcile flap).
+        // v4: identity and metadata ARE reconciled state — they hash.
+        let mut other = base.clone();
+        other.uuid = Some([7u8; 16]);
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        let mut other = base.clone();
+        other.meta = Some(crate::metadata::Meta {
+            kind: crate::metadata::FileKind::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_s: 1,
+            mtime_ns: 0,
+            symlink_target: None,
+            rdev: 0,
+            xattrs: vec![],
+        });
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        // Mode/size columns are NOT hashed (they are summaries of meta and
+        // content; hashing them too would double-count and flap).
         let mut other = base.clone();
         other.mode = 0o600;
         other.size = 999;

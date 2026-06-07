@@ -14,6 +14,7 @@ use std::path::Path;
 
 use replicore::apply::{apply_delete, apply_write};
 use replicore::decide::{decide, Decision};
+use replicore::metadata::OwnerPolicy;
 use replicore::oplog::Store;
 use replicore::proto::{op_id, OpRecord, OpType};
 use replicore::suppress::Suppressor;
@@ -34,6 +35,7 @@ fn remote_write(seq: i64, path: &str, data: &[u8], vv_b: u64) -> OpRecord {
         mode: 0o644,
         size: data.len() as u64,
         content_hash: Some(*blake3::hash(data).as_bytes()),
+        meta: None,
         vv: [(NODE_B, vv_b)].into_iter().collect(),
     }
 }
@@ -51,7 +53,17 @@ async fn deliver_write(store: &Store, share: &Path, op: &OpRecord, data: &[u8]) 
     if decision == Decision::Apply {
         let hash = op.content_hash.expect("write op carries a hash");
         let suppress = Suppressor::new();
-        apply_write(share, &op.path, op.mode, &hash, data, &suppress).unwrap();
+        apply_write(
+            share,
+            &op.path,
+            op.mode,
+            &hash,
+            data,
+            None,
+            OwnerPolicy::Skip,
+            &suppress,
+        )
+        .unwrap();
     }
     // Step 6: the durability point.
     store.apply_remote(op.clone(), decision).await.unwrap();
@@ -81,6 +93,8 @@ async fn crash_between_rename_and_commit_recovers_exactly_once() {
             op.mode,
             &op.content_hash.unwrap(),
             data,
+            None,
+            OwnerPolicy::Skip,
             &suppress,
         )
         .unwrap();
@@ -156,6 +170,7 @@ async fn crash_between_assemble_and_commit_resumes_from_cas() {
         mode: 0o644,
         size: data.len() as u64,
         content_hash: Some(manifest.content_hash),
+        meta: None,
         vv: [(NODE_B, 1u64)].into_iter().collect(),
     };
 
@@ -172,6 +187,8 @@ async fn crash_between_assemble_and_commit_resumes_from_cas() {
             &manifest.content_hash,
             &manifest,
             &cas,
+            None,
+            OwnerPolicy::Skip,
             &suppress,
         )
         .unwrap();
@@ -205,6 +222,8 @@ async fn crash_between_assemble_and_commit_resumes_from_cas() {
         &manifest.content_hash,
         &recovered,
         &cas,
+        None,
+        OwnerPolicy::Skip,
         &suppress,
     )
     .unwrap();
@@ -241,6 +260,7 @@ async fn crash_between_unlink_and_commit_recovers_tombstone() {
         mode: 0o644,
         size: 0,
         content_hash: None,
+        meta: None,
         vv: [(NODE_B, 2u64)].into_iter().collect(),
     };
 

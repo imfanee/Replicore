@@ -44,7 +44,8 @@ fn op_version(op: &OpRecord) -> Version {
     Version {
         tombstone: op.op_type == OpType::Delete,
         content_hash: op.content_hash,
-        meta_hash: META_NONE,
+        meta_hash: crate::metadata::Meta::hash_of(&op.meta),
+        meta: op.meta.clone(),
         mode: op.mode,
         size: op.size,
         vv: op.vv.clone(),
@@ -58,6 +59,7 @@ fn rename_source_version(op: &OpRecord) -> Version {
         tombstone: true,
         content_hash: None,
         meta_hash: META_NONE,
+        meta: None,
         mode: 0,
         size: 0,
         vv: op.vv.clone(),
@@ -98,6 +100,7 @@ impl Replica {
                 mode: 0o644,
                 size: content.len() as u64,
                 content_hash: Some(hash),
+                meta: None,
                 manifest: None,
             })
             .await
@@ -113,6 +116,7 @@ impl Replica {
                 mode: 0o644,
                 size: 0,
                 content_hash: None,
+                meta: None,
                 manifest: None,
             })
             .await
@@ -279,6 +283,7 @@ impl Replica {
                             vv: r.vv.clone(),
                             tombstone: r.tombstone,
                             uuid: r.uuid,
+                            meta: r.meta.clone(),
                         })
                         .await?;
                     if effective == Decision::Apply {

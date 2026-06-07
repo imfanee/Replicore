@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::chunk::Manifest;
 use crate::conflict::{self, PlannedRow, Version};
 use crate::decide::{decide, Decision, LocalFile};
+use crate::metadata::Meta;
 use crate::proto::{op_id, OpRecord, OpType};
 use crate::state::{self, FileRow, LiveFile};
 use crate::vv::NodeId;
@@ -46,6 +47,8 @@ pub struct LocalChange {
     pub size: u64,
     /// BLAKE3 of the new content; `None` for deletes.
     pub content_hash: Option<[u8; 32]>,
+    /// Full metadata snapshot (FR-106); `None` for deletes.
+    pub meta: Option<Meta>,
     /// Chunk manifest built while hashing (FR-402); persisted in the SAME
     /// transaction as the op so a local op and its manifest are atomically
     /// durable. `None` for deletes.
@@ -68,6 +71,8 @@ pub struct ReconciledRow {
     pub tombstone: bool,
     /// File identity (FR-205), carried by the leaf.
     pub uuid: Option<[u8; 16]>,
+    /// Full metadata snapshot (FR-106), carried by the leaf.
+    pub meta: Option<Meta>,
 }
 
 /// Outcome of a [`Store::resolve_rows`] attempt — the conflict-path analogue
@@ -237,7 +242,8 @@ impl Store {
                mode         INTEGER NOT NULL,
                size         INTEGER NOT NULL,
                content_hash BLOB,
-               vv           BLOB NOT NULL
+               vv           BLOB NOT NULL,
+               meta         BLOB             -- canonical metadata (FR-106)
              );
              CREATE INDEX IF NOT EXISTS oplog_origin ON oplog(origin, origin_seq);
              -- Conflict resolution derives from the path's op history (the
@@ -250,7 +256,8 @@ impl Store {
                size         INTEGER NOT NULL,
                vv           BLOB NOT NULL,
                tombstone    INTEGER NOT NULL DEFAULT 0,
-               uuid         BLOB             -- file identity (FR-205)
+               uuid         BLOB,            -- file identity (FR-205)
+               meta         BLOB             -- canonical metadata (FR-106)
              );
              CREATE TABLE IF NOT EXISTS peers (
                node_id        BLOB PRIMARY KEY,
@@ -296,7 +303,9 @@ impl Store {
         for (table, column, decl) in [
             ("oplog", "path_old", "TEXT"),
             ("oplog", "uuid", "BLOB"),
+            ("oplog", "meta", "BLOB"),
             ("files", "uuid", "BLOB"),
+            ("files", "meta", "BLOB"),
         ] {
             if !has_column(&conn, table, column)? {
                 conn.execute(
@@ -782,8 +791,9 @@ fn op_type_from_i64(v: i64) -> Result<OpType, StoreError> {
 fn insert_op(conn: &Connection, op: &OpRecord) -> Result<(), StoreError> {
     conn.execute(
         "INSERT OR IGNORE INTO oplog
-           (op_id, origin, origin_seq, op_type, path, path_old, uuid, mode, size, content_hash, vv)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+           (op_id, origin, origin_seq, op_type, path, path_old, uuid, mode, size, content_hash,
+            vv, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             op.op_id.as_slice(),
             op.origin.as_slice(),
@@ -796,6 +806,7 @@ fn insert_op(conn: &Connection, op: &OpRecord) -> Result<(), StoreError> {
             op.size as i64,
             op.content_hash.as_ref().map(|h| h.as_slice()),
             state::encode_vv(&op.vv)?,
+            state::encode_meta(op.meta.as_ref())?,
         ],
     )?;
     Ok(())
@@ -828,7 +839,13 @@ fn append_local(
     match change.op_type {
         OpType::Write => {
             if let Some(l) = &local {
-                if !l.tombstone && l.content_hash == change.content_hash {
+                // A meta-only change (same bytes, different xattrs/mode/
+                // owner/mtime) still emits an op (FR-106) — only a full
+                // content+meta match is a causal no-op.
+                if !l.tombstone
+                    && l.content_hash == change.content_hash
+                    && Meta::hash_of(&l.meta) == Meta::hash_of(&change.meta)
+                {
                     return Ok(None);
                 }
             }
@@ -865,6 +882,7 @@ fn append_local(
         mode: change.mode,
         size: change.size,
         content_hash: change.content_hash,
+        meta: change.meta.clone(),
         vv: vv.clone(),
     };
     insert_op(&tx, &op)?;
@@ -878,6 +896,7 @@ fn append_local(
         &vv,
         tombstone,
         uuid.as_ref(),
+        change.meta.as_ref(),
     )?;
     // The op and the manifest describing its content are atomically durable
     // together (FR-402: we must be able to serve chunks for our own ops).
@@ -939,12 +958,13 @@ fn append_local_rename(
         mode: src.mode,
         size: src.size,
         content_hash: src.content_hash,
+        meta: src.meta.clone(),
         vv: vv.clone(),
     };
     insert_op(&tx, &op)?;
     // Both path-effects in the one transaction: tombstone the source,
     // continue the file at the target.
-    state::upsert_file(&tx, old_path, None, 0, 0, &vv, true, Some(&uuid))?;
+    state::upsert_file(&tx, old_path, None, 0, 0, &vv, true, Some(&uuid), None)?;
     state::upsert_file(
         &tx,
         new_path,
@@ -954,6 +974,7 @@ fn append_local_rename(
         &vv,
         false,
         Some(&uuid),
+        src.meta.as_ref(),
     )?;
     tx.commit()?;
     Ok(Some(op))
@@ -1005,6 +1026,7 @@ fn apply_remote(
                         &vv,
                         false,
                         op.uuid.as_ref(),
+                        op.meta.as_ref(),
                     )?,
                     // Tombstone, never a hard delete (FR-204).
                     OpType::Delete => state::upsert_file(
@@ -1016,6 +1038,7 @@ fn apply_remote(
                         &vv,
                         true,
                         op.uuid.as_ref(),
+                        None,
                     )?,
                 }
             }
@@ -1031,7 +1054,17 @@ fn apply_remote(
                 if decide(old_local.as_ref(), &op.vv) == Decision::Apply {
                     let mut vv = old_local.map(|l| l.vv).unwrap_or_default();
                     vv.merge(&op.vv);
-                    state::upsert_file(&tx, old_path, None, 0, 0, &vv, true, op.uuid.as_ref())?;
+                    state::upsert_file(
+                        &tx,
+                        old_path,
+                        None,
+                        0,
+                        0,
+                        &vv,
+                        true,
+                        op.uuid.as_ref(),
+                        None,
+                    )?;
                 }
             } else {
                 return Err(StoreError::Corrupt("rename op without path_old"));
@@ -1081,7 +1114,7 @@ fn ops_since(
 ) -> Result<Vec<OpRecord>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT op_id, origin, origin_seq, op_type, path, path_old, uuid, mode, size,
-                content_hash, vv
+                content_hash, vv, meta
          FROM oplog WHERE origin = ?1 AND origin_seq > ?2
          ORDER BY origin_seq ASC LIMIT ?3",
     )?;
@@ -1098,6 +1131,7 @@ fn ops_since(
             row.get::<_, i64>(8)?,
             row.get::<_, Option<Vec<u8>>>(9)?,
             row.get::<_, Vec<u8>>(10)?,
+            row.get::<_, Option<Vec<u8>>>(11)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -1114,6 +1148,7 @@ fn ops_since(
             size,
             hash,
             vv_blob,
+            meta,
         ) = row?;
         out.push(OpRecord {
             op_id: op_id_b
@@ -1137,6 +1172,7 @@ fn ops_since(
                         .map_err(|_| StoreError::Corrupt("oplog.content_hash"))
                 })
                 .transpose()?,
+            meta: state::decode_meta(meta)?,
             vv: state::decode_vv(&vv_blob)?,
         });
     }
@@ -1209,6 +1245,7 @@ fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decisi
             &vv,
             row.tombstone,
             row.uuid.as_ref(),
+            row.meta.as_ref(),
         )?;
     }
     tx.commit()?;
@@ -1221,7 +1258,7 @@ fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decisi
 /// is a write-shaped candidate; as the source it is a tombstone-shaped one.
 fn ops_as_candidates(conn: &Connection, path: &str) -> Result<Vec<Version>, StoreError> {
     let mut stmt = conn.prepare_cached(
-        "SELECT op_type, mode, size, content_hash, vv, uuid, path
+        "SELECT op_type, mode, size, content_hash, vv, uuid, path, meta
          FROM oplog WHERE path = ?1 OR path_old = ?1",
     )?;
     let rows = stmt.query_map([path], |row| {
@@ -1233,15 +1270,21 @@ fn ops_as_candidates(conn: &Connection, path: &str) -> Result<Vec<Version>, Stor
             row.get::<_, Vec<u8>>(4)?,
             row.get::<_, Option<Vec<u8>>>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (op_type, mode, size, hash, vv_blob, uuid, op_path) = row?;
+        let (op_type, mode, size, hash, vv_blob, uuid, op_path, meta) = row?;
         let op_type = op_type_from_i64(op_type)?;
         // A rename matched via path_old contributes its SOURCE effect here.
         let as_source = op_type == OpType::Rename && op_path != path;
         let tombstone = op_type == OpType::Delete || as_source;
+        let meta = if tombstone {
+            None
+        } else {
+            state::decode_meta(meta)?
+        };
         out.push(Version {
             tombstone,
             content_hash: if tombstone {
@@ -1253,7 +1296,8 @@ fn ops_as_candidates(conn: &Connection, path: &str) -> Result<Vec<Version>, Stor
                 })
                 .transpose()?
             },
-            meta_hash: conflict::META_NONE,
+            meta_hash: Meta::hash_of(&meta),
+            meta,
             mode: if tombstone { 0 } else { mode as u32 },
             size: if tombstone { 0 } else { size as u64 },
             vv: state::decode_vv(&vv_blob)?,
@@ -1337,6 +1381,7 @@ fn resolve_rows(
             &row.vv,
             row.tombstone,
             row.uuid.as_ref(),
+            row.meta.as_ref(),
         )?;
     }
     tx.commit()?;
@@ -1422,6 +1467,7 @@ mod tests {
             mode: 0o644,
             size: 3,
             content_hash: Some(hash),
+            meta: None,
             manifest: None,
         }
     }
@@ -1433,6 +1479,7 @@ mod tests {
             mode: 0o644,
             size: 0,
             content_hash: None,
+            meta: None,
             manifest: None,
         }
     }
@@ -1520,6 +1567,7 @@ mod tests {
             mode: 0o600,
             size: 5,
             content_hash: Some([7; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store
@@ -1560,6 +1608,7 @@ mod tests {
             mode: 0o644,
             size: 1,
             content_hash: Some([2; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(), // concurrent with ours
         };
         store
@@ -1596,6 +1645,7 @@ mod tests {
             mode: 0o644,
             size: 1,
             content_hash: Some([9; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store.apply_remote(remote, Decision::Apply).await.unwrap();
@@ -1712,6 +1762,7 @@ mod tests {
             vv: [(NODE_B, 2u64)].into_iter().collect(),
             tombstone: false,
             uuid: None,
+            meta: None,
         };
         assert_eq!(
             store.reconcile_upsert(row.clone()).await.unwrap(),
@@ -1790,6 +1841,7 @@ mod tests {
             mode: 0o644,
             size: 8,
             content_hash: Some([0xbb; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         let stale_local = store.load_file("race/p").await.unwrap();
@@ -1876,6 +1928,7 @@ mod tests {
             mode: 0o644,
             size: 1,
             content_hash: Some([3; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store.apply_remote(remote, Decision::Apply).await.unwrap();

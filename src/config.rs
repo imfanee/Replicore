@@ -54,6 +54,8 @@ pub enum ConfigError {
     BadAdminPubkey(String),
     #[error("set either [[peers]] or [[seed_peers]], not both (they are aliases)")]
     PeersAndSeedPeers,
+    #[error("{0}")]
+    Invalid(String),
 }
 
 /// Validated runtime configuration.
@@ -103,6 +105,11 @@ pub struct Config {
     pub max_concurrent_transfers: usize,
     /// Concurrent serve streams we grant each peer connection (FR-1106).
     pub serve_concurrency: usize,
+    /// Ownership replication policy (FR-106). MUST be uniform across the
+    /// mesh — it changes what metadata captures record, hence every meta
+    /// hash. `numeric` (default) replicates uid/gid and needs CAP_CHOWN;
+    /// `skip` leaves files owned by the daemon.
+    pub owner_policy: crate::metadata::OwnerPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +165,8 @@ struct RawConfig {
     max_concurrent_transfers: usize,
     #[serde(default = "default_serve_concurrency")]
     serve_concurrency: usize,
+    #[serde(default = "default_owner_policy")]
+    owner_policy: String,
 }
 
 #[derive(Deserialize)]
@@ -201,6 +210,10 @@ fn default_per_file_chunk_concurrency() -> usize {
 fn default_max_concurrent_transfers() -> usize {
     8
 }
+fn default_owner_policy() -> String {
+    "numeric".into()
+}
+
 fn default_serve_concurrency() -> usize {
     16
 }
@@ -305,6 +318,15 @@ impl Config {
             per_file_chunk_concurrency: raw.per_file_chunk_concurrency,
             max_concurrent_transfers: raw.max_concurrent_transfers,
             serve_concurrency: raw.serve_concurrency,
+            owner_policy: match raw.owner_policy.as_str() {
+                "numeric" => crate::metadata::OwnerPolicy::Numeric,
+                "skip" => crate::metadata::OwnerPolicy::Skip,
+                other => {
+                    return Err(ConfigError::Invalid(format!(
+                        "owner_policy must be \"numeric\" or \"skip\", got \"{other}\""
+                    )))
+                }
+            },
         })
     }
 

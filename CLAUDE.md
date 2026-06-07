@@ -141,3 +141,34 @@ the rescan path on the assumption that fanotify catches everything.
   fans out today); removed-node data disposition, FR-1308 (data is RETAINED;
   drop policy deferred); reload applies only the hot peer/trust view —
   everything else is honestly restart-required.
+
+## Wire/state compatibility notes (M3)
+
+- Protocol v4 (`replicore/4` ALPN) is a flag-day bump over v3: `OpRecord`
+  gains `uuid` (FR-205) / `path_old` + `OpType::Rename` / `meta` (FR-106);
+  `LeafResp` carries uuid + meta; the Merkle leaf is
+  `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ uuid ‖ meta_hash ‖ vv)`.
+  Upgrade the whole mesh as a unit. DB columns migrate at open (PRAGMA-guarded
+  ALTERs); pre-v4 rows get uuids minted as a pure function of the PATH (must
+  agree across nodes). First post-upgrade scans backfill meta and emit a
+  one-time wave of meta-only ops — expected and convergent.
+- **Conflict resolution derives from the antichain, never a pair.** Winner =
+  `max(kind_rank, content_hash, meta_hash)` over the maximal antichain of the
+  path's op history (`resolve_rows`); pairwise row-vs-op contests are
+  provably non-confluent — do not reintroduce them. Copies are derived
+  locally (never emitted as ops), named by losing content, with the synthetic
+  `{blake3("replicore-conflict"‖copy_path)[..16]: 1}` VV. Resolution and copy
+  staging route through `resolve_rows`'s re-validated committing transaction;
+  `tests/write_path_gate.rs` greps that no other path writes `files`.
+- **The no-storm law for metadata**: every field in `metadata::Meta` must be
+  node-independent or applied verbatim — a captured field the apply cannot
+  reproduce re-emits forever. `owner_policy` must be uniform across the mesh.
+  Apply order (FR-804): content → xattrs → owner → mode → mtime, on the
+  staged temp, before the publishing rename.
+- Renames are identity-lite (user decision): ONE op, two path-effects,
+  lineage continues at the target; a concurrent write to the source
+  resurrects it (modify wins). Cross-path write redirect is
+  SEAM(M4): rename redirect.
+- M3 SEAMs (grep `SEAM(`): hardlinks-as-links (storm-free leader-election
+  design sketched in metadata.rs), directory metadata / default ACLs on dirs
+  (rides the dir-lifecycle seam), per-share encryption (FR-1004, deferred).

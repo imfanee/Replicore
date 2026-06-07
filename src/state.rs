@@ -13,6 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::chunk::Manifest;
 use crate::decide::LocalFile;
+use crate::metadata::Meta;
 use crate::oplog::StoreError;
 use crate::proto::ChunkEntry;
 use crate::vv::VersionVector;
@@ -77,12 +78,14 @@ pub(crate) fn upsert_file(
     vv: &VersionVector,
     tombstone: bool,
     uuid: Option<&[u8; 16]>,
+    meta: Option<&Meta>,
 ) -> Result<(), StoreError> {
     conn.execute(
-        "INSERT INTO files (path, content_hash, mode, size, vv, tombstone, uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO files (path, content_hash, mode, size, vv, tombstone, uuid, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(path) DO UPDATE
-         SET content_hash = ?2, mode = ?3, size = ?4, vv = ?5, tombstone = ?6, uuid = ?7",
+         SET content_hash = ?2, mode = ?3, size = ?4, vv = ?5, tombstone = ?6, uuid = ?7,
+             meta = ?8",
         params![
             path,
             content_hash.map(|h| h.as_slice()),
@@ -91,9 +94,21 @@ pub(crate) fn upsert_file(
             encode_vv(vv)?,
             tombstone,
             uuid.map(|u| u.as_slice()),
+            encode_meta(meta)?,
         ],
     )?;
     Ok(())
+}
+
+/// Canonical meta blob (bincode of the capture-sorted struct); NULL for none.
+pub(crate) fn encode_meta(meta: Option<&Meta>) -> Result<Option<Vec<u8>>, StoreError> {
+    meta.map(|m| bincode::serialize(m).map_err(StoreError::VvCodec))
+        .transpose()
+}
+
+pub(crate) fn decode_meta(blob: Option<Vec<u8>>) -> Result<Option<Meta>, StoreError> {
+    blob.map(|b| bincode::deserialize(&b).map_err(StoreError::VvCodec))
+        .transpose()
 }
 
 /// Every live path with its expected content — the scanner's diff basis.
@@ -136,6 +151,9 @@ pub struct FileRow {
     /// Stable per-file identity (FR-205); `None` only transiently before the
     /// open-time migration mints deterministic uuids for pre-v4 rows.
     pub uuid: Option<[u8; 16]>,
+    /// Full metadata snapshot (FR-106); `None` for tombstones and pre-v4
+    /// rows awaiting their first re-capture.
+    pub meta: Option<Meta>,
 }
 
 fn blob16(blob: Vec<u8>, what: &'static str) -> Result<[u8; 16], StoreError> {
@@ -148,7 +166,8 @@ fn blob16(blob: Vec<u8>, what: &'static str) -> Result<[u8; 16], StoreError> {
 pub(crate) fn load_row(conn: &Connection, path: &str) -> Result<Option<FileRow>, StoreError> {
     let row = conn
         .query_row(
-            "SELECT content_hash, mode, size, tombstone, vv, uuid FROM files WHERE path = ?1",
+            "SELECT content_hash, mode, size, tombstone, vv, uuid, meta
+             FROM files WHERE path = ?1",
             [path],
             |row| {
                 Ok((
@@ -158,11 +177,12 @@ pub(crate) fn load_row(conn: &Connection, path: &str) -> Result<Option<FileRow>,
                     row.get::<_, bool>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
                     row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
                 ))
             },
         )
         .optional()?;
-    row.map(|(hash, mode, size, tombstone, vv_blob, uuid)| {
+    row.map(|(hash, mode, size, tombstone, vv_blob, uuid, meta)| {
         Ok(FileRow {
             path: path.to_string(),
             content_hash: hash.map(|h| blob32(h, "files.content_hash")).transpose()?,
@@ -171,6 +191,7 @@ pub(crate) fn load_row(conn: &Connection, path: &str) -> Result<Option<FileRow>,
             tombstone,
             vv: decode_vv(&vv_blob)?,
             uuid: uuid.map(|u| blob16(u, "files.uuid")).transpose()?,
+            meta: decode_meta(meta)?,
         })
     })
     .transpose()
@@ -200,7 +221,8 @@ pub(crate) fn backfill_uuids(
 /// Every row, live and tombstoned, ordered by path.
 pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT path, content_hash, mode, size, tombstone, vv, uuid FROM files ORDER BY path",
+        "SELECT path, content_hash, mode, size, tombstone, vv, uuid, meta
+         FROM files ORDER BY path",
     )?;
     let rows = stmt.query_map([], |row| {
         Ok((
@@ -211,11 +233,12 @@ pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
             row.get::<_, bool>(4)?,
             row.get::<_, Vec<u8>>(5)?,
             row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, Option<Vec<u8>>>(7)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (path, hash, mode, size, tombstone, vv_blob, uuid) = row?;
+        let (path, hash, mode, size, tombstone, vv_blob, uuid, meta) = row?;
         out.push(FileRow {
             path,
             content_hash: hash.map(|h| blob32(h, "files.content_hash")).transpose()?,
@@ -224,6 +247,7 @@ pub(crate) fn all_files(conn: &Connection) -> Result<Vec<FileRow>, StoreError> {
             tombstone,
             vv: decode_vv(&vv_blob)?,
             uuid: uuid.map(|u| blob16(u, "files.uuid")).transpose()?,
+            meta: decode_meta(meta)?,
         });
     }
     Ok(out)
