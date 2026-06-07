@@ -4,6 +4,7 @@
 //! modules. Everything correctness-critical lives here so unit, property, and
 //! integration tests can drive it directly.
 
+pub mod admin;
 pub mod apply;
 pub mod chunk;
 pub mod config;

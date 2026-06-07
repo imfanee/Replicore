@@ -5,6 +5,13 @@
 //!       key mode 0600) and print the SHA-256 fingerprint to pin in peers'
 //!       config allowlists (FR-1002).
 //!
+//!   replicored gen-admin-key --out FILE
+//!       Generate the cluster admin Ed25519 keypair: the secret PKCS#8 doc is
+//!       written to FILE (mode 0600) and the public key is printed for the
+//!       intent file's `[trust] admin_pubkey`. The daemon never reads the
+//!       secret — only `replicorectl member add/remove` does, to sign roster
+//!       entries client-side (FR-1305).
+//!
 //!   replicored run --config FILE
 //!       Run the replication daemon: store thread, fanotify watcher
 //!       (best-effort), authoritative periodic scanner, ingest pipeline, and
@@ -34,10 +41,11 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("gen-cert") => gen_cert(args),
+        Some("gen-admin-key") => gen_admin_key(args),
         Some("run") => run(args).await,
         _ => {
             eprintln!(
-                "usage:\n  replicored gen-cert --out-dir DIR --name NAME\n  replicored run --config FILE"
+                "usage:\n  replicored gen-cert --out-dir DIR --name NAME\n  replicored gen-admin-key --out FILE\n  replicored run --config FILE"
             );
             Ok(())
         }
@@ -196,6 +204,37 @@ fn gen_cert(mut args: impl Iterator<Item = String>) -> Result<()> {
     println!("fingerprint: {}", hex::encode(ident.fingerprint));
     println!();
     println!("Pin this fingerprint in each peer's [[peers]] entry.");
+    Ok(())
+}
+
+fn gen_admin_key(mut args: impl Iterator<Item = String>) -> Result<()> {
+    let mut out: Option<PathBuf> = None;
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--out" => out = Some(PathBuf::from(args.next().context("--out needs a value")?)),
+            other => bail!("unknown argument: {other}"),
+        }
+    }
+    let out = out.context("gen-admin-key needs --out FILE")?;
+    if out.exists() {
+        bail!(
+            "{} already exists; refusing to overwrite an admin key",
+            out.display()
+        );
+    }
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    let (doc, pubkey) = replicore::admin::generate_admin_key().context("generate admin key")?;
+    write_private(&out, &doc).with_context(|| format!("write {}", out.display()))?;
+
+    println!("admin secret: {} (mode 0600 — keep offline)", out.display());
+    println!("admin pubkey: {}", pubkey.to_hex());
+    println!();
+    println!("Put this in every node's intent file:");
+    println!("  [trust]");
+    println!("  admin_pubkey = \"{}\"", pubkey.to_hex());
     Ok(())
 }
 
