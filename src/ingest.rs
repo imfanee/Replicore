@@ -35,6 +35,9 @@ pub enum LocalEvent {
     Write(PathBuf),
     /// Share-relative path that is live in the index but gone from disk.
     Delete(String),
+    /// An observed move (FID watcher tier 1, FR-205): share-relative source,
+    /// absolute destination.
+    Rename { from: String, to: PathBuf },
 }
 
 pub struct Ingest {
@@ -91,6 +94,7 @@ impl Ingest {
                         }
                     }
                     Some(LocalEvent::Delete(rel)) => self.handle_delete(rel).await,
+                    Some(LocalEvent::Rename { from, to }) => self.handle_rename(from, to).await,
                 },
                 _ = tick.tick() => {
                     self.flush_ripe().await;
@@ -246,6 +250,33 @@ impl Ingest {
             }
             Ok(None) => tracing::debug!(path = %rel, "unchanged content+meta; no op"),
             Err(e) => tracing::error!(path = %rel, error = %e, "append_local failed"),
+        }
+    }
+
+    /// An observed move → ONE identity-preserving op (FR-205). The store's
+    /// no-op filter (source absent/tombstoned) and the suppression check
+    /// below are the loop defenses; everything else is `append_local_rename`.
+    async fn handle_rename(&mut self, from: String, to_abs: PathBuf) {
+        let Some(to) = self.relativize(&to_abs) else {
+            return;
+        };
+        // A pending write for the vacated source is moot; the destination
+        // re-quiesces if content changes after the move.
+        self.pending.remove(&from);
+
+        // Loop defense 1 (FR-902): our own remote rename apply observed back
+        // (apply_rename registers the delete entry before moving).
+        if self.suppress.check_delete(&from) {
+            tracing::debug!(path = %from, "suppressed self-apply rename event");
+            return;
+        }
+
+        match self.store.append_local_rename(&from, &to).await {
+            Ok(Some(op)) => {
+                tracing::info!(from = %from, to = %to, seq = op.origin_seq, "local rename -> op")
+            }
+            Ok(None) => tracing::debug!(from = %from, to = %to, "rename was a causal no-op"),
+            Err(e) => tracing::error!(from = %from, error = %e, "append_local_rename failed"),
         }
     }
 

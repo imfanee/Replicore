@@ -246,6 +246,7 @@ mod tests {
             match ev {
                 LocalEvent::Write(p) => seen.push(p),
                 LocalEvent::Delete(p) => panic!("unexpected delete {p}"),
+                LocalEvent::Rename { from, .. } => panic!("unexpected rename {from}"),
             }
         }
         seen.sort();
