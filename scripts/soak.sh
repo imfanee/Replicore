@@ -60,6 +60,18 @@ VERDICT="$STATE/soak-verdict.txt"
 [ "$(id -u)" = 0 ] || { echo "run as root"; exit 1; }
 [ -x "$BIN" ] || { echo "build first: cargo build --release"; exit 1; }
 
+# Cross-process rig lock (shared with the integration rig tests): the soak
+# and integration_wan share ONE host rig and the /srv/replicore tree. Held
+# for the whole run; if a rig test (or another soak) holds it, refuse LOUD
+# instead of scribbling each other's share dirs (the root cause of the
+# flaky integration_wan findings).
+mkdir -p /srv/replicore
+exec {RIG_LOCK_FD}>/srv/replicore/.rig.lock
+if ! flock -n "$RIG_LOCK_FD"; then
+  echo "rig is BUSY: another replicore rig process holds /srv/replicore/.rig.lock; refusing to start"
+  exit 1
+fi
+
 declare -A PID
 start_node() {
   ip netns exec "rc-$1" "$BIN" run --config "$ETC/node-$1.toml" \
@@ -164,14 +176,17 @@ while :; do
     done
   fi
 
-  # --- traffic ---
+  # --- traffic (only while the target daemon is alive — never scribble a
+  # --- dir whose rig has gone out from under us) ---
   n=${NODES[$((RANDOM % 3))]}
-  rec="recordings/$(date +%s)-$i.wav"
-  mkdir -p "${DIR[$n]}/recordings" 2>/dev/null || true
-  if head -c $(((RANDOM % 600 + 200) * 1024)) /dev/urandom >"${DIR[$n]}/$rec" 2>/dev/null; then
-    RECORDINGS+=("$rec")
-  else
-    echo "[soak] WARN: write failed for ${DIR[$n]}/$rec (transient?)"
+  if kill -0 "${PID[$n]:-0}" 2>/dev/null; then
+    rec="recordings/$(date +%s)-$i.wav"
+    mkdir -p "${DIR[$n]}/recordings" 2>/dev/null || true
+    if head -c $(((RANDOM % 600 + 200) * 1024)) /dev/urandom >"${DIR[$n]}/$rec" 2>/dev/null; then
+      RECORDINGS+=("$rec")
+    else
+      echo "[soak] WARN: write failed for ${DIR[$n]}/$rec (transient?)"
+    fi
   fi
 
   if [ $((i % 6)) -eq 0 ]; then
