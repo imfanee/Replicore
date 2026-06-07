@@ -44,12 +44,15 @@ the misconfiguration is a **silent permanent op storm** (visible only as
 kind of "mostly followed" posture CLAUDE.md says to reject. The soak's
 lag/oplog monitors would catch it, prose wouldn't.
 
-**Recommendation (for a follow-up task, not this one):** treat persistent
-EPERM under `numeric` as a configuration error — e.g. after the first
-owner-skip, hold the captured uid/gid equal to the ROW's values for
-unchanged content (capture-side pinning), or refuse to start under
-`numeric` without CAP_CHOWN. Either restores the law; the second is
-simpler and honest.
+**STATUS: FIXED** — the daemon now refuses to start under
+`owner_policy = "numeric"` without CAP_CHOWN (`metadata::can_chown` probe +
+the boot gate in `main.rs`), which eliminates the storm-producing
+configuration class. Residual: a privileged daemon facing PER-PATH
+squashing (e.g. one NFS export with root-squash) can still EPERM-skip on
+those paths and, paired with a second such daemon of a different uid,
+ping-pong on the squashed subtree — surfaced by
+`replicore_meta_owner_skips_total` and op-rate growth; capture-side
+pinning remains the follow-up if that corner ever matters in practice.
 
 Everything else below **passes**.
 

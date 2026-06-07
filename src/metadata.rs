@@ -339,6 +339,39 @@ pub fn apply_meta(path: &Path, meta: &Meta, policy: OwnerPolicy) -> io::Result<M
     Ok(applied)
 }
 
+/// Does this process hold CAP_CHOWN (the capability `owner_policy =
+/// "numeric"` requires)? euid 0 passes trivially; otherwise probe by
+/// chowning a fresh temp file in `probe_dir` to root — exactly the call
+/// `apply_meta` will make, so the answer cannot drift from reality.
+///
+/// The daemon REFUSES to start under `numeric` without it (review finding
+/// S5): an unprivileged daemon would EPERM-skip every ownership apply, and
+/// two such daemons with different uids re-capture their own uids and
+/// ping-pong corrective metadata ops forever — a silent op storm, not a
+/// graceful degradation. The per-file EPERM skip in `apply_meta` remains
+/// only for residual per-path cases (e.g. NFS root-squash on one export).
+pub fn can_chown(probe_dir: &Path) -> io::Result<bool> {
+    // SAFETY: trivial libc call, no pointers.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(true);
+    }
+    std::fs::create_dir_all(probe_dir)?;
+    let probe = probe_dir.join(format!(".replicore-chown-probe.{}", std::process::id()));
+    std::fs::write(&probe, b"")?;
+    let c = cpath(&probe)?;
+    // SAFETY: valid NUL-terminated path; chown to root requires CAP_CHOWN.
+    let rc = unsafe { libc::lchown(c.as_ptr(), 0, 0) };
+    let err = std::io::Error::last_os_error();
+    let _ = std::fs::remove_file(&probe);
+    if rc == 0 {
+        return Ok(true);
+    }
+    match err.raw_os_error() {
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(err),
+    }
+}
+
 /// Create the special-file node for `meta.kind` at `path` (FIFO / device).
 /// Regular files and symlinks have their own apply paths. Device nodes need
 /// CAP_MKNOD; failure is reported as `Err` for the caller to degrade.
@@ -483,6 +516,22 @@ mod tests {
             change(&mut m);
             assert_ne!(h, Meta::hash_of(&Some(m)), "field must be hashed");
         }
+    }
+
+    #[test]
+    fn can_chown_probe_answers() {
+        // In this environment (root) the probe must say yes; the contract —
+        // EPERM ⇒ Ok(false), other errors surface — is what main()'s
+        // refusal gate runs on. Unprivileged CI environments exercise the
+        // false branch naturally.
+        let dir = tempfile::tempdir().unwrap();
+        let answer = can_chown(dir.path()).unwrap();
+        // SAFETY: trivial libc call.
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(answer, "root must hold CAP_CHOWN");
+        }
+        // No probe litter left behind.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
