@@ -305,7 +305,20 @@ pub(crate) fn manifest_for(
         });
     }
     if chunks.len() as i64 != count {
-        return Err(StoreError::Corrupt("manifest_chunks row count"));
+        // A PARTIAL manifest — the `manifests` row says `count` but fewer
+        // chunk rows are present. This is the residue of a crash mid-persist
+        // (pre-fix `put_manifest` was non-atomic). Treat it as ABSENT, not a
+        // hard corruption: the caller re-fetches the (immutable,
+        // content-addressed) manifest from a peer and the now-atomic
+        // re-`put_manifest` fills the missing rows (INSERT OR IGNORE),
+        // self-healing the partial instead of wedging the node forever.
+        tracing::warn!(
+            content = %hex::encode(&content_hash[..4]),
+            have = chunks.len(),
+            want = count,
+            "partial manifest (crash residue); treating as absent to re-fetch"
+        );
+        return Ok(None);
     }
     Ok(Some(Manifest {
         content_hash: *content_hash,

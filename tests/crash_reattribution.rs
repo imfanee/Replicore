@@ -212,18 +212,14 @@ async fn committed_file_reobserved_is_a_no_op() {
     // since been swept in a real run; force the worst case by sweeping now).
     r.suppress.sweep(Duration::from_millis(0));
     for _ in 0..4 {
-        r.tx
-            .send(LocalEvent::Write(r.share.join("from-a/rec.wav")))
+        r.tx.send(LocalEvent::Write(r.share.join("from-a/rec.wav")))
             .await
             .unwrap();
     }
     let count = r.wait_op_fixed_point(3).await;
     assert_eq!(count, 1, "a recovered file must not re-emit (no-storm law)");
     // Content intact.
-    assert_eq!(
-        std::fs::read(r.share.join("from-a/rec.wav")).unwrap(),
-        data
-    );
+    assert_eq!(std::fs::read(r.share.join("from-a/rec.wav")).unwrap(), data);
 }
 
 /// Invariant 2: the orphaned-but-correct file (crash after rename, before
@@ -243,13 +239,15 @@ async fn orphaned_file_reattributes_bounded_then_converges_with_redelivery() {
     // Restart: the scanner observes the orphan before A redelivers. Worst
     // case — suppression already swept.
     r.suppress.sweep(Duration::from_millis(0));
-    r.tx
-        .send(LocalEvent::Write(r.share.join("from-a/r07.bin")))
+    r.tx.send(LocalEvent::Write(r.share.join("from-a/r07.bin")))
         .await
         .unwrap();
     let after_reattrib = r.wait_op_fixed_point(3).await;
     // BOUNDED: exactly one re-attribution op, not an unbounded storm.
-    assert_eq!(after_reattrib, 1, "re-attribution must be bounded to one op");
+    assert_eq!(
+        after_reattrib, 1,
+        "re-attribution must be bounded to one op"
+    );
     // Content NOT clobbered — the bytes A staged survive.
     assert_eq!(std::fs::read(r.share.join("from-a/r07.bin")).unwrap(), data);
 
@@ -288,8 +286,7 @@ async fn orphaned_file_reattributes_bounded_then_converges_with_redelivery() {
 
     // Re-observation after convergence is a pure no-op (true no-storm).
     r.suppress.sweep(Duration::from_millis(0));
-    r.tx
-        .send(LocalEvent::Write(r.share.join("from-a/r07.bin")))
+    r.tx.send(LocalEvent::Write(r.share.join("from-a/r07.bin")))
         .await
         .unwrap();
     assert_eq!(r.wait_op_fixed_point(3).await, final_count);
@@ -304,7 +301,11 @@ async fn resolve_then_record(r: &Receiver, op: &OpRecord) {
     let remote = Version {
         tombstone: false,
         content_hash: op.content_hash,
-        meta_hash: op.meta.as_ref().map(|m| Meta::hash_of(&Some(m.clone()))).unwrap_or(META_NONE),
+        meta_hash: op
+            .meta
+            .as_ref()
+            .map(|m| Meta::hash_of(&Some(m.clone())))
+            .unwrap_or(META_NONE),
         meta: op.meta.clone(),
         mode: op.mode,
         size: op.size,

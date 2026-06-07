@@ -674,7 +674,7 @@ fn run_store(
                 let _ = reply.send(cursor_value(&conn, &peer, &node_id, "last_acked_seq"));
             }
             StoreCmd::PutManifest { manifest, reply } => {
-                let _ = reply.send(state::put_manifest(&conn, &manifest));
+                let _ = reply.send(put_manifest_atomic(&mut conn, &manifest));
             }
             StoreCmd::ManifestFor {
                 content_hash,
@@ -1386,6 +1386,21 @@ fn resolve_rows(
     }
     tx.commit()?;
     Ok(ResolveOutcome::Resolved)
+}
+
+/// Persist a manifest ATOMICALLY (review/QA finding): the standalone
+/// receiver path (`obtain_manifest` → `Store::put_manifest`) ran the
+/// `manifests` row + the `manifest_chunks` rows as separate autocommit
+/// statements, so a kill -9 mid-persist left a partial manifest that
+/// `manifest_for` then rejected forever — wedging the node in a reconnect
+/// loop ("bad manifest_chunks row count"). One transaction makes it
+/// all-or-nothing. (`append_local` already persists its manifest inside the
+/// op's transaction; this closes the only non-atomic path.)
+fn put_manifest_atomic(conn: &mut Connection, m: &Manifest) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    state::put_manifest(&tx, m)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn op_count(conn: &Connection) -> Result<i64, StoreError> {
