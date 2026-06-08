@@ -48,7 +48,7 @@ emulated-WAN rig.
 | [docs/DEPLOYMENT-NFS.md](docs/DEPLOYMENT-NFS.md) | DevOps | Theory for NFS-fronted topologies |
 | [docs/DEPLOYMENT-NFS-RUNBOOK.md](docs/DEPLOYMENT-NFS-RUNBOOK.md) | DevOps | Actionable deploy-time runbook for NFS-fronted nodes |
 | [CHANGELOG.md](CHANGELOG.md) | Everyone | Milestone history and notable fixes |
-| [BOOTSTRAP.md](BOOTSTRAP.md) | Engineers | Single comprehensive build prompt to reconstruct the product from scratch |
+| [AGENTS.md](AGENTS.md) | Engineers / AI agents | The single source of project memory and build guidance: non-negotiable invariants, build order, and the session protocol |
 
 ## Quick start (three-node mesh)
 
@@ -101,3 +101,21 @@ Hashing: **blake3**. Chunking: **fastcdc**. FS monitoring: **fanotify** (FID) +
 periodic Merkle rescan as the correctness backstop. State: **rusqlite** (WAL).
 Membership: SWIM-style gossip + a versioned roster. Serialization: **serde** +
 versioned binary. Metrics: **prometheus**. Logging: **tracing**.
+
+## Working on this repo with an AI agent
+
+[`AGENTS.md`](AGENTS.md) is the **single source of project memory and build
+guidance** for this repository — it carries the non-negotiable correctness
+invariants, the highest-risk subsystems, the milestone build order and
+definition-of-done, and the current build state. It is vendor-neutral; any coding
+agent can load it.
+
+- **Starting a session:** point the agent at `AGENTS.md` and have it read the
+  file in full first, so it inherits the invariants (Section 2) as hard
+  constraints and picks up the current milestone state (Section 6).
+- **Closing a session:** ask the agent to update `AGENTS.md` — appending any new
+  invariant, decision, or gotcha it learned and refreshing the current build
+  state — so the next session inherits it. The file's own Section 5 ("Session
+  Protocol") spells out both steps.
+- Keep `AGENTS.md` factual and append-oriented; it is the handoff between
+  sessions, not a scratchpad. There is no other agent-memory file in the repo.
