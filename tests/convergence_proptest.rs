@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! THE M1 correctness gate (exit criterion 4): random op sequences applied in
 //! different orders on two simulated nodes converge to identical state.
 //!
@@ -9,11 +10,13 @@
 //! redelivery only after crashes).
 //!
 //! Under partitioned write ownership (the M1 operating regime) convergence
-//! must be exact. With overlapping writes, M1 must *detect* the conflict
-//! (Decision::Concurrent) and leave both sides' state untouched — resolution
-//! is M3 (FR-303).
+//! must be exact. With overlapping writes, the conflict is detected
+//! (Decision::Concurrent) and resolved deterministically with a conflict
+//! copy (M3, FR-303) — the dense-overlap convergence gate lives in
+//! `tests/conflict_proptest.rs`.
 
 use proptest::prelude::*;
+use replicore::conflict::META_NONE;
 use replicore::decide::Decision;
 use replicore::proto::OpRecord;
 use replicore::replica::Replica;
@@ -154,12 +157,12 @@ proptest! {
         })?;
     }
 
-    /// Overlapping concurrent writes: M1 must DETECT the conflict on both
-    /// sides and leave local state untouched (no merge, no silent overwrite).
-    /// The resulting divergence on the conflicted path is the documented M1
-    /// behavior — deterministic resolution + conflict copies are M3 (FR-303).
+    /// Overlapping concurrent writes: both sides detect the conflict AND
+    /// resolve it identically (FR-303/304) — deterministic winner by the
+    /// content total order, loser preserved as a conflict copy with the same
+    /// derived name on both nodes. Zero silent loss, byte-identical trees.
     #[test]
-    fn concurrent_overlap_is_detected_symmetrically(ca in 0u8..8, cb in 8u8..16) {
+    fn concurrent_overlap_resolves_identically(ca in 0u8..8, cb in 8u8..16) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("tokio runtime");
@@ -174,18 +177,39 @@ proptest! {
             prop_assert_eq!(a.receive(&op_b).await.unwrap(), Some(Decision::Concurrent));
             prop_assert_eq!(b.receive(&op_a).await.unwrap(), Some(Decision::Concurrent));
 
-            // Each keeps its own version: no merge happened on skip.
-            let row_a = &a.snapshot().await.unwrap()[0];
-            let row_b = &b.snapshot().await.unwrap()[0];
-            prop_assert_eq!(row_a.content_hash, Some(*blake3::hash(&[ca]).as_bytes()));
-            prop_assert_eq!(row_b.content_hash, Some(*blake3::hash(&[cb]).as_bytes()));
-            prop_assert_eq!(row_a.vv.get(&NODE_B), 0);
-            prop_assert_eq!(row_b.vv.get(&NODE_A), 0);
+            // Deterministic winner: the larger content hash (kind ranks tie —
+            // both writes). The loser survives as the content-derived copy.
+            let hash_a = *blake3::hash(&[ca]).as_bytes();
+            let hash_b = *blake3::hash(&[cb]).as_bytes();
+            let (winner, loser) = if hash_a > hash_b {
+                (hash_a, hash_b)
+            } else {
+                (hash_b, hash_a)
+            };
+            let copy = replicore::conflict::copy_path_for("shared/p", &loser, &META_NONE);
 
-            // But the foreign op IS durably recorded: never re-fetched, and a
-            // redelivery is dropped on the idempotency fast path.
+            let snap_a = a.snapshot().await.unwrap();
+            let snap_b = b.snapshot().await.unwrap();
+            prop_assert_eq!(&snap_a, &snap_b); // byte-identical incl. the copy
+
+            let row = snap_a.iter().find(|r| r.path == "shared/p").unwrap();
+            prop_assert_eq!(row.content_hash, Some(winner));
+            // Winner VV merged both sides: neither op can re-fire.
+            prop_assert_eq!(row.vv.get(&NODE_A), 1);
+            prop_assert_eq!(row.vv.get(&NODE_B), 1);
+            let copy_row = snap_a.iter().find(|r| r.path == copy).unwrap();
+            prop_assert_eq!(copy_row.content_hash, Some(loser));
+            prop_assert_eq!(&copy_row.vv, &replicore::conflict::copy_vv(&copy));
+
+            a.assert_fs_matches_index().await.unwrap();
+            b.assert_fs_matches_index().await.unwrap();
+
+            // The foreign op IS durably recorded: a redelivery is dropped on
+            // the idempotency fast path and nothing moves.
             prop_assert_eq!(a.receive(&op_b).await.unwrap(), None);
             prop_assert_eq!(b.receive(&op_a).await.unwrap(), None);
+            prop_assert_eq!(a.snapshot().await.unwrap(), snap_a);
+            prop_assert_eq!(b.snapshot().await.unwrap(), snap_b);
             Ok(())
         })?;
     }

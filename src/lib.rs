@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Replicore library crate — the replication engine's correctness core.
 //!
 //! The `replicored` binary (`main.rs`) is a thin wiring layer over these
@@ -8,6 +9,7 @@ pub mod admin;
 pub mod apply;
 pub mod chunk;
 pub mod config;
+pub mod conflict;
 pub mod control;
 pub mod decide;
 pub mod fetch;
@@ -17,10 +19,12 @@ pub mod ingest;
 pub mod join;
 pub mod membership;
 pub mod merkle;
+pub mod metadata;
 pub mod net;
 pub mod oplog;
 pub mod peer;
 pub mod proto;
+pub mod qos;
 pub mod replica;
 pub mod scanner;
 pub mod state;

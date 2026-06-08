@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! admin.rs — the membership trust anchor (FR-1305, NFR-CM2).
 //!
 //! Every roster mutation is an individually Ed25519-signed entry. The admin

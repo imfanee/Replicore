@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 # wan-testbed.sh — four-node emulated-WAN test rig for Replicore (M2 mesh +
 # M2.5 dynamic membership: a,b,c are the static trio; d joins dynamically).
 #
@@ -215,6 +216,9 @@ down() {
   need_root
   for n in "${NODES[@]}"; do ip netns del "${NS[$n]}" 2>/dev/null || true; done
   ip netns del _rc_probe 2>/dev/null || true
+  # Bridge-side veth peers can orphan when their ns-side end was downed
+  # (e.g. a partition test) before the netns died — delete explicitly.
+  for n in "${NODES[@]}"; do ip link del "brv-$n" 2>/dev/null || true; done
   ip link del "$BR" 2>/dev/null || true
   echo "down."
 }

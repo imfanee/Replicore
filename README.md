@@ -1,100 +1,103 @@
+*Architected & Developed By:- Faisal Hanif | imfanee@gmail.com*
+
 # Replicore
 
-A production-grade, multi-master file replication engine for LAN and WAN. One
-agent per node; nodes form a dynamic mesh; each node reads/writes local storage
-normally and the engine propagates changes without blocking local I/O. Metadata
-replicates as a causally-ordered operation log; file data replicates as
-content-addressed chunks; divergence heals via Merkle anti-entropy.
+**Replicore** is a production-grade, agent-based, eventually-consistent,
+**multi-master** file replication engine for LAN and WAN. One daemon
+(`replicored`) runs per node; nodes form a dynamic, self-healing mesh; each node
+reads and writes its local storage normally and the engine propagates every
+change to all peers **without blocking local I/O**.
 
-This repository is the single source of truth: specification, milestone build
-prompts, the working M0 spike, and the test rig — all version-aligned.
-
-## Layout
-
-```
-Replicore/
-├── README.md                 # this file
-├── CLAUDE.md                 # project memory for Claude Code (loaded every session)
-├── Cargo.toml, Cargo.lock    # M0 spike build (pinned, reproducible)
-├── src/                      # M0 spike: watcher + QUIC transport + atomic apply
-│   ├── main.rs  proto.rs  watch.rs  net.rs  apply.rs
-├── docs/
-│   ├── RSD.md                        # requirements + development plan (v1.0)
-│   ├── RSD-addendum-membership.md    # v1.1: cluster membership + control plane
-│   ├── design-guide.md               # architecture & build guide
-│   ├── DEPLOYMENT-NFS.md             # operator rules for NFS-fronted nodes
-│   └── M0-spike.md                   # what M0 does / omits, mapped to requirements
-├── prompts/                  # one brief per milestone, for Claude Code
-│   ├── README.md
-│   ├── M1-mvp-bidirectional.md
-│   ├── M2-mesh-selfheal.md
-│   ├── M2.5-cluster-membership.md
-│   └── M3-production-hardening.md
-└── scripts/
-    └── wan-testbed.sh        # two-node + emulated-WAN (netns + tc netem) rig
-```
+- **Multi-master, not primary/replica.** Every node accepts writes. Causality is
+  tracked with **version vectors** (never wall-clock time); concurrent edits are
+  resolved deterministically and the loser is preserved as a conflict copy — no
+  silent data loss.
+- **Atomic apply.** A replicated file is staged, fsync'd, BLAKE3-verified, then
+  `rename(2)`'d into place. A partial or unverified file is never exposed.
+- **Self-healing.** Metadata replicates as a causally-ordered operation log; file
+  data replicates as content-addressed **FastCDC chunks**; any divergence is
+  detected and repaired by **Merkle anti-entropy**.
+- **Dynamic membership.** Nodes join and leave a live cluster with zero downtime.
+  Membership is an epoch-versioned register that converges deterministically;
+  every peer is admitted only after mutual-TLS validation against a pinned trust
+  anchor, and membership changes are admin-signed.
+- **Operable.** A local `replicorectl` CLI (over a Unix domain socket) exposes
+  status, lag, conflicts, transfers, live config reload, bandwidth control, and
+  membership management. Prometheus `/metrics` and a `/healthz` endpoint are
+  built in.
 
 ## Status
 
-**M0 spike — complete and verified.** Compiles on stock Ubuntu `cargo` (Rust
-1.75) and replicates files one-directionally over QUIC with atomic apply. It is
-the proof that fanotify + QUIC + atomic apply compose; it is **not** Replicore
-yet — the correctness core (op-log, version vectors, conflict handling, mesh,
-membership) lands in the milestones below.
+**M3 — production hardening — complete.** The engine implements the full
+correctness core (op-log, version vectors, apply-suppression, conflict
+resolution, metadata fidelity), the self-healing mesh (chunking, multi-source
+fetch, Merkle anti-entropy), dynamic cluster membership with a signed control
+plane, and production concerns (QoS/bandwidth shaping, free-space guard, metrics,
+BBR congestion control). It is under long-duration soak validation on the
+emulated-WAN rig.
 
-## Milestone order
+## Documentation
 
-```
-M1  bidirectional correctness core (op-log, version vectors, apply-suppression, mTLS)
-M2  mesh + self-healing (chunking, multi-source fetch, Merkle anti-entropy)
-M2.5 cluster membership + management plane (zero-downtime add/remove, replicorectl)
-M3  production hardening (conflict rules, metadata fidelity, QoS, metrics, soak)
-```
+| Document | Audience | What it covers |
+|---|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Everyone | How Replicore works: op-log, version vectors, chunks, anti-entropy, membership |
+| [docs/DEPLOYMENT-GUIDE.md](docs/DEPLOYMENT-GUIDE.md) | DevOps / SRE | Install, provision identities, configure, run under systemd, firewall, upgrade, back up |
+| [docs/ADMIN-GUIDE.md](docs/ADMIN-GUIDE.md) | Cluster admins | Day-2 ops: `replicorectl`, membership, monitoring, conflicts, config reload, troubleshooting |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | DevOps / admins | Every configuration field, defaults, and hot-reload vs restart-required |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security / DevOps | Trust model, mutual TLS, admin signing, control-socket auth |
+| [docs/DEPLOYMENT-NFS.md](docs/DEPLOYMENT-NFS.md) | DevOps | Theory for NFS-fronted topologies |
+| [docs/DEPLOYMENT-NFS-RUNBOOK.md](docs/DEPLOYMENT-NFS-RUNBOOK.md) | DevOps | Actionable deploy-time runbook for NFS-fronted nodes |
+| [CHANGELOG.md](CHANGELOG.md) | Everyone | Milestone history and notable fixes |
+| [BOOTSTRAP.md](BOOTSTRAP.md) | Engineers | Single comprehensive build prompt to reconstruct the product from scratch |
 
-M2.5 precedes M3 deliberately, so hardening hardens a dynamic cluster.
-
-## Build & run the M0 spike
+## Quick start (three-node mesh)
 
 ```sh
 cargo build --release
-# localhost smoke test:
-mkdir -p /tmp/a /tmp/b
-./target/release/replicored sink   --listen 127.0.0.1:7000 --dir /tmp/b &
-./target/release/replicored source --peer 127.0.0.1:7000   --dir /tmp/a &
-sleep 2; echo hello > /tmp/a/t.txt; sleep 2
-cmp /tmp/a/t.txt /tmp/b/t.txt && echo "M0 OK"
+
+# 1. On each node, generate its identity (prints the cert fingerprint to pin):
+./target/release/replicored gen-cert --out-dir /etc/replicore --name node-a
+
+# 2. Generate ONE cluster admin keypair (kept off the daemons; used to sign
+#    membership changes):
+./target/release/replicored gen-admin-key --out /secure/replicore-admin.key
+
+# 3. Write each node's replicore.toml (see replicore.example.toml and
+#    docs/CONFIGURATION.md), pinning every peer's fingerprint.
+
+# 4. Run the daemon on each node:
+./target/release/replicored run --config /etc/replicore/replicore.toml
+
+# 5. Operate from any node:
+./target/release/replicorectl status --all
+./target/release/replicorectl members
 ```
 
-The `Cargo.toml` pins `time` and `blake3` to specific versions so the build is
-reproducible on both the older apt toolchain (Rust 1.75) and current Rust. On a
-current toolchain you may relax them (`time` unpinned, `blake3 = "1"`), but the
-pinned set is the configuration that has actually been compiled and tested —
-leave it as-is unless you have a reason to change it.
+See **[docs/DEPLOYMENT-GUIDE.md](docs/DEPLOYMENT-GUIDE.md)** for the full
+production procedure.
 
-## Two-node + emulated-WAN testing
+## Build, test, lint
+
+```sh
+cargo build --release
+cargo test
+cargo clippy --all-targets -- -D warnings   # must be clean
+cargo fmt --all
+```
+
+## Emulated-WAN test rig
 
 ```sh
 sudo modprobe sch_netem
-sudo scripts/wan-testbed.sh up        # ~150ms RTT, ~1% loss (tunable via env)
+sudo scripts/wan-testbed.sh up        # netns + tc netem: ~150ms RTT, ~1% loss
 sudo scripts/wan-testbed.sh status
 sudo scripts/wan-testbed.sh down
 ```
 
-## Developing with Claude Code
+## Tech stack
 
-Open a Claude Code session at this repo root (so `CLAUDE.md` loads). Do **not**
-run `/init` — `CLAUDE.md` is already curated. Work one milestone per session in
-Plan Mode: paste the milestone prompt from `prompts/`, review the plan against
-its "Mandated design" section, let it implement and test, then complete the
-prompt's "Reviewer checklist" yourself before committing. `/clear` between
-milestones. See `docs/` for the full spec and the human-review gates.
-
-## The two highest-risk subsystems
-
-When the agent reaches them, review by hand rather than trusting tests:
-
-1. **Version vectors + apply-suppression (M1)** — the causality and loop-control
-   core; plausible-looking code here causes silent corruption or mesh storms.
-2. **Join frontier (M2.5)** — "keep syncing live writes while initial sync runs"
-   loses or double-applies writes at the boundary if coded carelessly, and won't
-   show up in a casual demo.
+Rust + **tokio**. Transport: **quinn** (QUIC) with **BBR** congestion control.
+Hashing: **blake3**. Chunking: **fastcdc**. FS monitoring: **fanotify** (FID) +
+periodic Merkle rescan as the correctness backstop. State: **rusqlite** (WAL).
+Membership: SWIM-style gossip + a versioned roster. Serialization: **serde** +
+versioned binary. Metrics: **prometheus**. Logging: **tracing**.

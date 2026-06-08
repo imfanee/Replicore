@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! apply.rs — atomic, verified, suppressed apply (FR-803, FR-802, FR-902).
 //!
 //! Stage into a temp file in the destination directory (same filesystem so the
@@ -11,12 +12,19 @@
 //! the store commit) swallows its own observation instead of emitting a
 //! spurious outbound op. Re-running an apply with the same bytes is idempotent:
 //! the rename replaces identical content.
+//!
+//! Metadata (FR-804): applied to the STAGED temp, after the content is fully
+//! written and verified, BEFORE the publishing rename — metadata travels with
+//! the inode through the rename, so a consumer never observes content with
+//! stale metadata or metadata without its content. The order inside the
+//! metadata step lives in `metadata::apply_meta`.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::metadata::{self, Meta, OwnerPolicy};
 use crate::suppress::Suppressor;
 use crate::TMP_SUFFIX;
 
@@ -63,12 +71,15 @@ fn safe_dest(root: &Path, rel: &str) -> Result<PathBuf, ApplyError> {
 }
 
 /// Atomically publish `data` (whose BLAKE3 must equal `hash`) at `root/rel`.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_write(
     root: &Path,
     rel: &str,
     mode: u32,
     hash: &[u8; 32],
     data: &[u8],
+    meta: Option<&Meta>,
+    policy: OwnerPolicy,
     suppress: &Suppressor,
 ) -> Result<(), ApplyError> {
     // Verify integrity before touching the filesystem.
@@ -111,6 +122,12 @@ pub fn apply_write(
         // verify → rename). Catches torn writes the in-memory check cannot.
         verify_on_disk(&tmp, hash, rel)?;
 
+        // Metadata on the staged temp, after content, before publish
+        // (FR-804) — it travels with the inode through the rename.
+        if let Some(m) = meta {
+            metadata::apply_meta(&tmp, m, policy).map_err(io_err("meta", &tmp))?;
+        }
+
         // Atomic publish, then persist the rename itself.
         std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
         if let Ok(dirf) = std::fs::File::open(parent) {
@@ -134,6 +151,7 @@ pub fn apply_write(
 /// in-memory `data` buffer (files can exceed RAM). Suppression is registered
 /// before the first mutation; failures clean up the temp. Blocking — call in
 /// spawn_blocking.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_assembled(
     root: &Path,
     rel: &str,
@@ -141,6 +159,8 @@ pub fn apply_assembled(
     whole_hash: &[u8; 32],
     manifest: &crate::chunk::Manifest,
     cas: &crate::chunk::Cas,
+    meta: Option<&Meta>,
+    policy: OwnerPolicy,
     suppress: &Suppressor,
 ) -> Result<(), ApplyError> {
     // Structure sanity before any fs work: the manifest must claim to
@@ -186,6 +206,11 @@ pub fn apply_assembled(
         // Independent readback (torn-write check), as in apply_write.
         verify_on_disk(&tmp, whole_hash, rel)?;
 
+        // Metadata after content, before publish (FR-804).
+        if let Some(m) = meta {
+            metadata::apply_meta(&tmp, m, policy).map_err(io_err("meta", &tmp))?;
+        }
+
         std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
         if let Ok(dirf) = std::fs::File::open(parent) {
             let _ = dirf.sync_all();
@@ -213,6 +238,207 @@ fn verify_on_disk(path: &Path, hash: &[u8; 32], rel: &str) -> Result<(), ApplyEr
     if hasher.finalize().as_bytes() != hash {
         return Err(ApplyError::HashMismatch(rel.to_string()));
     }
+    Ok(())
+}
+
+/// Identity-preserving move for a remote rename (FR-205): `root/old_rel` →
+/// `root/new_rel` via `rename(2)`, taken ONLY when the source file already
+/// holds exactly `hash` (verified by readback first) — the no-retransfer fast
+/// path. Returns `Ok(false)` with the fs untouched when the source is missing
+/// or holds other bytes; the caller falls back to assemble-at-target.
+/// Suppression is registered for BOTH path events before the mutation.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rename(
+    root: &Path,
+    old_rel: &str,
+    new_rel: &str,
+    mode: u32,
+    hash: &[u8; 32],
+    meta: Option<&Meta>,
+    policy: OwnerPolicy,
+    suppress: &Suppressor,
+) -> Result<bool, ApplyError> {
+    let src = safe_dest(root, old_rel)?;
+    let dest = safe_dest(root, new_rel)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| ApplyError::UnsafePath(new_rel.to_string()))?;
+    match verify_on_disk(&src, hash, old_rel) {
+        Ok(()) => {}
+        // Source gone or different content: not a fast-path candidate.
+        Err(ApplyError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(false)
+        }
+        Err(ApplyError::HashMismatch(_)) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    std::fs::create_dir_all(parent).map_err(io_err("mkdir", parent))?;
+
+    // Both halves of the move are self-inflicted events (FR-902).
+    suppress.register_delete(old_rel);
+    suppress.register_write(new_rel, *hash);
+
+    std::fs::rename(&src, &dest).map_err(io_err("rename", &dest))?;
+    let perms = std::fs::Permissions::from_mode(mode & 0o7777);
+    std::fs::set_permissions(&dest, perms).map_err(io_err("chmod", &dest))?;
+    // The op's metadata snapshot rides the move (it IS the file's, captured
+    // at the origin's rename).
+    if let Some(m) = meta {
+        metadata::apply_meta(&dest, m, policy).map_err(io_err("meta", &dest))?;
+    }
+    // Persist the namespace change in both directories.
+    if let Ok(dirf) = std::fs::File::open(parent) {
+        let _ = dirf.sync_all();
+    }
+    if let Some(old_parent) = src.parent() {
+        if let Ok(dirf) = std::fs::File::open(old_parent) {
+            let _ = dirf.sync_all();
+        }
+    }
+    Ok(true)
+}
+
+/// Atomically publish a symlink at `root/rel` (FR-106). The target rides in
+/// `meta`; `hash` is BLAKE3 of the raw target bytes (the op's content hash).
+/// Staged under a temp name and renamed — same discipline, no following.
+pub fn apply_symlink(
+    root: &Path,
+    rel: &str,
+    hash: &[u8; 32],
+    meta: &Meta,
+    policy: OwnerPolicy,
+    suppress: &Suppressor,
+) -> Result<(), ApplyError> {
+    let Some(target) = meta.symlink_target.as_deref() else {
+        return Err(ApplyError::HashMismatch(rel.to_string()));
+    };
+    if blake3::hash(target).as_bytes() != hash {
+        return Err(ApplyError::HashMismatch(rel.to_string()));
+    }
+    let dest = safe_dest(root, rel)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| ApplyError::UnsafePath(rel.to_string()))?;
+    std::fs::create_dir_all(parent).map_err(io_err("mkdir", parent))?;
+    suppress.register_write(rel, *hash);
+
+    let stage_seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}{}.{}.{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("l"),
+        TMP_SUFFIX,
+        std::process::id(),
+        stage_seq
+    ));
+    let stage = || -> Result<(), ApplyError> {
+        use std::os::unix::ffi::OsStrExt;
+        let target_os = std::ffi::OsStr::from_bytes(target);
+        std::os::unix::fs::symlink(target_os, &tmp).map_err(io_err("symlink", &tmp))?;
+        metadata::apply_meta(&tmp, meta, policy).map_err(io_err("meta", &tmp))?;
+        std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+        Ok(())
+    };
+    stage().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Atomically publish a special node (FIFO / device) at `root/rel` (FR-106).
+/// Devices need CAP_MKNOD; the caller degrades on PermissionDenied.
+pub fn apply_special(
+    root: &Path,
+    rel: &str,
+    meta: &Meta,
+    policy: OwnerPolicy,
+    suppress: &Suppressor,
+) -> Result<(), ApplyError> {
+    let dest = safe_dest(root, rel)?;
+    let parent = dest
+        .parent()
+        .ok_or_else(|| ApplyError::UnsafePath(rel.to_string()))?;
+    std::fs::create_dir_all(parent).map_err(io_err("mkdir", parent))?;
+    // Special ops carry no content hash; the delete-shaped suppression entry
+    // covers the node's appearance for the scanner.
+    suppress.register_write(rel, [0u8; 32]);
+
+    let stage_seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = parent.join(format!(
+        ".{}{}.{}.{}",
+        dest.file_name().and_then(|n| n.to_str()).unwrap_or("s"),
+        TMP_SUFFIX,
+        std::process::id(),
+        stage_seq
+    ));
+    let stage = || -> Result<(), ApplyError> {
+        metadata::create_special(&tmp, meta).map_err(io_err("mknod", &tmp))?;
+        metadata::apply_meta(&tmp, meta, policy).map_err(io_err("meta", &tmp))?;
+        std::fs::rename(&tmp, &dest).map_err(io_err("rename", &dest))?;
+        if let Ok(dirf) = std::fs::File::open(parent) {
+            let _ = dirf.sync_all();
+        }
+        Ok(())
+    };
+    stage().inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Publish one VERSION (content hash + metadata) at `root/rel`, dispatching
+/// on the metadata kind: regular files assemble from the CAS manifest;
+/// symlinks and special nodes build from the metadata itself (they have no
+/// chunk plane). The single materialization entry every receive path uses.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_version(
+    root: &Path,
+    rel: &str,
+    mode: u32,
+    hash: Option<&[u8; 32]>,
+    manifest: Option<&crate::chunk::Manifest>,
+    cas: &crate::chunk::Cas,
+    meta: Option<&Meta>,
+    policy: OwnerPolicy,
+    suppress: &Suppressor,
+) -> Result<(), ApplyError> {
+    use crate::metadata::FileKind;
+    match meta.map(|m| m.kind) {
+        Some(FileKind::Symlink) => {
+            let (h, m) = (hash, meta);
+            match (h, m) {
+                (Some(h), Some(m)) => apply_symlink(root, rel, h, m, policy, suppress),
+                _ => Err(ApplyError::HashMismatch(rel.to_string())),
+            }
+        }
+        Some(FileKind::Fifo) | Some(FileKind::CharDev) | Some(FileKind::BlockDev) => match meta {
+            Some(m) => apply_special(root, rel, m, policy, suppress),
+            None => Err(ApplyError::HashMismatch(rel.to_string())),
+        },
+        _ => match (hash, manifest) {
+            (Some(h), Some(man)) => {
+                apply_assembled(root, rel, mode, h, man, cas, meta, policy, suppress)
+            }
+            _ => Err(ApplyError::HashMismatch(rel.to_string())),
+        },
+    }
+}
+
+/// Apply ONLY metadata to an already-current destination (a meta-only op:
+/// same bytes, new xattrs/mode/owner/mtime). The content was verified in
+/// place by the caller's `have` check; suppression covers the attribute
+/// events the change fires.
+pub fn apply_meta_only(
+    root: &Path,
+    rel: &str,
+    hash: Option<&[u8; 32]>,
+    meta: &Meta,
+    policy: OwnerPolicy,
+    suppress: &Suppressor,
+) -> Result<(), ApplyError> {
+    let dest = safe_dest(root, rel)?;
+    suppress.register_write(rel, hash.copied().unwrap_or([0u8; 32]));
+    metadata::apply_meta(&dest, meta, policy).map_err(io_err("meta", &dest))?;
     Ok(())
 }
 
@@ -252,7 +478,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = Suppressor::new();
         let data = b"hello replicore";
-        apply_write(dir.path(), "sub/dir/f.txt", 0o640, &hash_of(data), data, &s).unwrap();
+        apply_write(
+            dir.path(),
+            "sub/dir/f.txt",
+            0o640,
+            &hash_of(data),
+            data,
+            None,
+            OwnerPolicy::Skip,
+            &s,
+        )
+        .unwrap();
 
         let dest = dir.path().join("sub/dir/f.txt");
         assert_eq!(std::fs::read(&dest).unwrap(), data);
@@ -270,7 +506,17 @@ mod tests {
         let s = Suppressor::new();
         let data = b"same";
         for _ in 0..2 {
-            apply_write(dir.path(), "f", 0o644, &hash_of(data), data, &s).unwrap();
+            apply_write(
+                dir.path(),
+                "f",
+                0o644,
+                &hash_of(data),
+                data,
+                None,
+                OwnerPolicy::Skip,
+                &s,
+            )
+            .unwrap();
         }
         assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), data);
     }
@@ -281,7 +527,17 @@ mod tests {
         let s = Suppressor::new();
         let data = b"x";
         for bad in ["../evil", "/abs/path", "a/../../evil", ""] {
-            let err = apply_write(dir.path(), bad, 0o644, &hash_of(data), data, &s).unwrap_err();
+            let err = apply_write(
+                dir.path(),
+                bad,
+                0o644,
+                &hash_of(data),
+                data,
+                None,
+                OwnerPolicy::Skip,
+                &s,
+            )
+            .unwrap_err();
             assert!(matches!(err, ApplyError::UnsafePath(_)), "{bad}");
         }
         assert!(s.is_empty()); // rejected before suppression registration
@@ -292,7 +548,17 @@ mod tests {
     fn rejects_hash_mismatch_without_touching_fs() {
         let dir = tempfile::tempdir().unwrap();
         let s = Suppressor::new();
-        let err = apply_write(dir.path(), "f", 0o644, &[0u8; 32], b"data", &s).unwrap_err();
+        let err = apply_write(
+            dir.path(),
+            "f",
+            0o644,
+            &[0u8; 32],
+            b"data",
+            None,
+            OwnerPolicy::Skip,
+            &s,
+        )
+        .unwrap_err();
         assert!(matches!(err, ApplyError::HashMismatch(_)));
         assert!(!dir.path().join("f").exists());
         assert!(s.is_empty()); // verified before registration
@@ -336,6 +602,8 @@ mod tests {
             &manifest.content_hash,
             &manifest,
             &cas,
+            None,
+            OwnerPolicy::Skip,
             &s,
         )
         .unwrap();
@@ -354,6 +622,8 @@ mod tests {
             &manifest.content_hash,
             &manifest,
             &cas,
+            None,
+            OwnerPolicy::Skip,
             &s,
         )
         .unwrap();
@@ -370,8 +640,18 @@ mod tests {
 
         // Manifest lies about the whole-file hash: rejected BEFORE any fs work.
         manifest.content_hash = [0xee; 32];
-        let err =
-            apply_assembled(&share, "f", 0o644, &[0xee; 32], &manifest, &cas, &s).unwrap_err();
+        let err = apply_assembled(
+            &share,
+            "f",
+            0o644,
+            &[0xee; 32],
+            &manifest,
+            &cas,
+            None,
+            OwnerPolicy::Skip,
+            &s,
+        )
+        .unwrap_err();
         assert!(matches!(err, ApplyError::HashMismatch(_)));
         assert!(!share.join("f").exists());
         assert!(!walk_has_tmp(&share));
@@ -394,12 +674,63 @@ mod tests {
             &manifest.content_hash,
             &manifest,
             &cas,
+            None,
+            OwnerPolicy::Skip,
             &s,
         )
         .unwrap_err();
         assert!(matches!(err, ApplyError::Cas(_)), "{err:?}");
         assert!(!share.join("g").exists());
         assert!(!walk_has_tmp(&share)); // staged temp removed on failure
+    }
+
+    #[test]
+    fn dir_squatting_the_path_fails_with_a_directory_error_kind() {
+        // Review finding S6: a LOCAL directory occupying a replicated file's
+        // path must surface as a directory-shaped io error — the receive
+        // paths classify those PERMANENT (quarantine) instead of retrying
+        // the same poison op forever.
+        let dir = tempfile::tempdir().unwrap();
+        let s = Suppressor::new();
+        std::fs::create_dir_all(dir.path().join("x")).unwrap();
+
+        // Write onto the dir: the publish rename hits EISDIR.
+        let data = b"file content";
+        let err = apply_write(
+            dir.path(),
+            "x",
+            0o644,
+            &hash_of(data),
+            data,
+            None,
+            OwnerPolicy::Skip,
+            &s,
+        )
+        .unwrap_err();
+        match &err {
+            ApplyError::Io { source, .. } => assert!(
+                matches!(
+                    source.kind(),
+                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::DirectoryNotEmpty
+                ),
+                "unexpected kind: {source:?}"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // No staged temp left behind.
+        assert!(!walk_has_tmp(dir.path()));
+
+        // Delete of the dir path: unlink hits EISDIR too.
+        let err = apply_delete(dir.path(), "x", &s).unwrap_err();
+        match &err {
+            ApplyError::Io { source, .. } => assert!(
+                matches!(source.kind(), std::io::ErrorKind::IsADirectory),
+                "unexpected kind: {source:?}"
+            ),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        // The directory survives untouched either way.
+        assert!(dir.path().join("x").is_dir());
     }
 
     #[test]

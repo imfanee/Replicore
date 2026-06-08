@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! oplog.rs — durable, WAL-backed operation log and store thread (FR-201/202,
 //! FR-801/802).
 //!
@@ -19,7 +20,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::chunk::Manifest;
+use crate::conflict::{self, PlannedRow, Version};
 use crate::decide::{decide, Decision, LocalFile};
+use crate::metadata::Meta;
 use crate::proto::{op_id, OpRecord, OpType};
 use crate::state::{self, FileRow, LiveFile};
 use crate::vv::NodeId;
@@ -45,6 +48,8 @@ pub struct LocalChange {
     pub size: u64,
     /// BLAKE3 of the new content; `None` for deletes.
     pub content_hash: Option<[u8; 32]>,
+    /// Full metadata snapshot (FR-106); `None` for deletes.
+    pub meta: Option<Meta>,
     /// Chunk manifest built while hashing (FR-402); persisted in the SAME
     /// transaction as the op so a local op and its manifest are atomically
     /// durable. `None` for deletes.
@@ -65,12 +70,56 @@ pub struct ReconciledRow {
     /// the transaction (no TOCTOU).
     pub vv: crate::vv::VersionVector,
     pub tombstone: bool,
+    /// File identity (FR-205), carried by the leaf.
+    pub uuid: Option<[u8; 16]>,
+    /// Full metadata snapshot (FR-106), carried by the leaf.
+    pub meta: Option<Meta>,
+}
+
+/// Outcome of a [`Store::resolve_rows`] attempt — the conflict-path analogue
+/// of the effective decision `apply_remote` returns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ResolveOutcome {
+    /// The staged plan still matched under the committing transaction: winner
+    /// row and copy rows are durable. The caller's staged disk state is now
+    /// the truth.
+    Resolved,
+    /// The fresh row is no longer concurrent with the remote version (e.g.
+    /// reconcile merged another node's resolution meanwhile). NOTHING was
+    /// committed; the caller repairs any staged disk state from the rows
+    /// (`Ignore`-shaped) or re-routes (`Apply`-shaped).
+    NotConcurrent(Decision),
+    /// Still concurrent, but the rows changed since the caller planned (a
+    /// local write landed during the loser fetch — the stale-decision hazard
+    /// on the conflict path) or a copy-path collision surfaced. NOTHING was
+    /// committed. `plan` is the authoritative re-derivation: stage its
+    /// contents and retry.
+    Stale { plan: Vec<PlannedRow> },
+    /// The copy chain exceeded [`conflict::MAX_COPY_DEPTH`]. Nothing was
+    /// committed; the conflict stays detected-but-unresolved (the M1 posture)
+    /// and reconcile retries later. Operators see it via the conflict log.
+    Unresolvable,
 }
 
 enum StoreCmd {
     AppendLocal {
         change: LocalChange,
         reply: oneshot::Sender<Result<Option<OpRecord>, StoreError>>,
+    },
+    AppendLocalRename {
+        old_path: String,
+        new_path: String,
+        reply: oneshot::Sender<Result<Option<OpRecord>, StoreError>>,
+    },
+    ResolveRows {
+        path: String,
+        remote: Box<Version>,
+        staged: Vec<PlannedRow>,
+        reply: oneshot::Sender<Result<ResolveOutcome, StoreError>>,
+    },
+    LoadRow {
+        path: String,
+        reply: oneshot::Sender<Result<Option<FileRow>, StoreError>>,
     },
     ApplyRemote {
         op: Box<OpRecord>,
@@ -175,7 +224,7 @@ impl Store {
     /// Open (or create) the database, run migrations, and launch the store
     /// thread. `":memory:"` works for tests.
     pub fn open(db_path: &Path, node_id: NodeId) -> Result<Store, StoreError> {
-        let conn = Connection::open(db_path)?;
+        let mut conn = Connection::open(db_path)?;
         // WAL for crash-safe append throughput; FULL so COMMIT == fsynced
         // (FR-801: durable before peer acknowledgment). On :memory: the
         // journal_mode pragma reports "memory" — that's fine for tests.
@@ -189,19 +238,27 @@ impl Store {
                origin_seq   INTEGER NOT NULL,
                op_type      INTEGER NOT NULL,
                path         TEXT NOT NULL,
+               path_old     TEXT,            -- rename source (FR-205)
+               uuid         BLOB,            -- file identity (FR-205)
                mode         INTEGER NOT NULL,
                size         INTEGER NOT NULL,
                content_hash BLOB,
-               vv           BLOB NOT NULL
+               vv           BLOB NOT NULL,
+               meta         BLOB             -- canonical metadata (FR-106)
              );
              CREATE INDEX IF NOT EXISTS oplog_origin ON oplog(origin, origin_seq);
+             -- Conflict resolution derives from the path's op history (the
+             -- antichain scan in resolve_rows).
+             CREATE INDEX IF NOT EXISTS oplog_path ON oplog(path);
              CREATE TABLE IF NOT EXISTS files (
                path         TEXT PRIMARY KEY,
                content_hash BLOB,
                mode         INTEGER NOT NULL,
                size         INTEGER NOT NULL,
                vv           BLOB NOT NULL,
-               tombstone    INTEGER NOT NULL DEFAULT 0
+               tombstone    INTEGER NOT NULL DEFAULT 0,
+               uuid         BLOB,            -- file identity (FR-205)
+               meta         BLOB             -- canonical metadata (FR-106)
              );
              CREATE TABLE IF NOT EXISTS peers (
                node_id        BLOB PRIMARY KEY,
@@ -239,6 +296,36 @@ impl Store {
                value TEXT NOT NULL
              );",
         )?;
+
+        // v3 → v4 column migrations (CREATE TABLE IF NOT EXISTS cannot add
+        // columns to an existing DB; rusqlite has no ADD COLUMN IF NOT
+        // EXISTS, so probe via PRAGMA table_info). Indexes on the new
+        // columns only AFTER the columns exist.
+        for (table, column, decl) in [
+            ("oplog", "path_old", "TEXT"),
+            ("oplog", "uuid", "BLOB"),
+            ("oplog", "meta", "BLOB"),
+            ("files", "uuid", "BLOB"),
+            ("files", "meta", "BLOB"),
+        ] {
+            if !has_column(&conn, table, column)? {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS oplog_path_old ON oplog(path_old)
+               WHERE path_old IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS files_uuid ON files(uuid)
+               WHERE uuid IS NOT NULL;",
+        )?;
+        // Mint identities for pre-v4 rows (FR-205 migration). MUST be a pure
+        // function of the PATH alone — every node migrates independently and
+        // their minted uuids have to agree, or identity (and the leaf hash,
+        // once uuid joins it) diverges mesh-wide forever.
+        migrate_uuids(&mut conn)?;
 
         // One-time idempotent backfill from the M1 single-cursor layout.
         // recv_cursor was keyed (peer == origin); last_acked was "this peer
@@ -295,6 +382,25 @@ impl Store {
     pub async fn append_local(&self, change: LocalChange) -> Result<Option<OpRecord>, StoreError> {
         self.call(|reply| StoreCmd::AppendLocal { change, reply })
             .await
+    }
+
+    /// A locally-observed rename → one identity-preserving op (FR-205): the
+    /// source tombstones and the target continues the same uuid + VV lineage,
+    /// atomically. `None` = causal no-op. Emitted by the FID watcher's MOVED
+    /// pair; the scanner still observes un-watched renames as delete+create.
+    pub async fn append_local_rename(
+        &self,
+        old_path: &str,
+        new_path: &str,
+    ) -> Result<Option<OpRecord>, StoreError> {
+        let old_path = old_path.to_string();
+        let new_path = new_path.to_string();
+        self.call(|reply| StoreCmd::AppendLocalRename {
+            old_path,
+            new_path,
+            reply,
+        })
+        .await
     }
 
     /// Durably record the handling of a remote op and, when the decision
@@ -413,6 +519,45 @@ impl Store {
         .await
     }
 
+    /// Commit a conflict resolution: winner row + conflict-copy rows in ONE
+    /// transaction, after RE-DERIVING the plan from the freshly-loaded rows
+    /// and comparing it to what the caller staged (the stale-decision
+    /// re-check, extended to the conflict path — FR-303 routes through the
+    /// same committing discipline as `apply_remote`).
+    ///
+    /// State-plane only, like [`Store::reconcile_upsert`]: touches `files`
+    /// exclusively — no oplog row, no `applied` entry, no cursor movement.
+    /// The op-plane record for a live Concurrent op is the unchanged
+    /// `apply_remote(op, Concurrent)`; resolution is *derived locally* on
+    /// every node that witnesses the conflict and is never itself an op
+    /// (reconcile delivers the copy rows to nodes that never witness it).
+    ///
+    /// The caller must have staged every live row in `staged` on disk
+    /// (stage→fsync→verify→rename + suppression) BEFORE this call; on any
+    /// non-`Resolved` outcome it repairs the staging.
+    pub async fn resolve_rows(
+        &self,
+        path: &str,
+        remote: Version,
+        staged: Vec<PlannedRow>,
+    ) -> Result<ResolveOutcome, StoreError> {
+        let path = path.to_string();
+        self.call(|reply| StoreCmd::ResolveRows {
+            path,
+            remote: Box::new(remote),
+            staged,
+            reply,
+        })
+        .await
+    }
+
+    /// Full row for one path (size + VV included) — the conflict-resolution
+    /// planning view. Read-only.
+    pub async fn load_row(&self, path: &str) -> Result<Option<FileRow>, StoreError> {
+        let path = path.to_string();
+        self.call(|reply| StoreCmd::LoadRow { path, reply }).await
+    }
+
     /// Anti-entropy state apply — see [`ReconciledRow`] for the contract.
     /// Returns the effective decision (re-validated in the committing tx);
     /// on downgrade the caller repairs the disk.
@@ -484,6 +629,17 @@ fn run_store(
                 }
                 let _ = reply.send(res);
             }
+            StoreCmd::AppendLocalRename {
+                old_path,
+                new_path,
+                reply,
+            } => {
+                let res = append_local_rename(&mut conn, &node_id, &old_path, &new_path);
+                if let Ok(Some(op)) = &res {
+                    let _ = latest_tx.send(op.origin_seq);
+                }
+                let _ = reply.send(res);
+            }
             StoreCmd::ApplyRemote {
                 op,
                 decision,
@@ -519,7 +675,7 @@ fn run_store(
                 let _ = reply.send(cursor_value(&conn, &peer, &node_id, "last_acked_seq"));
             }
             StoreCmd::PutManifest { manifest, reply } => {
-                let _ = reply.send(state::put_manifest(&conn, &manifest));
+                let _ = reply.send(put_manifest_atomic(&mut conn, &manifest));
             }
             StoreCmd::ManifestFor {
                 content_hash,
@@ -529,6 +685,17 @@ fn run_store(
             }
             StoreCmd::ReconcileUpsert { row, reply } => {
                 let _ = reply.send(reconcile_upsert(&mut conn, &row));
+            }
+            StoreCmd::ResolveRows {
+                path,
+                remote,
+                staged,
+                reply,
+            } => {
+                let _ = reply.send(resolve_rows(&mut conn, &path, &remote, &staged));
+            }
+            StoreCmd::LoadRow { path, reply } => {
+                let _ = reply.send(state::load_row(&conn, &path));
             }
             StoreCmd::SnapshotForJoin { reply } => {
                 let _ = reply.send(snapshot_for_join(&conn));
@@ -564,6 +731,39 @@ fn run_store(
     // Channel closed: all handles dropped; the connection closes with us.
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    // `table` is a compile-time constant from this module, never user input.
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in names {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Identity for a row that predates v4 (FR-205 migration). A pure function of
+/// the PATH alone: every node mints independently and they MUST agree.
+pub fn migration_uuid(path: &str) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"replicore-uuid-migration");
+    h.update(path.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
+}
+
+/// One-time v4 backfill: mint deterministic identities for rows that predate
+/// the uuid column. Idempotent (touches only NULL rows). The mutation itself
+/// lives in `state.rs` — the single home of `files`-table writes.
+fn migrate_uuids(conn: &mut Connection) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    state::backfill_uuids(&tx, migration_uuid)?;
+    tx.commit()?;
+    Ok(())
+}
+
 fn latest_origin_seq(conn: &Connection, origin: &NodeId) -> Result<i64, StoreError> {
     Ok(conn.query_row(
         "SELECT COALESCE(MAX(origin_seq), 0) FROM oplog WHERE origin = ?1",
@@ -576,6 +776,7 @@ fn op_type_to_i64(t: OpType) -> i64 {
     match t {
         OpType::Write => 0,
         OpType::Delete => 1,
+        OpType::Rename => 2,
     }
 }
 
@@ -583,6 +784,7 @@ fn op_type_from_i64(v: i64) -> Result<OpType, StoreError> {
     match v {
         0 => Ok(OpType::Write),
         1 => Ok(OpType::Delete),
+        2 => Ok(OpType::Rename),
         _ => Err(StoreError::Corrupt("oplog.op_type")),
     }
 }
@@ -590,21 +792,37 @@ fn op_type_from_i64(v: i64) -> Result<OpType, StoreError> {
 fn insert_op(conn: &Connection, op: &OpRecord) -> Result<(), StoreError> {
     conn.execute(
         "INSERT OR IGNORE INTO oplog
-           (op_id, origin, origin_seq, op_type, path, mode, size, content_hash, vv)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+           (op_id, origin, origin_seq, op_type, path, path_old, uuid, mode, size, content_hash,
+            vv, meta)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             op.op_id.as_slice(),
             op.origin.as_slice(),
             op.origin_seq,
             op_type_to_i64(op.op_type),
             op.path,
+            op.path_old,
+            op.uuid.as_ref().map(|u| u.as_slice()),
             op.mode as i64,
             op.size as i64,
             op.content_hash.as_ref().map(|h| h.as_slice()),
             state::encode_vv(&op.vv)?,
+            state::encode_meta(op.meta.as_ref())?,
         ],
     )?;
     Ok(())
+}
+
+/// Identity minted at create (FR-205): `blake3(origin ‖ origin_seq ‖ path)`
+/// truncated — propagated by the op, so every node stores the same value.
+pub fn fresh_uuid(origin: &NodeId, origin_seq: i64, path: &str) -> [u8; 16] {
+    let mut h = blake3::Hasher::new();
+    h.update(origin);
+    h.update(&origin_seq.to_be_bytes());
+    h.update(path.as_bytes());
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&h.finalize().as_bytes()[..16]);
+    id
 }
 
 /// Local mutation → op, atomically. See [`Store::append_local`].
@@ -614,7 +832,7 @@ fn append_local(
     change: &LocalChange,
 ) -> Result<Option<OpRecord>, StoreError> {
     let tx = conn.transaction()?;
-    let local = state::load_file(&tx, &change.path)?;
+    let local = state::load_row(&tx, &change.path)?;
 
     // Causal no-op filter (second line of loop defense, FR-901): an applied
     // remote write re-observed by the scanner, or an unchanged file, must not
@@ -622,7 +840,13 @@ fn append_local(
     match change.op_type {
         OpType::Write => {
             if let Some(l) = &local {
-                if !l.tombstone && l.content_hash == change.content_hash {
+                // A meta-only change (same bytes, different xattrs/mode/
+                // owner/mtime) still emits an op (FR-106) — only a full
+                // content+meta match is a causal no-op.
+                if !l.tombstone
+                    && l.content_hash == change.content_hash
+                    && Meta::hash_of(&l.meta) == Meta::hash_of(&change.meta)
+                {
                     return Ok(None);
                 }
             }
@@ -632,21 +856,34 @@ fn append_local(
             Some(l) if l.tombstone => return Ok(None),
             Some(_) => {}
         },
+        OpType::Rename => return Err(StoreError::Corrupt("rename is not a LocalChange")),
     }
 
+    let origin_seq = latest_origin_seq(&tx, node_id)? + 1;
+    // Identity (FR-205): an overwrite or delete carries the row's uuid; a
+    // genuine create (no row, or writing over a tombstone) mints a fresh one.
+    let uuid = match &local {
+        Some(l) if !(change.op_type == OpType::Write && l.tombstone) => l
+            .uuid
+            .unwrap_or_else(|| migration_uuid(&change.path))
+            .into(),
+        _ => Some(fresh_uuid(node_id, origin_seq, &change.path)),
+    };
     let mut vv = local.map(|l| l.vv).unwrap_or_default();
     vv.increment(node_id); // FR-301: local write bumps our component
 
-    let origin_seq = latest_origin_seq(&tx, node_id)? + 1;
     let op = OpRecord {
         op_id: op_id(node_id, origin_seq),
         origin: *node_id,
         origin_seq,
         op_type: change.op_type,
         path: change.path.clone(),
+        path_old: None,
+        uuid,
         mode: change.mode,
         size: change.size,
         content_hash: change.content_hash,
+        meta: change.meta.clone(),
         vv: vv.clone(),
     };
     insert_op(&tx, &op)?;
@@ -659,6 +896,8 @@ fn append_local(
         change.size,
         &vv,
         tombstone,
+        uuid.as_ref(),
+        change.meta.as_ref(),
     )?;
     // The op and the manifest describing its content are atomically durable
     // together (FR-402: we must be able to serve chunks for our own ops).
@@ -669,6 +908,76 @@ fn append_local(
         state::put_manifest(&tx, manifest)?;
     }
     tx.commit()?; // durable before anything is pushed
+    Ok(Some(op))
+}
+
+/// A locally-observed rename → ONE identity-preserving op, atomically
+/// (FR-205, identity-lite): the source row becomes a tombstone and the target
+/// row continues the SAME uuid and VV lineage, bumped once. Renaming over an
+/// existing live target also absorbs the target's lineage (the user
+/// intentionally replaced it — receivers see a clean dominating apply, no
+/// spurious conflict, exactly like a local overwrite-write).
+///
+/// `None` when the source row is absent/tombstoned or `old == new` (causal
+/// no-op: e.g. the scanner re-observing an applied remote rename).
+fn append_local_rename(
+    conn: &mut Connection,
+    node_id: &NodeId,
+    old_path: &str,
+    new_path: &str,
+) -> Result<Option<OpRecord>, StoreError> {
+    if old_path == new_path {
+        return Ok(None);
+    }
+    let tx = conn.transaction()?;
+    let Some(src) = state::load_row(&tx, old_path)? else {
+        return Ok(None);
+    };
+    if src.tombstone {
+        return Ok(None);
+    }
+    // (No target-content no-op filter: even when the target already holds
+    // identical bytes the rename still tombstones the SOURCE. A re-observed
+    // applied remote rename is caught by the tombstoned-source check above.)
+
+    let origin_seq = latest_origin_seq(&tx, node_id)? + 1;
+    let uuid = src.uuid.unwrap_or_else(|| migration_uuid(old_path));
+    let mut vv = src.vv.clone();
+    if let Some(dst) = state::load_row(&tx, new_path)? {
+        vv.merge(&dst.vv); // absorb a replaced target's lineage
+    }
+    vv.increment(node_id);
+
+    let op = OpRecord {
+        op_id: op_id(node_id, origin_seq),
+        origin: *node_id,
+        origin_seq,
+        op_type: OpType::Rename,
+        path: new_path.to_string(),
+        path_old: Some(old_path.to_string()),
+        uuid: Some(uuid),
+        mode: src.mode,
+        size: src.size,
+        content_hash: src.content_hash,
+        meta: src.meta.clone(),
+        vv: vv.clone(),
+    };
+    insert_op(&tx, &op)?;
+    // Both path-effects in the one transaction: tombstone the source,
+    // continue the file at the target.
+    state::upsert_file(&tx, old_path, None, 0, 0, &vv, true, Some(&uuid), None)?;
+    state::upsert_file(
+        &tx,
+        new_path,
+        src.content_hash.as_ref(),
+        src.mode,
+        src.size,
+        &vv,
+        false,
+        Some(&uuid),
+        src.meta.as_ref(),
+    )?;
+    tx.commit()?;
     Ok(Some(op))
 }
 
@@ -706,7 +1015,10 @@ fn apply_remote(
                 let mut vv = local.map(|l| l.vv).unwrap_or_default();
                 vv.merge(&op.vv);
                 match op.op_type {
-                    OpType::Write => state::upsert_file(
+                    // Rename's primary (target-path) effect: the file
+                    // continues here — same uuid, same content, the lineage
+                    // the op carries.
+                    OpType::Write | OpType::Rename => state::upsert_file(
                         &tx,
                         &op.path,
                         op.content_hash.as_ref(),
@@ -714,12 +1026,49 @@ fn apply_remote(
                         op.size,
                         &vv,
                         false,
+                        op.uuid.as_ref(),
+                        op.meta.as_ref(),
                     )?,
                     // Tombstone, never a hard delete (FR-204).
-                    OpType::Delete => {
-                        state::upsert_file(&tx, &op.path, None, op.mode, 0, &vv, true)?
-                    }
+                    OpType::Delete => state::upsert_file(
+                        &tx,
+                        &op.path,
+                        None,
+                        op.mode,
+                        0,
+                        &vv,
+                        true,
+                        op.uuid.as_ref(),
+                        None,
+                    )?,
                 }
+            }
+        }
+        // Rename's SECOND path-effect: tombstone the source — decided
+        // independently per-path, in the same transaction (the two halves
+        // are atomic). A concurrent write to the source is simply not
+        // dominated: the source row stays (modify wins; the caller resolves
+        // it as a normal per-path conflict — identity-lite, FR-205).
+        if op.op_type == OpType::Rename {
+            if let Some(old_path) = &op.path_old {
+                let old_local = state::load_file(&tx, old_path)?;
+                if decide(old_local.as_ref(), &op.vv) == Decision::Apply {
+                    let mut vv = old_local.map(|l| l.vv).unwrap_or_default();
+                    vv.merge(&op.vv);
+                    state::upsert_file(
+                        &tx,
+                        old_path,
+                        None,
+                        0,
+                        0,
+                        &vv,
+                        true,
+                        op.uuid.as_ref(),
+                        None,
+                    )?;
+                }
+            } else {
+                return Err(StoreError::Corrupt("rename op without path_old"));
             }
         }
         // Decision::Ignore / ::Concurrent / ::Quarantined (incl. an Apply
@@ -765,7 +1114,8 @@ fn ops_since(
     limit: u32,
 ) -> Result<Vec<OpRecord>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT op_id, origin, origin_seq, op_type, path, mode, size, content_hash, vv
+        "SELECT op_id, origin, origin_seq, op_type, path, path_old, uuid, mode, size,
+                content_hash, vv, meta
          FROM oplog WHERE origin = ?1 AND origin_seq > ?2
          ORDER BY origin_seq ASC LIMIT ?3",
     )?;
@@ -776,15 +1126,31 @@ fn ops_since(
             row.get::<_, i64>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, String>(4)?,
-            row.get::<_, i64>(5)?,
-            row.get::<_, i64>(6)?,
-            row.get::<_, Option<Vec<u8>>>(7)?,
-            row.get::<_, Vec<u8>>(8)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+            row.get::<_, Option<Vec<u8>>>(9)?,
+            row.get::<_, Vec<u8>>(10)?,
+            row.get::<_, Option<Vec<u8>>>(11)?,
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (op_id_b, origin_b, origin_seq, op_type, path, mode, size, hash, vv_blob) = row?;
+        let (
+            op_id_b,
+            origin_b,
+            origin_seq,
+            op_type,
+            path,
+            path_old,
+            uuid,
+            mode,
+            size,
+            hash,
+            vv_blob,
+            meta,
+        ) = row?;
         out.push(OpRecord {
             op_id: op_id_b
                 .try_into()
@@ -795,6 +1161,10 @@ fn ops_since(
             origin_seq,
             op_type: op_type_from_i64(op_type)?,
             path,
+            path_old,
+            uuid: uuid
+                .map(|u| u.try_into().map_err(|_| StoreError::Corrupt("oplog.uuid")))
+                .transpose()?,
             mode: mode as u32,
             size: size as u64,
             content_hash: hash
@@ -803,6 +1173,7 @@ fn ops_since(
                         .map_err(|_| StoreError::Corrupt("oplog.content_hash"))
                 })
                 .transpose()?,
+            meta: state::decode_meta(meta)?,
             vv: state::decode_vv(&vv_blob)?,
         });
     }
@@ -874,10 +1245,163 @@ fn reconcile_upsert(conn: &mut Connection, row: &ReconciledRow) -> Result<Decisi
             row.size,
             &vv,
             row.tombstone,
+            row.uuid.as_ref(),
+            row.meta.as_ref(),
         )?;
     }
     tx.commit()?;
     Ok(effective)
+}
+
+/// The path's op history as resolution candidates — every op ever recorded
+/// that affects `path`, live-stream or local, in arrival order (the antichain
+/// scan normalizes order away). A Rename affects TWO paths: as the target it
+/// is a write-shaped candidate; as the source it is a tombstone-shaped one.
+fn ops_as_candidates(conn: &Connection, path: &str) -> Result<Vec<Version>, StoreError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT op_type, mode, size, content_hash, vv, uuid, path, meta
+         FROM oplog WHERE path = ?1 OR path_old = ?1",
+    )?;
+    let rows = stmt.query_map([path], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<Vec<u8>>>(7)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (op_type, mode, size, hash, vv_blob, uuid, op_path, meta) = row?;
+        let op_type = op_type_from_i64(op_type)?;
+        // A rename matched via path_old contributes its SOURCE effect here.
+        let as_source = op_type == OpType::Rename && op_path != path;
+        let tombstone = op_type == OpType::Delete || as_source;
+        let meta = if tombstone {
+            None
+        } else {
+            state::decode_meta(meta)?
+        };
+        out.push(Version {
+            tombstone,
+            content_hash: if tombstone {
+                None
+            } else {
+                hash.map(|h| {
+                    h.try_into()
+                        .map_err(|_| StoreError::Corrupt("oplog.content_hash"))
+                })
+                .transpose()?
+            },
+            meta_hash: Meta::hash_of(&meta),
+            meta,
+            mode: if tombstone { 0 } else { mode as u32 },
+            size: if tombstone { 0 } else { size as u64 },
+            vv: state::decode_vv(&vv_blob)?,
+            uuid: uuid
+                .map(|u| u.try_into().map_err(|_| StoreError::Corrupt("oplog.uuid")))
+                .transpose()?,
+        });
+    }
+    Ok(out)
+}
+
+/// Conflict resolution, ONE transaction (see [`Store::resolve_rows`]).
+///
+/// Candidates = the path's op history ∪ {the remote version} ∪ {the current
+/// row, only when the ops do not fully explain its VV — e.g. after a join
+/// bootstrap, where state arrived without history}. Deriving from the op SET
+/// (not the row/op pair) is what makes resolution confluent: max over an
+/// antichain is delivery-order-free, and a causally-superseded intermediate
+/// is never maximal, so it can never win. When the row IS fully covered by
+/// ops it must be excluded — its merged VV would otherwise dominate every op
+/// and collapse the derivation back to the non-confluent pairwise contest.
+///
+/// The committing re-check, conflict flavor: the caller staged disk for a
+/// plan derived BEFORE a multi-second loser fetch. The plan is re-derived
+/// here from state under the committing transaction; only an exact match
+/// commits. A concurrent local write during the fetch changes the derivation
+/// (a new op at minimum) and comes back `Stale` with the fresh plan — nothing
+/// committed, the caller restages and retries. Trusting the stale plan would
+/// clobber the newer write exactly like the stale-Apply hazard `apply_remote`
+/// guards against.
+fn resolve_rows(
+    conn: &mut Connection,
+    path: &str,
+    remote: &Version,
+    staged: &[PlannedRow],
+) -> Result<ResolveOutcome, StoreError> {
+    let tx = conn.transaction()?;
+    let local_row = state::load_row(&tx, path)?;
+    let local_lf = local_row.as_ref().map(|r| LocalFile {
+        vv: r.vv.clone(),
+        tombstone: r.tombstone,
+        content_hash: r.content_hash,
+        mode: r.mode,
+    });
+    let decision = decide(local_lf.as_ref(), &remote.vv);
+    if decision != Decision::Concurrent {
+        return Ok(ResolveOutcome::NotConcurrent(decision));
+    }
+    // decide(None, _) is Apply, so a Concurrent decision proves the row exists.
+    let Some(local_row) = local_row else {
+        return Err(StoreError::Corrupt("concurrent decision without a row"));
+    };
+    let mut candidates = ops_as_candidates(&tx, path)?;
+    candidates.push(remote.clone());
+    let mut coverage = crate::vv::VersionVector::new();
+    for c in &candidates {
+        coverage.merge(&c.vv);
+    }
+    match coverage.compare(&local_row.vv) {
+        // Ops (+ remote) fully explain the row: derive from history alone.
+        crate::vv::Ord3::Dominates | crate::vv::Ord3::Equal => {}
+        // The row embodies history we hold no ops for: it is a candidate.
+        _ => candidates.push(Version::from_row(&local_row)),
+    }
+    let derived = conflict::plan_candidates(path, &candidates, &mut |p| {
+        state::load_row(&tx, p).map(|row| row.as_ref().map(Version::from_row))
+    })?;
+    let Some(derived) = derived else {
+        return Ok(ResolveOutcome::Unresolvable);
+    };
+    if derived != staged {
+        return Ok(ResolveOutcome::Stale { plan: derived });
+    }
+    for row in &derived {
+        state::upsert_file(
+            &tx,
+            &row.path,
+            row.content_hash.as_ref(),
+            row.mode,
+            row.size,
+            &row.vv,
+            row.tombstone,
+            row.uuid.as_ref(),
+            row.meta.as_ref(),
+        )?;
+    }
+    tx.commit()?;
+    Ok(ResolveOutcome::Resolved)
+}
+
+/// Persist a manifest ATOMICALLY (review/QA finding): the standalone
+/// receiver path (`obtain_manifest` → `Store::put_manifest`) ran the
+/// `manifests` row + the `manifest_chunks` rows as separate autocommit
+/// statements, so a kill -9 mid-persist left a partial manifest that
+/// `manifest_for` then rejected forever — wedging the node in a reconnect
+/// loop ("bad manifest_chunks row count"). One transaction makes it
+/// all-or-nothing. (`append_local` already persists its manifest inside the
+/// op's transaction; this closes the only non-atomic path.)
+fn put_manifest_atomic(conn: &mut Connection, m: &Manifest) -> Result<(), StoreError> {
+    let tx = conn.transaction()?;
+    state::put_manifest(&tx, m)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn op_count(conn: &Connection) -> Result<i64, StoreError> {
@@ -959,6 +1483,7 @@ mod tests {
             mode: 0o644,
             size: 3,
             content_hash: Some(hash),
+            meta: None,
             manifest: None,
         }
     }
@@ -970,6 +1495,7 @@ mod tests {
             mode: 0o644,
             size: 0,
             content_hash: None,
+            meta: None,
             manifest: None,
         }
     }
@@ -1052,9 +1578,12 @@ mod tests {
             origin_seq: 1,
             op_type: OpType::Write,
             path: "y/z".into(),
+            path_old: None,
+            uuid: None,
             mode: 0o600,
             size: 5,
             content_hash: Some([7; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store
@@ -1090,9 +1619,12 @@ mod tests {
             origin_seq: 1,
             op_type: OpType::Write,
             path: "p".into(),
+            path_old: None,
+            uuid: None,
             mode: 0o644,
             size: 1,
             content_hash: Some([2; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(), // concurrent with ours
         };
         store
@@ -1124,9 +1656,12 @@ mod tests {
             origin_seq: 9,
             op_type: OpType::Write,
             path: "other".into(),
+            path_old: None,
+            uuid: None,
             mode: 0o644,
             size: 1,
             content_hash: Some([9; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store.apply_remote(remote, Decision::Apply).await.unwrap();
@@ -1242,6 +1777,8 @@ mod tests {
             size: 10,
             vv: [(NODE_B, 2u64)].into_iter().collect(),
             tombstone: false,
+            uuid: None,
+            meta: None,
         };
         assert_eq!(
             store.reconcile_upsert(row.clone()).await.unwrap(),
@@ -1315,9 +1852,12 @@ mod tests {
             origin_seq: 1,
             op_type: OpType::Write,
             path: "race/p".into(),
+            path_old: None,
+            uuid: None,
             mode: 0o644,
             size: 8,
             content_hash: Some([0xbb; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         let stale_local = store.load_file("race/p").await.unwrap();
@@ -1399,9 +1939,12 @@ mod tests {
             origin_seq: 5,
             op_type: OpType::Write,
             path: "c".into(),
+            path_old: None,
+            uuid: None,
             mode: 0o644,
             size: 1,
             content_hash: Some([3; 32]),
+            meta: None,
             vv: [(NODE_B, 1u64)].into_iter().collect(),
         };
         store.apply_remote(remote, Decision::Apply).await.unwrap();

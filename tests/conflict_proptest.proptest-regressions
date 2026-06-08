@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 22a17c60b4bb979e23da52eee02ba569db4c395806ea5d701800a59ae9074710 # shrinks to scripts = [[], [(0, Write(0))], [(0, Write(1)), (0, Write(0))]], picks = [[Index(0)], [Index(0)], [Index(0)]], dups = [Index(0)]
+cc 521016f0018610f7fb94b03ceaa51b590aca3e068ea2c1b17dc0d835fe3237ac # shrinks to scripts = [[], [], [(0, Write(1)), (2, Write(1)), (0, Rename(2))]], picks = [[Index(0)], [Index(0)], [Index(0)]], dups = [Index(0)]

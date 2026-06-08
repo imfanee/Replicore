@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! suppress.rs — apply-suppression set, the second mandatory half of loop
 //! prevention (FR-902; FR-901 VV dedup is the other half — BOTH are required).
 //!

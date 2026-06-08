@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! main.rs — `replicored` entrypoint (anyhow boundary).
 //!
 //!   replicored gen-cert --out-dir DIR --name NAME
@@ -69,6 +70,23 @@ async fn run(mut args: impl Iterator<Item = String>) -> Result<()> {
         .with_context(|| format!("load config {}", config_path.display()))?;
     if cfg.peers.is_empty() {
         tracing::warn!("no [[peers]] configured; running standalone (nothing will replicate)");
+    }
+
+    // owner_policy = "numeric" without CAP_CHOWN is refused at boot: every
+    // ownership apply would EPERM-skip, and unprivileged daemons with
+    // differing uids ping-pong corrective metadata ops FOREVER (a silent op
+    // storm — review finding). The two valid configurations are explicit.
+    if cfg.owner_policy == replicore::metadata::OwnerPolicy::Numeric {
+        let probe_dir = cfg.db_path.parent().unwrap_or(std::path::Path::new("."));
+        let ok = replicore::metadata::can_chown(probe_dir)
+            .context("probe CAP_CHOWN for owner_policy = numeric")?;
+        if !ok {
+            bail!(
+                "owner_policy = \"numeric\" requires CAP_CHOWN (this daemon cannot chown). \
+                 Either run the daemon privileged, or set owner_policy = \"skip\" — the \
+                 policy must be uniform across the mesh."
+            );
+        }
     }
 
     if let Some(parent) = cfg.db_path.parent() {

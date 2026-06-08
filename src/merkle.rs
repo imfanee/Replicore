@@ -1,10 +1,12 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! merkle.rs — Merkle-tree anti-entropy (FR-701/702/703).
 //!
-//! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ vv)` — metadata
-//! beyond the tombstone flag is deliberately EXCLUDED (mode/size fidelity is
-//! M3; hashing fields we do not reconcile would make trees differ forever).
-//! Directory nodes hash their sorted children. Two replicas in the same
-//! causal state therefore have identical roots, tombstones included.
+//! Leaf = `blake3(path ‖ 0x00 ‖ tombstone ‖ content_hash ‖ uuid ‖ meta_hash
+//! ‖ vv)` (the v4 formula — identity and full metadata are reconciled state
+//! as of M3/FR-106; `mode`/`size` ride the rows but stay out of the hash, as
+//! they are summaries of `meta`/content). Directory nodes hash their sorted
+//! children. Two replicas in the same causal state have identical roots,
+//! tombstones included.
 //!
 //! The tree is built per session from the `files` index (db rows only — no
 //! file I/O), O(files) locally; **network descent is O(differences)**: a
@@ -16,21 +18,28 @@
 //! Sessions are pull-based and one-directional: the initiator fetches what it
 //! lacks; the responder mutates nothing. Both sides of a link each run their
 //! own pull, which converges the pair (the dominated side adopts; Equal
-//! no-ops; Concurrent is detected and skipped — resolution is M3). Applies go
-//! through `decide()` + `Store::reconcile_upsert` (state plane: files row
-//! only, never op cursors) with suppression registered like any apply, so a
-//! reconcile session can run concurrently with the live op stream: the single
-//! store thread linearizes, VV merges are idempotent, and whichever path
-//! lands a dominating vector first turns the other into an Ignore.
+//! no-ops; Concurrent is RESOLVED deterministically — winner + conflict
+//! copies through `Store::resolve_rows`, M3 FR-303). Applies go through
+//! `decide()` + `Store::reconcile_upsert`/`resolve_rows` (state plane: files
+//! rows only, never op cursors) with suppression registered like any apply,
+//! so a reconcile session can run concurrently with the live op stream: the
+//! single store thread linearizes, VV merges are idempotent, and whichever
+//! path lands a dominating vector first turns the other into an Ignore.
+//! Reconcile is also what hands conflict-copy rows to a node that never
+//! witnessed the conflict on the op plane (its causal successor arrived
+//! first) — the resolution backstop.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::apply::{apply_delete, apply_version, ApplyError};
 use crate::chunk::{Cas, Manifest};
+use crate::conflict::PlannedRow;
+use crate::conflict::Version;
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
-use crate::oplog::{ReconciledRow, Store, StoreError};
+use crate::metadata::{Meta, OwnerPolicy};
+use crate::oplog::{ReconciledRow, ResolveOutcome, Store, StoreError};
 use crate::proto::{ProtoError, WireChild};
 use crate::state::FileRow;
 use crate::suppress::Suppressor;
@@ -61,19 +70,37 @@ fn leaf_error_is_skippable(e: &ReconcileError) -> bool {
     match e {
         ReconcileError::Apply(ApplyError::UnsafePath(_)) => true,
         ReconcileError::Apply(ApplyError::HashMismatch(_)) => true,
+        // A local directory squatting the leaf's path (review finding S6):
+        // retrying this session cannot fix it; skip the leaf, keep the
+        // session.
+        ReconcileError::Apply(ApplyError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            true
+        }
         ReconcileError::Fetch(f) => f.is_permanent(),
         ReconcileError::Violation(_) => true,
         _ => false,
     }
 }
 
-/// Merkle leaf hash. Pure; field-sensitivity is unit-tested.
+/// Merkle leaf hash (v4 formula). Pure; field-sensitivity is unit-tested.
+/// Identity and metadata joined the leaf in M3 — they are reconciled state
+/// now, so differing uuid/meta MUST make trees differ (FR-106: a metadata-
+/// only divergence heals through anti-entropy like any other).
 pub fn leaf_hash(row: &FileRow) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(row.path.as_bytes());
     h.update(&[0x00]);
     h.update(&[row.tombstone as u8]);
     h.update(row.content_hash.as_ref().unwrap_or(&[0u8; 32]));
+    h.update(row.uuid.as_ref().unwrap_or(&[0u8; 16]));
+    h.update(&Meta::hash_of(&row.meta));
     // BTreeMap-backed VV: bincode encoding is deterministic.
     if let Ok(vv) = bincode::serialize(&row.vv) {
         h.update(&vv);
@@ -216,6 +243,8 @@ pub struct RemoteLeaf {
     pub vv: VersionVector,
     pub mode: u32,
     pub size: u64,
+    pub uuid: Option<[u8; 16]>,
+    pub meta: Option<Meta>,
 }
 
 /// Session transport, abstracted so the convergence property test can drive
@@ -242,6 +271,8 @@ pub struct ReconcileCtx<'a> {
     pub cas: &'a Cas,
     pub share: &'a Path,
     pub suppress: &'a Suppressor,
+    /// Ownership apply policy (FR-106) — uniform mesh-wide.
+    pub policy: OwnerPolicy,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -250,6 +281,12 @@ pub struct ReconcileReport {
     pub tree_reqs: u64,
     pub leaves_compared: u64,
     pub applied: u64,
+    /// Concurrent leaves RESOLVED this session: winner + copies committed
+    /// through `resolve_rows` (FR-303).
+    pub resolved_conflicts: u64,
+    /// Concurrent leaves detected but NOT resolved this session (staging
+    /// failed, retries exhausted under local-write interference): local state
+    /// kept, a later session retries.
     pub skipped_concurrent: u64,
     /// Permanently unmaterializable leaves (hostile path / content gone):
     /// logged, skipped, left for a superseding op or a later session.
@@ -311,23 +348,35 @@ async fn handle_leaf<T: ReconcileTransport>(
     match decide(local_row.as_ref(), &rleaf.vv) {
         Decision::Ignore | Decision::Quarantined => Ok(()),
         Decision::Concurrent => {
-            report.skipped_concurrent += 1;
-            tracing::warn!(
-                path,
-                "reconcile: concurrent versions; keeping local (M3 resolves)"
-            );
+            // FR-303: resolve, don't skip — winner + conflict copies through
+            // the committing transaction. This is also how copy rows reach a
+            // node that never witnessed the conflict on the op plane.
+            match resolve_concurrent_leaf(path, &rleaf, remote, ctx).await {
+                Ok(true) => report.resolved_conflicts += 1,
+                Ok(false) => report.skipped_concurrent += 1,
+                Err(e) if leaf_error_is_skippable(&e) => {
+                    report.skipped_damaged += 1;
+                    tracing::error!(path, error = %e,
+                        "reconcile: conflict copy unmaterializable; skipping");
+                }
+                Err(e) => return Err(e),
+            }
             Ok(())
         }
         Decision::Apply => match apply_remote_leaf(path, &rleaf, remote, ctx).await {
             // The committing re-check inside reconcile_upsert may downgrade
             // a stale Apply (a concurrent local write landed during the
-            // content fetch); the disk clobber was repaired inside
-            // apply_remote_leaf — count it as the conflict it is.
-            Ok(Decision::Apply) => {
+            // content fetch); the disk clobber was repaired and the conflict
+            // RESOLVED inside apply_remote_leaf.
+            Ok(LeafOutcome::Applied) => {
                 report.applied += 1;
                 Ok(())
             }
-            Ok(_) => {
+            Ok(LeafOutcome::Resolved) => {
+                report.resolved_conflicts += 1;
+                Ok(())
+            }
+            Ok(LeafOutcome::Skipped) => {
                 report.skipped_concurrent += 1;
                 Ok(())
             }
@@ -342,12 +391,173 @@ async fn handle_leaf<T: ReconcileTransport>(
     }
 }
 
+/// How one leaf apply ended (the Apply-decision path).
+enum LeafOutcome {
+    Applied,
+    /// The committing re-check downgraded to Concurrent and the conflict was
+    /// resolved (winner + copies committed).
+    Resolved,
+    /// Downgraded and resolution did not complete: local kept, retried later.
+    Skipped,
+}
+
+/// The conflict-resolution loop, reconcile flavor (FR-303): ask the store for
+/// the authoritative plan (empty staging never matches), stage its contents
+/// on disk through the atomic-apply discipline, commit. `Stale` re-derives
+/// under local-write interference; bounded retries. Returns whether the
+/// resolution committed. On any non-committed exit every path staged here is
+/// restored from its committed row, so no uncommitted content (and no orphan
+/// copy the scanner would mint an op for) is left on disk.
+async fn resolve_concurrent_leaf<T: ReconcileTransport>(
+    path: &str,
+    rleaf: &RemoteLeaf,
+    remote: &mut T,
+    ctx: &ReconcileCtx<'_>,
+) -> Result<bool, ReconcileError> {
+    let rv = Version {
+        tombstone: rleaf.tombstone,
+        content_hash: rleaf.content_hash,
+        meta_hash: Meta::hash_of(&rleaf.meta),
+        meta: rleaf.meta.clone(),
+        mode: rleaf.mode,
+        size: rleaf.size,
+        vv: rleaf.vv.clone(),
+        uuid: rleaf.uuid,
+    };
+    let mut staged: Vec<PlannedRow> = Vec::new();
+    let mut staged_paths: Vec<String> = Vec::new();
+    for _ in 0..4 {
+        match ctx
+            .store
+            .resolve_rows(path, rv.clone(), std::mem::take(&mut staged))
+            .await?
+        {
+            ResolveOutcome::Resolved => {
+                tracing::info!(path, "reconcile: conflict resolved (FR-303)");
+                return Ok(true);
+            }
+            ResolveOutcome::NotConcurrent(_) => {
+                restore_paths(ctx, &staged_paths).await;
+                return Ok(false);
+            }
+            ResolveOutcome::Unresolvable => {
+                tracing::error!(
+                    path,
+                    "reconcile: conflict copy chain too deep; keeping local"
+                );
+                restore_paths(ctx, &staged_paths).await;
+                return Ok(false);
+            }
+            ResolveOutcome::Stale { plan } => {
+                for row in &plan {
+                    match stage_planned_row(row, remote, ctx).await {
+                        Ok(true) => staged_paths.push(row.path.clone()),
+                        Ok(false) => {}
+                        Err(e) => {
+                            restore_paths(ctx, &staged_paths).await;
+                            return Err(e);
+                        }
+                    }
+                }
+                staged = plan;
+            }
+        }
+    }
+    tracing::warn!(
+        path,
+        "reconcile: resolution retries exhausted under local writes; later session retries"
+    );
+    restore_paths(ctx, &staged_paths).await;
+    Ok(false)
+}
+
+/// Stage one planned row's content on disk (stage→fsync→verify→rename +
+/// suppression — the only apply discipline). Content comes from the local
+/// manifest + CAS when we hold it (local writes chunk into the CAS at
+/// ingest), else from the session transport. Returns whether the disk was
+/// touched (an already-current path needs no staging).
+async fn stage_planned_row<T: ReconcileTransport>(
+    row: &PlannedRow,
+    remote: &mut T,
+    ctx: &ReconcileCtx<'_>,
+) -> Result<bool, ReconcileError> {
+    if row.tombstone {
+        let share = ctx.share.to_path_buf();
+        let rel = row.path.clone();
+        let suppress = ctx.suppress.clone();
+        tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
+        return Ok(true);
+    }
+    // Already current on disk (e.g. the winner is the local content): the
+    // commit only moves the row's VV — but metadata may still differ.
+    let meta_kind_regular = row
+        .meta
+        .as_ref()
+        .map(|m| m.kind == crate::metadata::FileKind::Regular)
+        .unwrap_or(true);
+    if let Some(cur) = ctx.store.load_row(&row.path).await? {
+        if !cur.tombstone
+            && cur.content_hash == row.content_hash
+            && Meta::hash_of(&cur.meta) == Meta::hash_of(&row.meta)
+        {
+            return Ok(false);
+        }
+    }
+    // Regular content needs its manifest (and possibly a fetch); symlinks
+    // and special nodes build from the meta alone.
+    let manifest = match (row.content_hash, meta_kind_regular) {
+        (Some(hash), true) => Some(match ctx.store.manifest_for(hash).await? {
+            Some(m) => m,
+            None => {
+                let m = remote.ensure_content(hash, ctx.cas).await?;
+                // Persist the structure: a committed copy row must be
+                // SERVABLE (peers pull copy rows via reconcile — that is how
+                // copies reach nodes that never witnessed the conflict).
+                ctx.store.put_manifest(m.clone()).await?;
+                m
+            }
+        }),
+        _ => None,
+    };
+    let share = ctx.share.to_path_buf();
+    let rel = row.path.clone();
+    let mode = row.mode;
+    let hash = row.content_hash;
+    let meta = row.meta.clone();
+    let policy = ctx.policy;
+    let suppress = ctx.suppress.clone();
+    let cas = ctx.cas.clone();
+    tokio::task::spawn_blocking(move || {
+        apply_version(
+            &share,
+            &rel,
+            mode,
+            hash.as_ref(),
+            manifest.as_ref(),
+            &cas,
+            meta.as_ref(),
+            policy,
+            &suppress,
+        )
+    })
+    .await??;
+    Ok(true)
+}
+
+/// Restore every path in `paths` from its committed row — the repair for
+/// staged-but-not-committed resolution content.
+async fn restore_paths(ctx: &ReconcileCtx<'_>, paths: &[String]) {
+    for p in paths {
+        restore_local_content(ctx.store, ctx.cas, ctx.share, ctx.suppress, p).await;
+    }
+}
+
 async fn apply_remote_leaf<T: ReconcileTransport>(
     path: &str,
     rleaf: &RemoteLeaf,
     remote: &mut T,
     ctx: &ReconcileCtx<'_>,
-) -> Result<Decision, ReconcileError> {
+) -> Result<LeafOutcome, ReconcileError> {
     let effective;
     if rleaf.tombstone {
         let share = ctx.share.to_path_buf();
@@ -363,21 +573,46 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
                 size: 0,
                 vv: rleaf.vv.clone(),
                 tombstone: true,
+                uuid: rleaf.uuid,
+                meta: None,
             })
             .await?;
     } else {
-        let hash = rleaf
-            .content_hash
-            .ok_or(ReconcileError::Violation("live leaf without content hash"))?;
-        let manifest = remote.ensure_content(hash, ctx.cas).await?;
+        let regular = rleaf
+            .meta
+            .as_ref()
+            .map(|m| m.kind == crate::metadata::FileKind::Regular)
+            .unwrap_or(true);
+        let manifest = match (rleaf.content_hash, regular) {
+            (Some(hash), true) => Some(remote.ensure_content(hash, ctx.cas).await?),
+            (None, true) => {
+                return Err(ReconcileError::Violation(
+                    "regular leaf without content hash",
+                ))
+            }
+            _ => None, // symlink/special: payload rides in the meta
+        };
         {
             let share = ctx.share.to_path_buf();
             let rel = path.to_string();
             let mode = rleaf.mode;
+            let hash = rleaf.content_hash;
+            let meta = rleaf.meta.clone();
+            let policy = ctx.policy;
             let suppress = ctx.suppress.clone();
             let cas = ctx.cas.clone();
             tokio::task::spawn_blocking(move || {
-                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    manifest.as_ref(),
+                    &cas,
+                    meta.as_ref(),
+                    policy,
+                    &suppress,
+                )
             })
             .await??;
         }
@@ -385,25 +620,35 @@ async fn apply_remote_leaf<T: ReconcileTransport>(
             .store
             .reconcile_upsert(ReconciledRow {
                 path: path.to_string(),
-                content_hash: Some(hash),
+                content_hash: rleaf.content_hash,
                 mode: rleaf.mode,
                 size: rleaf.size,
                 vv: rleaf.vv.clone(),
                 tombstone: false,
+                uuid: rleaf.uuid,
+                meta: rleaf.meta.clone(),
             })
             .await?;
     }
-    if effective != Decision::Apply {
-        // Stale decision: the unlink/rename above clobbered a concurrent
-        // local write — put the committed local state back on disk.
-        tracing::warn!(
-            path,
-            ?effective,
-            "reconcile: concurrent local write landed during fetch; restoring local content"
-        );
-        restore_local_content(ctx.store, ctx.cas, ctx.share, ctx.suppress, path).await;
+    if effective == Decision::Apply {
+        return Ok(LeafOutcome::Applied);
     }
-    Ok(effective)
+    // Stale decision: the unlink/rename above clobbered a concurrent local
+    // write — put the committed local state back on disk, then RESOLVE the
+    // conflict the downgrade just proved (the second reconcile Concurrent
+    // site gets the same FR-303 treatment as the first).
+    tracing::warn!(
+        path,
+        ?effective,
+        "reconcile: concurrent local write landed during fetch; restoring and resolving"
+    );
+    restore_local_content(ctx.store, ctx.cas, ctx.share, ctx.suppress, path).await;
+    if effective == Decision::Concurrent
+        && resolve_concurrent_leaf(path, rleaf, remote, ctx).await?
+    {
+        return Ok(LeafOutcome::Resolved);
+    }
+    Ok(LeafOutcome::Skipped)
 }
 
 /// Re-materialize `path`'s on-disk content from the LOCAL committed row —
@@ -421,7 +666,7 @@ pub(crate) async fn restore_local_content(
     suppress: &Suppressor,
     path: &str,
 ) {
-    let row = match store.load_file(path).await {
+    let row = match store.load_row(path).await {
         Ok(row) => row,
         Err(e) => {
             tracing::error!(path, error = %e, "restore: cannot load local row");
@@ -430,28 +675,51 @@ pub(crate) async fn restore_local_content(
     };
     match row {
         Some(local) if !local.tombstone => {
-            let Some(hash) = local.content_hash else {
-                tracing::error!(path, "restore: live row without content hash");
-                return;
-            };
-            let manifest = match store.manifest_for(hash).await {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    tracing::error!(path, "restore: local manifest missing; scanner will heal");
+            let regular = local
+                .meta
+                .as_ref()
+                .map(|m| m.kind == crate::metadata::FileKind::Regular)
+                .unwrap_or(true);
+            let manifest = match (local.content_hash, regular) {
+                (Some(hash), true) => match store.manifest_for(hash).await {
+                    Ok(Some(m)) => Some(m),
+                    Ok(None) => {
+                        tracing::error!(path, "restore: local manifest missing; scanner will heal");
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!(path, error = %e, "restore: manifest lookup failed");
+                        return;
+                    }
+                },
+                (None, true) => {
+                    tracing::error!(path, "restore: live row without content hash");
                     return;
                 }
-                Err(e) => {
-                    tracing::error!(path, error = %e, "restore: manifest lookup failed");
-                    return;
-                }
+                _ => None, // symlink/special rebuild from the meta
             };
             let share = share.to_path_buf();
             let rel = path.to_string();
             let mode = local.mode;
+            let hash = local.content_hash;
+            let meta = local.meta.clone();
             let suppress = suppress.clone();
             let cas = cas.clone();
             let result = tokio::task::spawn_blocking(move || {
-                apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    manifest.as_ref(),
+                    &cas,
+                    meta.as_ref(),
+                    // Restore is repair of OUR OWN disk from OUR row: numeric
+                    // is always faithful here (the row's meta was captured or
+                    // applied under the mesh policy already).
+                    OwnerPolicy::Numeric,
+                    &suppress,
+                )
             })
             .await;
             match result {
@@ -496,6 +764,8 @@ mod tests {
             size: 1,
             tombstone,
             vv: [(nid(1), vva)].into_iter().collect(),
+            uuid: None,
+            meta: None,
         }
     }
 
@@ -515,7 +785,25 @@ mod tests {
         let mut other = base.clone();
         other.vv = [(nid(1), 2u64)].into_iter().collect();
         assert_ne!(leaf_hash(&base), leaf_hash(&other));
-        // Mode/size are NOT hashed (M3 fidelity — no reconcile flap).
+        // v4: identity and metadata ARE reconciled state — they hash.
+        let mut other = base.clone();
+        other.uuid = Some([7u8; 16]);
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        let mut other = base.clone();
+        other.meta = Some(crate::metadata::Meta {
+            kind: crate::metadata::FileKind::Regular,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime_s: 1,
+            mtime_ns: 0,
+            symlink_target: None,
+            rdev: 0,
+            xattrs: vec![],
+        });
+        assert_ne!(leaf_hash(&base), leaf_hash(&other));
+        // Mode/size columns are NOT hashed (they are summaries of meta and
+        // content; hashing them too would double-count and flap).
         let mut other = base.clone();
         other.mode = 0o600;
         other.size = 999;

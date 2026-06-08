@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! peer.rs — liveness registry, shared connection pool, jittered backoff
 //! (FR-602/603, FR-1102).
 //!

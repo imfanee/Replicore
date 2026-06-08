@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! ingest.rs — the local-change pipeline (FR-101/105, FR-901/902).
 //!
 //! Watcher and scanner events funnel through one channel into this task,
@@ -22,6 +23,7 @@ use tokio::time::Instant;
 
 use crate::chunk::{chunk_file_into_cas, Cas, CasError, ChunkParams, Manifest};
 use crate::config::Config;
+use crate::metadata::{FileKind, Meta};
 use crate::oplog::{LocalChange, Store};
 use crate::proto::OpType;
 use crate::suppress::Suppressor;
@@ -34,6 +36,9 @@ pub enum LocalEvent {
     Write(PathBuf),
     /// Share-relative path that is live in the index but gone from disk.
     Delete(String),
+    /// An observed move (FID watcher tier 1, FR-205): share-relative source,
+    /// absolute destination.
+    Rename { from: String, to: PathBuf },
 }
 
 pub struct Ingest {
@@ -90,6 +95,7 @@ impl Ingest {
                         }
                     }
                     Some(LocalEvent::Delete(rel)) => self.handle_delete(rel).await,
+                    Some(LocalEvent::Rename { from, to }) => self.handle_rename(from, to).await,
                 },
                 _ = tick.tick() => {
                     self.flush_ripe().await;
@@ -100,8 +106,8 @@ impl Ingest {
     }
 
     /// Convert a watcher/scanner absolute path to the share-relative String
-    /// the protocol speaks. Non-UTF-8 names are skipped with a warning (full
-    /// fidelity is M3, FR-106).
+    /// the protocol speaks. Non-UTF-8 names are skipped with a warning (the
+    /// wire speaks UTF-8 paths).
     fn relativize(&self, abs: &std::path::Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.cfg.share_dir).ok()?;
         match rel.to_str() {
@@ -135,28 +141,43 @@ impl Ingest {
             max: self.cfg.chunk_max_bytes,
         };
         let cas = self.cas.clone();
-        // ONE streamed pass off the async runtime: fastcdc chunks → CAS
-        // inserts (idempotent — re-observed unchanged files cost a stat per
-        // chunk) → whole-file hash (FR-402).
+        let policy = self.cfg.owner_policy;
+        // ONE streamed pass off the async runtime: full metadata capture
+        // (FR-106) + fastcdc chunks → CAS inserts (idempotent — re-observed
+        // unchanged files cost a stat per chunk) → whole-file hash (FR-402).
         let observed =
             tokio::task::spawn_blocking(move || -> Result<Option<Observed>, CasError> {
-                let meta = std::fs::symlink_metadata(&abs).map_err(|source| CasError::Io {
-                    ctx: "stat",
-                    path: abs.clone(),
-                    source,
-                })?;
-                if !meta.is_file() {
-                    return Ok(None); // symlinks/dirs/special: M3 fidelity (FR-106)
+                let io = |ctx: &'static str| {
+                    let path = abs.clone();
+                    move |source| CasError::Io { ctx, path, source }
+                };
+                let Some(meta) = Meta::capture(&abs, policy).map_err(io("capture"))? else {
+                    return Ok(None); // sockets/dirs: not replicated
+                };
+                match meta.kind {
+                    FileKind::Regular => {
+                        let len = std::fs::symlink_metadata(&abs).map_err(io("stat"))?.len();
+                        if len > max {
+                            return Ok(Some(Observed::TooBig(len)));
+                        }
+                        let manifest = chunk_file_into_cas(&abs, &params, &cas)?;
+                        Ok(Some(Observed::File { manifest, meta }))
+                    }
+                    // The payload of a symlink IS its target (hashed so
+                    // content-change detection works); special nodes have no
+                    // payload at all — both ride entirely in the meta.
+                    FileKind::Symlink => {
+                        let target = meta
+                            .symlink_target
+                            .clone()
+                            .ok_or_else(|| std::io::Error::other("symlink without target"))
+                            .map_err(io("readlink"))?;
+                        Ok(Some(Observed::Symlink { meta, target }))
+                    }
+                    FileKind::Fifo | FileKind::CharDev | FileKind::BlockDev => {
+                        Ok(Some(Observed::Special { meta }))
+                    }
                 }
-                if meta.len() > max {
-                    return Ok(Some(Observed::TooBig(meta.len())));
-                }
-                let manifest = chunk_file_into_cas(&abs, &params, &cas)?;
-                use std::os::unix::fs::PermissionsExt;
-                Ok(Some(Observed::File {
-                    manifest,
-                    mode: meta.permissions().mode() & 0o7777,
-                }))
             })
             .await;
 
@@ -170,33 +191,48 @@ impl Ingest {
             // Vanished between event and read: the scanner's delete pass owns it.
             Ok(Err(e)) if vanished(&e) => return,
             Ok(Err(e)) => {
-                tracing::warn!(path = %rel, error = %e, "cannot chunk changed file; skipping");
+                tracing::warn!(path = %rel, error = %e, "cannot ingest changed file; skipping");
                 return;
             }
             Err(join) => {
-                tracing::error!(error = %join, "chunking task failed");
+                tracing::error!(error = %join, "ingest task failed");
                 return;
             }
         };
-        let (manifest, mode) = match observed {
+        let (content_hash, size, manifest, meta) = match observed {
             Observed::TooBig(len) => {
                 tracing::warn!(path = %rel, len, "file exceeds max_file_bytes; not replicated");
                 return;
             }
-            Observed::File { manifest, mode } => (manifest, mode),
+            Observed::File { manifest, meta } => (
+                Some(manifest.content_hash),
+                manifest.total_len(),
+                Some(manifest),
+                meta,
+            ),
+            Observed::Symlink { meta, target } => (
+                Some(*blake3::hash(&target).as_bytes()),
+                target.len() as u64,
+                None,
+                meta,
+            ),
+            Observed::Special { meta } => (None, 0, None, meta),
         };
-        let hash = manifest.content_hash;
-        let size = manifest.total_len();
 
         // Loop defense 1 (FR-902): our own remote apply observed back.
-        if self.suppress.check_write(&rel, &hash) {
+        // (Covers content AND meta applies: both register the content hash.)
+        if self
+            .suppress
+            .check_write(&rel, &content_hash.unwrap_or([0u8; 32]))
+        {
             tracing::debug!(path = %rel, "suppressed self-apply write event");
             return;
         }
 
         // Loop defense 2 (FR-901) lives in the store: append_local no-ops on
-        // identical content, atomically with the VV increment. The manifest
-        // rides in the same transaction.
+        // identical content AND metadata, atomically with the VV increment.
+        // The manifest rides in the same transaction.
+        let mode = meta.mode;
         match self
             .store
             .append_local(LocalChange {
@@ -204,16 +240,44 @@ impl Ingest {
                 op_type: OpType::Write,
                 mode,
                 size,
-                content_hash: Some(hash),
-                manifest: Some(manifest),
+                content_hash,
+                meta: Some(meta),
+                manifest,
             })
             .await
         {
             Ok(Some(op)) => {
                 tracing::info!(path = %rel, seq = op.origin_seq, "local write -> op")
             }
-            Ok(None) => tracing::debug!(path = %rel, "unchanged content; no op"),
+            Ok(None) => tracing::debug!(path = %rel, "unchanged content+meta; no op"),
             Err(e) => tracing::error!(path = %rel, error = %e, "append_local failed"),
+        }
+    }
+
+    /// An observed move → ONE identity-preserving op (FR-205). The store's
+    /// no-op filter (source absent/tombstoned) and the suppression check
+    /// below are the loop defenses; everything else is `append_local_rename`.
+    async fn handle_rename(&mut self, from: String, to_abs: PathBuf) {
+        let Some(to) = self.relativize(&to_abs) else {
+            return;
+        };
+        // A pending write for the vacated source is moot; the destination
+        // re-quiesces if content changes after the move.
+        self.pending.remove(&from);
+
+        // Loop defense 1 (FR-902): our own remote rename apply observed back
+        // (apply_rename registers the delete entry before moving).
+        if self.suppress.check_delete(&from) {
+            tracing::debug!(path = %from, "suppressed self-apply rename event");
+            return;
+        }
+
+        match self.store.append_local_rename(&from, &to).await {
+            Ok(Some(op)) => {
+                tracing::info!(from = %from, to = %to, seq = op.origin_seq, "local rename -> op")
+            }
+            Ok(None) => tracing::debug!(from = %from, to = %to, "rename was a causal no-op"),
+            Err(e) => tracing::error!(from = %from, error = %e, "append_local_rename failed"),
         }
     }
 
@@ -248,6 +312,7 @@ impl Ingest {
                 mode: 0,
                 size: 0,
                 content_hash: None,
+                meta: None,
                 manifest: None,
             })
             .await
@@ -262,7 +327,9 @@ impl Ingest {
 }
 
 enum Observed {
-    File { manifest: Manifest, mode: u32 },
+    File { manifest: Manifest, meta: Meta },
+    Symlink { meta: Meta, target: Vec<u8> },
+    Special { meta: Meta },
     TooBig(u64),
 }
 
@@ -312,6 +379,10 @@ mod tests {
             per_file_chunk_concurrency: 4,
             max_concurrent_transfers: 4,
             serve_concurrency: 8,
+            owner_policy: crate::metadata::OwnerPolicy::Skip,
+            bandwidth: Default::default(),
+            reserve_bytes: 0,
+            reserve_percent: 0.0,
         };
         let cas = Cas::open(&cfg.cas_dir).unwrap();
         let (tx, rx) = mpsc::channel(64);
@@ -357,6 +428,64 @@ mod tests {
         assert_eq!(r.store.op_count().await.unwrap(), 2);
         let ops = r.store.ops_since(NODE, 0, 10).await.unwrap();
         assert_eq!(ops[1].vv.get(&NODE), 2);
+    }
+
+    #[tokio::test]
+    async fn meta_only_change_emits_an_op() {
+        // FR-106: an xattr/mode/mtime-only change (same bytes) must
+        // replicate. The no-op filter compares content AND meta.
+        let r = rig();
+        let f = r.share.join("attrs.txt");
+        std::fs::write(&f, b"same bytes").unwrap();
+        r.tx.send(LocalEvent::Write(f.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1);
+
+        // Same content re-observed: still no new op.
+        r.tx.send(LocalEvent::Write(f.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1);
+
+        // chmod only: a second (meta-only) op with the SAME content hash.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        r.tx.send(LocalEvent::Write(f.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 2);
+        let ops = r.store.ops_since(NODE, 0, 10).await.unwrap();
+        assert_eq!(ops[0].content_hash, ops[1].content_hash);
+        assert_eq!(ops[1].meta.as_ref().unwrap().mode, 0o600);
+        assert_ne!(
+            crate::metadata::Meta::hash_of(&ops[0].meta),
+            crate::metadata::Meta::hash_of(&ops[1].meta)
+        );
+
+        // Re-observed unchanged: quiescent again.
+        r.tx.send(LocalEvent::Write(f)).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn symlink_event_becomes_op() {
+        let r = rig();
+        let l = r.share.join("link");
+        std::os::unix::fs::symlink("target", &l).unwrap();
+        r.tx.send(LocalEvent::Write(l.clone())).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1);
+        let ops = r.store.ops_since(NODE, 0, 10).await.unwrap();
+        let meta = ops[0].meta.as_ref().unwrap();
+        assert_eq!(meta.kind, FileKind::Symlink);
+        assert_eq!(meta.symlink_target.as_deref(), Some(&b"target"[..]));
+        assert_eq!(
+            ops[0].content_hash,
+            Some(*blake3::hash(b"target").as_bytes())
+        );
+        // Re-observation: no-op (the storm check for symlinks).
+        r.tx.send(LocalEvent::Write(l)).await.unwrap();
+        settle().await;
+        assert_eq!(r.store.op_count().await.unwrap(), 1);
     }
 
     #[tokio::test]

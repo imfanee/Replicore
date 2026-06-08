@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! join.rs — node join lifecycle (FR-1309/1310/1311).
 //!
 //! A node moves `Joining → Syncing → Active` as it bootstraps against the

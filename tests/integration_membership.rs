@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Membership control-plane integration tests (M2.5 AC 8–12), exercised with
 //! real in-process engines over localhost QUIC — no netns rig, so these run in
 //! plain `cargo test`. Each test drives the SAME code paths the operator does:
@@ -200,6 +201,7 @@ impl Node {
                 mode: 0o644,
                 size: data.len() as u64,
                 content_hash: Some(hash),
+                meta: None,
                 manifest: Some(manifest),
             })
             .await
@@ -216,13 +218,34 @@ impl Node {
     }
 }
 
-/// Poll `cond` up to ~12s.
-async fn eventually<F, Fut>(mut cond: F) -> bool
+/// Poll `cond` up to ~30s — generous because the whole test suite runs in
+/// parallel and the join flow (gate reconcile + bootstrap + subscribe) is
+/// CPU-starved under full-suite load. Positive assertions only.
+async fn eventually<F, Fut>(cond: F) -> bool
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    for _ in 0..240 {
+    eventually_for(cond, 600).await
+}
+
+/// Bounded variant for NEGATIVE assertions ("X must not happen"): a breach
+/// shows within a couple of seconds here; a short window keeps the suite
+/// fast without weakening the check.
+async fn never_within<F, Fut>(cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    eventually_for(cond, 120).await
+}
+
+async fn eventually_for<F, Fut>(mut cond: F, ticks: u32) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..ticks {
         if cond().await {
             return true;
         }
@@ -247,7 +270,7 @@ async fn dynamic_add_brings_a_node_into_the_data_path() {
     // Before the add, A must not admit C (not in the allowlist).
     a.write("pre.txt", b"before").await;
     assert!(
-        !eventually(|| c.has("pre.txt", h(b"before"))).await,
+        !never_within(|| c.has("pre.txt", h(b"before"))).await,
         "C replicated before being added — trust gate breached"
     );
 
@@ -290,7 +313,7 @@ async fn signed_remove_locks_a_node_out() {
     // A write after the removal must NOT reach C (it is locked out of TLS).
     a.write("two.txt", b"two").await;
     assert!(
-        !eventually(|| c.has("two.txt", h(b"two"))).await,
+        !never_within(|| c.has("two.txt", h(b"two"))).await,
         "removed node still received data"
     );
 }

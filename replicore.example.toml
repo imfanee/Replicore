@@ -1,3 +1,4 @@
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 # replicore.example.toml — declarative node configuration (FR-1201).
 #
 # One file per node. Generate each node's identity first:
@@ -15,22 +16,45 @@ cert_path = "/etc/replicore/node-a.cert.pem"
 key_path  = "/etc/replicore/node-a.key.pem"
 
 # cas_dir       = "/var/lib/replicore/a.cas"  # chunk store (default <db_path>.cas; outside the share!)
-# health_listen = "127.0.0.1:8080"             # GET /healthz JSON; absent = disabled (FR-1102)
+# health_listen = "127.0.0.1:8080"             # GET /healthz + /metrics; absent = disabled
+
+# Daemon-owned paths (defaults shown). The daemon NEVER writes this intent file;
+# learned membership lives in the roster:
+# roster_path    = "/var/lib/replicore/a.db.roster.json"  # default <db_path>.roster.json
+# control_socket = "/var/lib/replicore/a.db.sock"         # default <db_path>.sock (replicorectl UDS)
 
 # Optional tuning (defaults shown):
-# quiesce_ms              = 300       # per-path settle window before a write becomes an op (FR-105)
-# scan_interval_secs      = 5         # authoritative rescan cadence (FR-103)
-# reconcile_interval_secs = 300       # periodic anti-entropy per peer (FR-702)
+# quiesce_ms              = 300       # per-path settle window before a write becomes an op
+# scan_interval_secs      = 5         # authoritative rescan cadence (bounds NFS-write detection)
+# reconcile_interval_secs = 300       # periodic anti-entropy per peer
 # max_file_bytes          = 67108864  # single-file cap
-# chunk_min_bytes         = 262144    # fastcdc bounds (FR-402); max is also the wire guard
+# chunk_min_bytes         = 262144    # fastcdc bounds; max is also the wire guard
 # chunk_avg_bytes         = 1048576
 # chunk_max_bytes         = 4194304
-# per_file_chunk_concurrency = 6      # parallel chunk fetches within one file (FR-403)
-# max_concurrent_transfers   = 8      # engine-wide transfer bound (FR-1106)
-# serve_concurrency          = 16     # serve streams granted per peer connection (FR-1106)
+# per_file_chunk_concurrency = 6      # parallel chunk fetches within one file
+# max_concurrent_transfers   = 8      # engine-wide transfer bound
+# serve_concurrency          = 16     # serve streams granted per peer connection
+# owner_policy            = "numeric" # "numeric" replicates uid/gid (needs CAP_CHOWN or refuses
+#                                     #   to boot); "skip" ignores ownership. SAME on every node.
+# reserve_bytes           = 268435456 # free-space floor (256 MiB). HOT-reloadable.
+# reserve_percent         = 0.0       # free-space floor as fraction of capacity. HOT-reloadable.
 
+# Cluster trust anchor — REQUIRED for dynamic membership. The Ed25519 public key
+# (from `replicored gen-admin-key`) that authorizes admin-signed member add/remove.
+# The daemon never holds the secret half. HOT-reloadable. Must match on every node.
+# [trust]
+# admin_pubkey = "<64 hex chars>"
+
+# Bandwidth / QoS (all HOT-reloadable; also settable live via `replicorectl bandwidth set`):
+# [bandwidth]
+# global_bps        = 0          # engine-wide ceiling, bytes/sec; 0 = unlimited
+# per_peer_bps      = 0          # per-peer ceiling, bytes/sec; 0 = unlimited
+# small_asset_bytes = 65536      # files <= this use the priority (interactive) lane
+
+# Seed/bootstrap peers. This is the bootstrap list, not the full roster — learned
+# members live in the roster. The peer set is HOT-reloadable.
 [[peers]]
 node_id     = "101112131415161718191a1b1c1d1e1f"
 addr        = "10.123.0.2:7000"
-# SHA-256 of the peer's certificate DER, as printed by its gen-cert (FR-1002):
+# SHA-256 of the peer's certificate DER, as printed by its gen-cert:
 fingerprint = "0000000000000000000000000000000000000000000000000000000000000000"

@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! net.rs — QUIC transport with mutual TLS and pinned peer certificates
 //! (FR-501/504, FR-1001/1002). Built on quinn so we never hand-roll a UDP
 //! reliability/congestion layer (NFR-C2).
@@ -40,9 +41,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
-use crate::apply::{apply_assembled, apply_delete, ApplyError};
+use crate::apply::{apply_delete, apply_meta_only, apply_rename, apply_version, ApplyError};
 use crate::chunk::Cas;
 use crate::config::{Config, Peer};
+use crate::conflict::{PlannedRow, Version, META_NONE};
 use crate::decide::{decide, Decision};
 use crate::fetch::FetchError;
 use crate::membership::Membership;
@@ -50,7 +52,8 @@ use crate::merkle::{
     reconcile_pull, MerkleTree, ReconcileCtx, ReconcileError, ReconcileReport, ReconcileTransport,
     RemoteLeaf,
 };
-use crate::oplog::{Store, StoreError};
+use crate::metadata::{FileKind, Meta};
+use crate::oplog::{ResolveOutcome, Store, StoreError};
 use crate::peer::{jittered_backoff, ConnRegistry, PeerRegistry, PeerState};
 use crate::proto::{
     read_msg, write_msg, ChunkReq, ChunkResp, Frame, ManifestReq, ManifestResp, OpRecord, OpType,
@@ -339,6 +342,17 @@ pub struct Engine {
     /// Operator pause gate (FR-1404): when set, push and new transfers wait;
     /// in-flight transfers finish. Resume wakes the waiters.
     paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Bandwidth limiter (FR-1103/1104); retuned by schedule/reload/ctl.
+    qos: Arc<crate::qos::Limiter>,
+    /// The hot half of `[bandwidth]` (reload replaces it atomically): base
+    /// rates, lane threshold, schedule.
+    bandwidth_policy: Arc<StdRwLock<crate::config::BandwidthCfg>>,
+    /// The free-space guard tripped the pause (FR-1107): auto-resume may
+    /// clear it; an operator pause is never auto-resumed.
+    guard_paused: Arc<std::sync::atomic::AtomicBool>,
+    /// Hot-reloadable guard thresholds (reserve_percent in basis points).
+    reserve_bytes: Arc<std::sync::atomic::AtomicU64>,
+    reserve_pct_bp: Arc<std::sync::atomic::AtomicU64>,
     resume_notify: Arc<tokio::sync::Notify>,
 }
 
@@ -356,6 +370,15 @@ impl Engine {
         // Promotion is gated on the CURRENT effective set, not just the seeds.
         let expected = membership.effective_peers().into_iter().map(|p| p.node_id);
         let join = crate::join::JoinTracker::new(store.clone(), expected);
+        let qos = Arc::new(crate::qos::Limiter::new(
+            cfg.bandwidth.global_bps,
+            cfg.bandwidth.per_peer_bps,
+        ));
+        let bandwidth_policy = Arc::new(StdRwLock::new(cfg.bandwidth.clone()));
+        let reserve_bytes = Arc::new(std::sync::atomic::AtomicU64::new(cfg.reserve_bytes));
+        let reserve_pct_bp = Arc::new(std::sync::atomic::AtomicU64::new(
+            (cfg.reserve_percent * 100.0) as u64,
+        ));
         Arc::new(Engine {
             cfg: Arc::new(cfg),
             store,
@@ -368,6 +391,11 @@ impl Engine {
             join,
             membership,
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            qos,
+            bandwidth_policy,
+            guard_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reserve_bytes,
+            reserve_pct_bp,
             resume_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
@@ -551,7 +579,30 @@ impl Engine {
     ) -> Result<Vec<crate::config::ConfigChange>, crate::membership::MembershipError> {
         let changes = self.cfg.diff(candidate);
         self.membership.apply_reload(candidate)?;
+        // HOT (FR-1406 discipline — validated candidate or nothing): the
+        // bandwidth policy and free-space reserve retune live.
+        *self
+            .bandwidth_policy
+            .write()
+            .expect("bandwidth policy lock poisoned") = candidate.bandwidth.clone();
+        self.qos.set_rates(
+            candidate.bandwidth.global_bps,
+            candidate.bandwidth.per_peer_bps,
+        );
+        self.reserve_bytes
+            .store(candidate.reserve_bytes, Ordering::Relaxed);
+        self.reserve_pct_bp.store(
+            (candidate.reserve_percent * 100.0) as u64,
+            Ordering::Relaxed,
+        );
         Ok(changes)
+    }
+
+    fn bandwidth_policy(&self) -> crate::config::BandwidthCfg {
+        self.bandwidth_policy
+            .read()
+            .expect("bandwidth policy lock poisoned")
+            .clone()
     }
 
     /// On-demand anti-entropy (FR-1405): reconcile now with `node` (or every
@@ -595,6 +646,12 @@ impl Engine {
         transport.stream_receive_window(quinn::VarInt::from_u32(8 * 1024 * 1024));
         transport.receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
         transport.send_window(64 * 1024 * 1024);
+        // Lossy-WAN throughput (NFR-P6): the default loss-based CC (Cubic)
+        // collapses under ~1% RANDOM loss (measured 66–83% utilization on
+        // the rig); BBR models bandwidth instead of treating loss as
+        // congestion. quinn ships it natively — the quiche fallback from the
+        // stack notes stays unnecessary.
+        transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         let transport = Arc::new(transport);
 
         let mut server_tls = rustls::ServerConfig::builder_with_provider(provider.clone())
@@ -646,6 +703,7 @@ impl Engine {
             }
         });
         tokio::spawn(self.clone().gossip_driver());
+        self.spawn_policy_tasks();
         self.supervise(endpoint).await
     }
 
@@ -784,10 +842,42 @@ impl Engine {
 
         // Authenticated inbound connections serve multi-source fetch too.
         let peer_id = peer.node_id;
-        self.conns.insert(peer_id, conn.clone());
+        self.register_authenticated(peer_id, &conn)?;
         let result = self.inbound_io(conn.clone(), peer).await;
         self.conns.remove_if_same(&peer_id, &conn);
         result
+    }
+
+    /// Register an authenticated connection AND close the removal race
+    /// (review finding S4): a signed Remove may land between the TLS
+    /// allowlist check and this insert, and the supervisor's `close_all`
+    /// severs only connections present when it runs. Re-validating
+    /// effectiveness AFTER the insert leaves no window:
+    /// `recompute()` (the membership swap) strictly precedes the
+    /// supervisor's `close_all`, so either our insert precedes the
+    /// close_all snapshot (the supervisor severs us) or this re-check runs
+    /// after the swap (we sever ourselves). One of the two always fires.
+    fn register_authenticated(
+        &self,
+        peer_id: NodeId,
+        conn: &quinn::Connection,
+    ) -> Result<(), NetError> {
+        self.conns.insert(peer_id, conn.clone());
+        if !self
+            .membership
+            .effective_peers()
+            .iter()
+            .any(|p| p.node_id == peer_id)
+        {
+            self.conns.remove_if_same(&peer_id, conn);
+            conn.close(0u32.into(), b"membership-remove");
+            tracing::info!(
+                node = %hex::encode(&peer_id[..4]),
+                "connection raced a membership removal; severed at registration"
+            );
+            return Err(NetError::UnknownPeer);
+        }
+        Ok(())
     }
 
     async fn inbound_io(
@@ -907,7 +997,7 @@ impl Engine {
             }
             for op in ops {
                 cursor = op.origin_seq;
-                write_msg(&mut ctl_send, &Frame::OplogPush(op)).await?;
+                write_msg(&mut ctl_send, &Frame::OplogPush(Box::new(op))).await?;
                 // Publish after the frame is written: an honest ack can only
                 // arrive after the peer received it, i.e. after this store.
                 sent_frontier.store(cursor, Ordering::Release);
@@ -953,6 +1043,10 @@ impl Engine {
     /// unbounded spawn-per-stream: a peer hammering us with streams waits for
     /// a slot instead of growing our task count without limit.
     async fn serve_streams(self: &Arc<Engine>, conn: quinn::Connection) -> Result<(), NetError> {
+        // Egress attribution (FR-1103): the authenticated peer behind this
+        // connection, from the same pinned-cert identity the data path runs
+        // on. Unknown (should not happen post-auth) attributes to the zero id.
+        let peer = self.peer_of(&conn);
         let slots = Arc::new(tokio::sync::Semaphore::new(
             self.cfg.serve_concurrency.max(1),
         ));
@@ -965,11 +1059,104 @@ impl Engine {
             let engine = self.clone();
             tokio::spawn(async move {
                 let _permit = permit; // held for the stream's lifetime
-                if let Err(e) = engine.serve_one_stream(send, recv).await {
+                if let Err(e) = engine.serve_one_stream(send, recv, peer).await {
                     tracing::debug!(error = %e, "serve stream ended");
                 }
             });
         }
+    }
+
+    /// FR-1107: block until `incoming` bytes fit above the reserve on both
+    /// the CAS and share filesystems. A shortfall trips the pause gate
+    /// (counted + logged); the prober task auto-resumes once space recovers.
+    /// statvfs FAILURE also trips — a broken guard must fail closed.
+    async fn guard_free_space(&self, incoming: u64) {
+        loop {
+            if self.free_space_ok(incoming) {
+                return;
+            }
+            if !self.guard_paused.swap(true, Ordering::SeqCst) && !self.is_paused() {
+                Stats::inc(&self.stats.freespace_trips);
+                tracing::error!(
+                    incoming,
+                    "free-space guard: reserve would be breached; pausing transfers (FR-1107)"
+                );
+                self.pause();
+            }
+            self.await_unpaused().await;
+        }
+    }
+
+    fn free_space_ok(&self, incoming: u64) -> bool {
+        let reserve = self.reserve_bytes.load(Ordering::Relaxed);
+        let pct = self.reserve_pct_bp.load(Ordering::Relaxed) as f64 / 100.0;
+        for fs in [&self.cfg.cas_dir, &self.cfg.share_dir] {
+            match crate::qos::available_above_reserve(fs, reserve, pct) {
+                Ok(avail) if avail >= incoming => {}
+                Ok(_) => return false,
+                Err(e) => {
+                    tracing::error!(path = %fs.display(), error = %e,
+                        "free-space guard: statvfs failed; failing CLOSED");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Background policy tasks: the bandwidth schedule evaluator (FR-1103)
+    /// and the free-space auto-resume prober (FR-1107).
+    fn spawn_policy_tasks(self: &Arc<Engine>) {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                // Schedule (the one legitimate wall-clock read: policy).
+                let policy = engine.bandwidth_policy();
+                if !policy.schedule.is_empty() {
+                    let (wd, min) = crate::qos::local_clock();
+                    let base = (policy.global_bps, policy.per_peer_bps);
+                    let (g, p) = crate::qos::active_rates(&policy.schedule, base, wd, min);
+                    if (g, p) != engine.qos.rates() {
+                        tracing::info!(
+                            global_bps = g,
+                            per_peer_bps = p,
+                            "bandwidth schedule: retuning (FR-1103)"
+                        );
+                        engine.qos.set_rates(g, p);
+                    }
+                }
+                // Guard auto-resume: only a guard-initiated pause, and only
+                // once a healthy margin is back.
+                if engine.guard_paused.load(Ordering::SeqCst) && engine.free_space_ok(1 << 20) {
+                    engine.guard_paused.store(false, Ordering::SeqCst);
+                    engine.resume();
+                    tracing::info!("free-space guard: space recovered; resuming");
+                }
+            }
+        });
+    }
+
+    /// Runtime bandwidth control (FR-1105): `replicorectl bandwidth`.
+    pub fn bandwidth_rates(&self) -> (u64, u64) {
+        self.qos.rates()
+    }
+
+    pub fn set_bandwidth(&self, global_bps: u64, per_peer_bps: u64) {
+        tracing::info!(global_bps, per_peer_bps, "bandwidth set via control socket");
+        self.qos.set_rates(global_bps, per_peer_bps);
+    }
+
+    /// The peer NodeId a connection is registered under (egress accounting).
+    fn peer_of(&self, conn: &quinn::Connection) -> NodeId {
+        for (id, c) in self.conns.all() {
+            if c.stable_id() == conn.stable_id() {
+                return id;
+            }
+        }
+        [0u8; 16]
     }
 
     /// Dispatch one ephemeral stream by its leading tag byte.
@@ -977,11 +1164,12 @@ impl Engine {
         &self,
         send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        peer: NodeId,
     ) -> Result<(), NetError> {
         let mut tag = [0u8; 1];
         recv.read_exact(&mut tag).await?;
         match tag[0] {
-            STREAM_TAG_CHUNK => self.serve_chunk(send, recv).await,
+            STREAM_TAG_CHUNK => self.serve_chunk(send, recv, peer).await,
             STREAM_TAG_MANIFEST => self.serve_manifest(send, recv).await,
             STREAM_TAG_RECONCILE => self.serve_reconcile(send, recv).await,
             STREAM_TAG_ROSTER => crate::gossip::serve_roster(&self.membership, send, recv)
@@ -1046,6 +1234,8 @@ impl Engine {
                             vv: row.vv.clone(),
                             mode: row.mode,
                             size: row.size,
+                            uuid: row.uuid,
+                            meta: row.meta.clone(),
                         },
                         None => ReconcileFrame::LeafResp {
                             found: false,
@@ -1054,6 +1244,8 @@ impl Engine {
                             vv: crate::vv::VersionVector::new(),
                             mode: 0,
                             size: 0,
+                            uuid: None,
+                            meta: None,
                         },
                     };
                     write_msg(&mut send, &resp).await?;
@@ -1072,6 +1264,7 @@ impl Engine {
         &self,
         mut send: quinn::SendStream,
         mut recv: quinn::RecvStream,
+        peer: NodeId,
     ) -> Result<(), NetError> {
         let req: ChunkReq = read_msg(&mut recv).await?;
         let opened = {
@@ -1088,6 +1281,15 @@ impl Engine {
                     },
                 )
                 .await?;
+                // Egress cap (FR-1103/1104): single chunks at or under the
+                // small-asset size ride the priority lane (a small file IS
+                // its one chunk).
+                let lane = if len <= self.bandwidth_policy().small_asset_bytes {
+                    crate::qos::Lane::Priority
+                } else {
+                    crate::qos::Lane::Bulk
+                };
+                self.qos.acquire(lane, &peer, len).await;
                 let mut reader = tokio::fs::File::from_std(file);
                 tokio::io::copy(&mut reader, &mut send)
                     .await
@@ -1194,7 +1396,7 @@ impl Engine {
         // streams too. (Without this, a request stream opened toward a
         // dialer-only endpoint sits unaccepted forever and wedges the peer's
         // receive path — found as a 3-node startup race.)
-        self.conns.insert(peer.node_id, conn.clone());
+        self.register_authenticated(peer.node_id, &conn)?;
         let serve = tokio::spawn({
             let engine = self.clone();
             let conn = conn.clone();
@@ -1369,6 +1571,7 @@ impl Engine {
             loop {
                 match read_msg::<_, Frame>(&mut ctl_recv).await {
                     Ok(Frame::OplogPush(op)) => {
+                        let op = *op;
                         let seq = op.origin_seq;
                         tracing::debug!(seq, "op received");
                         if op.origin != peer.node_id {
@@ -1434,6 +1637,7 @@ impl Engine {
                         error = %e,
                         "op cannot be materialized; quarantining (a superseding op or rescan repairs)"
                     );
+                    Stats::inc(&self.stats.apply_errors);
                     decision = Decision::Quarantined;
                 }
                 // Transient (I/O, stream, store): drop the connection; the
@@ -1442,43 +1646,351 @@ impl Engine {
             }
         }
         if decision == Decision::Concurrent {
-            // Detected, durably recorded as skipped, surfaced to operators.
-            // TODO(M3): deterministic winner + conflict copy (FR-303/304).
+            // Detected (FR-305 counter + per-conflict log), then RESOLVED
+            // (FR-303): winner + copies commit through resolve_rows BEFORE
+            // apply_remote records the op — a crash between the two heals on
+            // redelivery (the merged row dominates, so it records as Ignore).
             Stats::inc(&self.stats.conflicts);
             tracing::warn!(
                 path = %op.path,
                 origin = %hex::encode(&op.origin[..4]),
-                "concurrent versions detected; keeping local (resolution is M3)"
+                "concurrent versions detected; resolving (FR-303)"
             );
+            self.resolve_concurrent_op(&op).await?;
         }
         // THE durability point (fsynced WAL commit). Ack happens after.
         // The store RE-VALIDATES an Apply under the committing transaction:
         // if a concurrent local write landed during the (multi-second) fetch
         // window, the decision comes back downgraded and the rename that
         // already hit the disk must be repaired from the local row.
-        let path = op.path.clone();
-        let origin = op.origin;
+        let resolved_op = op.clone();
         let effective = self.store.apply_remote(op, decision).await?;
         if decision == Decision::Apply && effective != Decision::Apply {
             // The committing re-check downgraded a stale Apply to Concurrent —
             // the second Concurrent site (FR-303 counter).
             Stats::inc(&self.stats.conflicts);
             tracing::warn!(
-                path = %path,
-                origin = %hex::encode(&origin[..4]),
+                path = %resolved_op.path,
+                origin = %hex::encode(&resolved_op.origin[..4]),
                 ?effective,
-                "concurrent local write landed during transfer; restoring local content, remote recorded (resolution is M3)"
+                "concurrent local write landed during transfer; restoring local content and resolving"
             );
             crate::merkle::restore_local_content(
                 &self.store,
                 &self.cas,
                 &self.cfg.share_dir,
                 &self.suppress,
-                &path,
+                &resolved_op.path,
+            )
+            .await;
+            if effective == Decision::Concurrent {
+                // The remote bytes are already CAS-resident (just fetched):
+                // the same resolution as site 1, no second transfer.
+                self.resolve_concurrent_op(&resolved_op).await?;
+            }
+        }
+        // A rename's SECOND path-effect: the source tombstone committed in
+        // the same transaction iff the op dominated the source row. Repair /
+        // resolve whatever did not dominate (a quarantined op never touched
+        // either side).
+        if resolved_op.op_type == OpType::Rename && decision != Decision::Quarantined {
+            if let Some(old_rel) = resolved_op.path_old.clone() {
+                let old_local = self.store.load_file(&old_rel).await?;
+                match decide(old_local.as_ref(), &resolved_op.vv) {
+                    // Normal success lands here too (the committed tombstone
+                    // dominates the op): restore-from-row is an idempotent
+                    // no-op then, and the repair when a local write landed
+                    // during the fetch window after we unlinked the source.
+                    Decision::Ignore | Decision::Apply => {
+                        crate::merkle::restore_local_content(
+                            &self.store,
+                            &self.cas,
+                            &self.cfg.share_dir,
+                            &self.suppress,
+                            &old_rel,
+                        )
+                        .await;
+                    }
+                    Decision::Concurrent => {
+                        // rename-vs-modify at the source: modify wins, the
+                        // source resurrects (FR-304, identity-lite).
+                        Stats::inc(&self.stats.conflicts);
+                        tracing::warn!(
+                            path = %old_rel,
+                            origin = %hex::encode(&resolved_op.origin[..4]),
+                            "concurrent write at rename source; restoring and resolving (FR-304)"
+                        );
+                        crate::merkle::restore_local_content(
+                            &self.store,
+                            &self.cas,
+                            &self.cfg.share_dir,
+                            &self.suppress,
+                            &old_rel,
+                        )
+                        .await;
+                        let src_effect = Version {
+                            tombstone: true,
+                            content_hash: None,
+                            meta_hash: META_NONE,
+                            meta: None,
+                            mode: 0,
+                            size: 0,
+                            vv: resolved_op.vv.clone(),
+                            uuid: resolved_op.uuid,
+                        };
+                        self.resolve_concurrent_at(&old_rel, src_effect, resolved_op.origin)
+                            .await?;
+                    }
+                    Decision::Quarantined => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The conflict-resolution loop, live-op flavor (FR-303): ask the store
+    /// for the authoritative plan (an empty staging never matches), stage its
+    /// contents on disk through the atomic-apply discipline, commit. `Stale`
+    /// re-derives under local-write interference; bounded retries. On any
+    /// non-committed exit every path staged here is restored from its
+    /// committed row, so no uncommitted content (and no orphan copy the
+    /// scanner would mint an op for) is left on disk.
+    ///
+    /// A PERMANENT staging failure (loser content gone everywhere, oversized)
+    /// abandons the resolution quarantine-style: the op still gets recorded
+    /// by the caller and a later reconcile session retries — the conflict
+    /// stays detected, never silently dropped. Transient failures propagate
+    /// (connection drops, redelivery re-runs the resolution).
+    async fn resolve_concurrent_op(&self, op: &OpRecord) -> Result<(), NetError> {
+        let remote = Version {
+            tombstone: op.op_type == OpType::Delete,
+            content_hash: op.content_hash,
+            meta_hash: Meta::hash_of(&op.meta),
+            meta: op.meta.clone(),
+            mode: op.mode,
+            size: op.size,
+            vv: op.vv.clone(),
+            uuid: op.uuid,
+        };
+        self.resolve_concurrent_at(&op.path, remote, op.origin)
+            .await
+    }
+
+    /// Resolve one conflicted path against `remote` (an op's effect on that
+    /// path, or a reconcile leaf), fetching loser content from `origin`
+    /// first. See `resolve_concurrent_op` for the loop contract.
+    async fn resolve_concurrent_at(
+        &self,
+        path: &str,
+        remote: Version,
+        origin: NodeId,
+    ) -> Result<(), NetError> {
+        let mut staged: Vec<PlannedRow> = Vec::new();
+        let mut staged_paths: Vec<String> = Vec::new();
+        for _ in 0..4 {
+            match self
+                .store
+                .resolve_rows(path, remote.clone(), std::mem::take(&mut staged))
+                .await?
+            {
+                ResolveOutcome::Resolved => {
+                    tracing::info!(
+                        path = %path,
+                        origin = %hex::encode(&origin[..4]),
+                        "conflict resolved: winner + copies committed (FR-303)"
+                    );
+                    return Ok(());
+                }
+                ResolveOutcome::NotConcurrent(_) => {
+                    // Raced away (e.g. reconcile merged a peer's resolution).
+                    self.restore_paths(&staged_paths).await;
+                    return Ok(());
+                }
+                ResolveOutcome::Unresolvable => {
+                    tracing::error!(
+                        path = %path,
+                        "conflict copy chain too deep; keeping local (reconcile retries)"
+                    );
+                    self.restore_paths(&staged_paths).await;
+                    return Ok(());
+                }
+                ResolveOutcome::Stale { plan } => {
+                    for row in &plan {
+                        match self.stage_planned_row(row, origin).await {
+                            Ok(true) => staged_paths.push(row.path.clone()),
+                            Ok(false) => {}
+                            Err(e) if is_permanent(&e) => {
+                                tracing::error!(
+                                    path = %row.path,
+                                    error = %e,
+                                    "conflict copy unmaterializable; resolution deferred to reconcile"
+                                );
+                                self.restore_paths(&staged_paths).await;
+                                return Ok(());
+                            }
+                            Err(e) => {
+                                self.restore_paths(&staged_paths).await;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    staged = plan;
+                }
+            }
+        }
+        tracing::warn!(
+            path = %path,
+            "conflict resolution retries exhausted under local writes; reconcile retries"
+        );
+        self.restore_paths(&staged_paths).await;
+        Ok(())
+    }
+
+    /// Stage one planned row's content on disk (stage→fsync→verify→rename +
+    /// suppression — the only apply discipline). Content comes from the local
+    /// manifest + CAS when held (local writes chunk into the CAS at ingest;
+    /// just-fetched remote bytes are CAS-resident), else multi-source fetch,
+    /// origin first — under the same pause gate, transfer bound, and size cap
+    /// as a normal materialize. Returns whether the disk was touched.
+    async fn stage_planned_row(&self, row: &PlannedRow, origin: NodeId) -> Result<bool, NetError> {
+        if row.tombstone {
+            let share = self.cfg.share_dir.clone();
+            let rel = row.path.clone();
+            let suppress = self.suppress.clone();
+            tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress)).await??;
+            return Ok(true);
+        }
+        // Already current on disk (e.g. the winner is the local content):
+        // the commit only moves the row's VV — but metadata may differ.
+        if let Some(cur) = self.store.load_row(&row.path).await? {
+            if !cur.tombstone
+                && cur.content_hash == row.content_hash
+                && Meta::hash_of(&cur.meta) == Meta::hash_of(&row.meta)
+            {
+                return Ok(false);
+            }
+        }
+        // Symlinks/specials rebuild from the meta; no chunk plane.
+        let kind = row
+            .meta
+            .as_ref()
+            .map(|m| m.kind)
+            .unwrap_or(FileKind::Regular);
+        if kind != FileKind::Regular {
+            let share = self.cfg.share_dir.clone();
+            let rel = row.path.clone();
+            let mode = row.mode;
+            let hash = row.content_hash;
+            let meta = row.meta.clone();
+            let policy = self.cfg.owner_policy;
+            let suppress = self.suppress.clone();
+            let cas = self.cas.clone();
+            tokio::task::spawn_blocking(move || {
+                apply_version(
+                    &share,
+                    &rel,
+                    mode,
+                    hash.as_ref(),
+                    None,
+                    &cas,
+                    meta.as_ref(),
+                    policy,
+                    &suppress,
+                )
+            })
+            .await??;
+            return Ok(true);
+        }
+        let Some(hash) = row.content_hash else {
+            return Err(NetError::Violation("live planned row without hash"));
+        };
+        if row.size > self.cfg.max_file_bytes {
+            return Err(NetError::TooBig);
+        }
+        self.await_unpaused().await;
+        let _transfer_permit = self
+            .transfers
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+        Stats::gauge_inc(&self.stats.inflight_transfers);
+        let result = self.stage_planned_content(row, origin, hash).await;
+        Stats::gauge_dec(&self.stats.inflight_transfers);
+        result?;
+        Ok(true)
+    }
+
+    async fn stage_planned_content(
+        &self,
+        row: &PlannedRow,
+        origin: NodeId,
+        hash: [u8; 32],
+    ) -> Result<(), NetError> {
+        self.guard_free_space(row.size).await;
+        let limits = self.fetch_limits_for(row.size);
+        let manifest = match self.store.manifest_for(hash).await? {
+            Some(m) => m,
+            None => {
+                crate::fetch::obtain_manifest(
+                    hash,
+                    &self.store,
+                    &self.conns,
+                    origin,
+                    &limits,
+                    &self.stats,
+                )
+                .await?
+            }
+        };
+        // Fetches only what the CAS lacks (no-op for local/just-fetched
+        // content).
+        crate::fetch::fetch_file_chunks(
+            &manifest,
+            &self.cas,
+            &self.conns,
+            origin,
+            &limits,
+            &self.stats,
+        )
+        .await?;
+        let share = self.cfg.share_dir.clone();
+        let rel = row.path.clone();
+        let mode = row.mode;
+        let meta = row.meta.clone();
+        let policy = self.cfg.owner_policy;
+        let suppress = self.suppress.clone();
+        let cas = self.cas.clone();
+        tokio::task::spawn_blocking(move || {
+            apply_version(
+                &share,
+                &rel,
+                mode,
+                Some(&hash),
+                Some(&manifest),
+                &cas,
+                meta.as_ref(),
+                policy,
+                &suppress,
+            )
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Restore every path in `paths` from its committed row — the repair for
+    /// staged-but-not-committed resolution content.
+    async fn restore_paths(&self, paths: &[String]) {
+        for p in paths {
+            crate::merkle::restore_local_content(
+                &self.store,
+                &self.cas,
+                &self.cfg.share_dir,
+                &self.suppress,
+                p,
             )
             .await;
         }
-        Ok(())
     }
 
     /// Execute the filesystem side of a `Decision::Apply` over the chunked
@@ -1492,6 +2004,38 @@ impl Engine {
     ) -> Result<(), NetError> {
         match op.op_type {
             OpType::Write => {
+                // Symlinks and special nodes carry their payload in the
+                // metadata — no chunk plane (FR-106).
+                let kind = op
+                    .meta
+                    .as_ref()
+                    .map(|m| m.kind)
+                    .unwrap_or(FileKind::Regular);
+                if kind != FileKind::Regular {
+                    let share = self.cfg.share_dir.clone();
+                    let rel = op.path.clone();
+                    let mode = op.mode;
+                    let hash = op.content_hash;
+                    let meta = op.meta.clone();
+                    let policy = self.cfg.owner_policy;
+                    let suppress = self.suppress.clone();
+                    let cas = self.cas.clone();
+                    tokio::task::spawn_blocking(move || {
+                        apply_version(
+                            &share,
+                            &rel,
+                            mode,
+                            hash.as_ref(),
+                            None,
+                            &cas,
+                            meta.as_ref(),
+                            policy,
+                            &suppress,
+                        )
+                    })
+                    .await??;
+                    return Ok(());
+                }
                 let hash = op
                     .content_hash
                     .ok_or(NetError::Violation("write op without content hash"))?;
@@ -1517,6 +2061,19 @@ impl Engine {
                     let result = self.fetch_and_assemble(op, hash).await;
                     Stats::gauge_dec(&self.stats.inflight_transfers);
                     result?;
+                } else if let Some(meta) = &op.meta {
+                    // Meta-only op (same bytes, new xattrs/mode/owner/mtime):
+                    // the content stays in place, the metadata applies to it
+                    // (FR-106 — an xattr-only change must replicate).
+                    let share = self.cfg.share_dir.clone();
+                    let rel = op.path.clone();
+                    let meta = meta.clone();
+                    let policy = self.cfg.owner_policy;
+                    let suppress = self.suppress.clone();
+                    tokio::task::spawn_blocking(move || {
+                        apply_meta_only(&share, &rel, Some(&hash), &meta, policy, &suppress)
+                    })
+                    .await??;
                 }
             }
             OpType::Delete => {
@@ -1526,13 +2083,112 @@ impl Engine {
                 tokio::task::spawn_blocking(move || apply_delete(&share, &rel, &suppress))
                     .await??;
             }
+            // Identity-preserving move (FR-205): the target receives the file
+            // (rename(2) of the local bytes when they match — no retransfer;
+            // assemble otherwise), the source goes away IF the op dominates
+            // it (a concurrent write to the source keeps it — modify wins;
+            // the post-commit step in process_remote_op resolves it).
+            OpType::Rename => {
+                let hash = op
+                    .content_hash
+                    .ok_or(NetError::Violation("rename op without content hash"))?;
+                let old_rel = op
+                    .path_old
+                    .clone()
+                    .ok_or(NetError::Violation("rename op without path_old"))?;
+                let old_local = self.store.load_file(&old_rel).await?;
+                let old_dominated = decide(old_local.as_ref(), &op.vv) == Decision::Apply;
+                let have = local.is_some_and(|l| !l.tombstone && l.content_hash == Some(hash));
+                let kind = op
+                    .meta
+                    .as_ref()
+                    .map(|m| m.kind)
+                    .unwrap_or(FileKind::Regular);
+                if !have {
+                    // rename(2) fast path only for regular files (the
+                    // readback verify follows symlinks); other kinds rebuild
+                    // from the meta below.
+                    let moved = if old_dominated && kind == FileKind::Regular {
+                        let share = self.cfg.share_dir.clone();
+                        let old = old_rel.clone();
+                        let new = op.path.clone();
+                        let mode = op.mode;
+                        let meta = op.meta.clone();
+                        let policy = self.cfg.owner_policy;
+                        let suppress = self.suppress.clone();
+                        tokio::task::spawn_blocking(move || {
+                            apply_rename(
+                                &share,
+                                &old,
+                                &new,
+                                mode,
+                                &hash,
+                                meta.as_ref(),
+                                policy,
+                                &suppress,
+                            )
+                        })
+                        .await??
+                    } else {
+                        false
+                    };
+                    if !moved {
+                        if kind != FileKind::Regular {
+                            let share = self.cfg.share_dir.clone();
+                            let rel = op.path.clone();
+                            let mode = op.mode;
+                            let meta = op.meta.clone();
+                            let policy = self.cfg.owner_policy;
+                            let suppress = self.suppress.clone();
+                            let cas = self.cas.clone();
+                            tokio::task::spawn_blocking(move || {
+                                apply_version(
+                                    &share,
+                                    &rel,
+                                    mode,
+                                    Some(&hash),
+                                    None,
+                                    &cas,
+                                    meta.as_ref(),
+                                    policy,
+                                    &suppress,
+                                )
+                            })
+                            .await??;
+                        } else {
+                            if op.size > self.cfg.max_file_bytes {
+                                return Err(NetError::TooBig);
+                            }
+                            self.await_unpaused().await;
+                            let _transfer_permit = self
+                                .transfers
+                                .clone()
+                                .acquire_owned()
+                                .await
+                                .map_err(|_| NetError::Violation("transfer limiter closed"))?;
+                            Stats::gauge_inc(&self.stats.inflight_transfers);
+                            let result = self.fetch_and_assemble(op, hash).await;
+                            Stats::gauge_dec(&self.stats.inflight_transfers);
+                            result?;
+                        }
+                    }
+                }
+                if old_dominated {
+                    // Idempotent if the fast path already moved the file.
+                    let share = self.cfg.share_dir.clone();
+                    let suppress = self.suppress.clone();
+                    tokio::task::spawn_blocking(move || apply_delete(&share, &old_rel, &suppress))
+                        .await??;
+                }
+            }
         }
         Ok(())
     }
 
     /// Manifest -> missing chunks -> CAS -> streamed atomic assembly.
     async fn fetch_and_assemble(&self, op: &OpRecord, hash: [u8; 32]) -> Result<(), NetError> {
-        let limits = self.fetch_limits();
+        self.guard_free_space(op.size).await;
+        let limits = self.fetch_limits_for(op.size);
         // Multi-source: candidates come from the shared registry, origin
         // first — not just this subscription's connection.
         let manifest = crate::fetch::obtain_manifest(
@@ -1556,11 +2212,23 @@ impl Engine {
         let share = self.cfg.share_dir.clone();
         let rel = op.path.clone();
         let mode = op.mode;
+        let meta = op.meta.clone();
+        let policy = self.cfg.owner_policy;
         let suppress = self.suppress.clone();
         let cas = self.cas.clone();
         // fsync-heavy: keep it off the async runtime.
         tokio::task::spawn_blocking(move || {
-            apply_assembled(&share, &rel, mode, &hash, &manifest, &cas, &suppress)
+            apply_version(
+                &share,
+                &rel,
+                mode,
+                Some(&hash),
+                Some(&manifest),
+                &cas,
+                meta.as_ref(),
+                policy,
+                &suppress,
+            )
         })
         .await??;
         Ok(())
@@ -1579,10 +2247,22 @@ impl Engine {
     }
 
     fn fetch_limits(&self) -> crate::fetch::FetchLimits {
+        self.fetch_limits_for(u64::MAX) // bulk lane by default
+    }
+
+    /// Limits for fetching one file of `size` bytes: small assets ride the
+    /// priority lane (FR-1104).
+    fn fetch_limits_for(&self, size: u64) -> crate::fetch::FetchLimits {
         crate::fetch::FetchLimits {
             per_file_chunk_concurrency: self.cfg.per_file_chunk_concurrency,
             max_chunk_bytes: self.cfg.chunk_max_bytes,
             max_file_bytes: self.cfg.max_file_bytes,
+            qos: Some(self.qos.clone()),
+            lane: if size <= self.bandwidth_policy().small_asset_bytes {
+                crate::qos::Lane::Priority
+            } else {
+                crate::qos::Lane::Bulk
+            },
         }
     }
 
@@ -1612,11 +2292,18 @@ impl Engine {
             cas: &self.cas,
             share: &self.cfg.share_dir,
             suppress: &self.suppress,
+            policy: self.cfg.owner_policy,
         };
         let report = reconcile_pull(&local, &mut transport, &ctx).await?;
         let _ = write_msg(&mut transport.send, &ReconcileFrame::Done).await;
         let _ = transport.send.finish();
         Stats::inc(&self.stats.reconcile_runs);
+        // FR-305: conflicts witnessed via anti-entropy count too — resolved
+        // or (rarely) left for the next session.
+        Stats::add(
+            &self.stats.conflicts,
+            report.resolved_conflicts + report.skipped_concurrent,
+        );
         Ok((report, transport.frontier))
     }
 
@@ -1739,12 +2426,16 @@ impl ReconcileTransport for QuicReconcile<'_> {
                 vv,
                 mode,
                 size,
+                uuid,
+                meta,
             } => Ok(Some(RemoteLeaf {
                 tombstone,
                 content_hash,
                 vv,
                 mode,
                 size,
+                uuid,
+                meta,
             })),
             _ => Err(ReconcileError::Violation("expected LeafResp")),
         }
@@ -1792,6 +2483,21 @@ fn is_permanent(e: &NetError) -> bool {
         NetError::TooBig => true,
         // Path escapes are rejected per CLAUDE.md invariant 5, permanently.
         NetError::Apply(ApplyError::UnsafePath(_)) => true,
+        // A LOCAL DIRECTORY squats the op's path (dirs are unreplicated
+        // local state — the dir-lifecycle SEAM): create/rename/unlink at
+        // that path can never succeed by retrying, and the reconnect loop
+        // would pin the whole subscription on one poison op (review
+        // finding S6). Quarantine; a superseding op or the rescan repairs.
+        NetError::Apply(ApplyError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::IsADirectory
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            true
+        }
         // The chunks individually verified but their composition does not
         // hash to the op's content: the manifest lied. Retrying re-fetches
         // the same manifest.
@@ -1852,7 +2558,71 @@ mod tests {
             per_file_chunk_concurrency: 4,
             max_concurrent_transfers: 4,
             serve_concurrency: 8,
+            owner_policy: crate::metadata::OwnerPolicy::Skip,
+            bandwidth: Default::default(),
+            reserve_bytes: 0,
+            reserve_percent: 0.0,
         }
+    }
+
+    /// FR-1107: the free-space guard trips the pause gate, counts it, and
+    /// the transfer path blocks until space recovers (here: the prober's
+    /// release sequence, applied directly).
+    #[tokio::test]
+    async fn free_space_guard_trips_pauses_and_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let ident = generate_identity().unwrap();
+        let engine = engine_on(dir.path(), [0xa; 16], &ident, vec![]);
+        // An impossible reserve: every filesystem is "full".
+        engine.reserve_bytes.store(u64::MAX, Ordering::Relaxed);
+
+        let blocked = {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                engine.guard_free_space(1).await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(engine.is_paused(), "guard did not pause");
+        assert!(
+            !blocked.is_finished(),
+            "guard admitted a transfer with no space"
+        );
+        assert_eq!(Stats::get(&engine.stats.freespace_trips), 1);
+
+        // Space "recovers": what the prober does on its tick.
+        engine.reserve_bytes.store(0, Ordering::Relaxed);
+        assert!(engine.free_space_ok(1 << 20));
+        engine.guard_paused.store(false, Ordering::SeqCst);
+        engine.resume();
+        tokio::time::timeout(Duration::from_secs(5), blocked)
+            .await
+            .expect("guard did not release after recovery")
+            .unwrap();
+        // Re-tripping counts again; an already-paused engine is not re-paused.
+        assert!(!engine.is_paused());
+    }
+
+    /// Review finding S6: directory-collision io kinds are PERMANENT (the
+    /// op quarantines and the stream advances) — and other io kinds stay
+    /// transient (reconnect + redeliver).
+    #[test]
+    fn dir_collision_errors_are_permanent_others_transient() {
+        let dir_err = |kind: std::io::ErrorKind| {
+            NetError::Apply(ApplyError::Io {
+                ctx: "rename",
+                path: std::path::PathBuf::from("x"),
+                source: std::io::Error::new(kind, "squatted"),
+            })
+        };
+        assert!(is_permanent(&dir_err(std::io::ErrorKind::IsADirectory)));
+        assert!(is_permanent(&dir_err(std::io::ErrorKind::NotADirectory)));
+        assert!(is_permanent(&dir_err(
+            std::io::ErrorKind::DirectoryNotEmpty
+        )));
+        // Genuine transients keep the retry semantics.
+        assert!(!is_permanent(&dir_err(std::io::ErrorKind::Interrupted)));
+        assert!(!is_permanent(&dir_err(std::io::ErrorKind::StorageFull)));
     }
 
     fn engine_on(
@@ -1889,6 +2659,7 @@ mod tests {
                 mode: 0o644,
                 size: data.len() as u64,
                 content_hash: Some(hash),
+                meta: None,
                 manifest: Some(manifest),
             })
             .await
@@ -2456,7 +3227,7 @@ mod tests {
     /// clobber from the already-performed rename must be repaired from the
     /// local row. No committed state may be lost.
     #[tokio::test]
-    async fn concurrent_local_write_during_transfer_is_not_clobbered() {
+    async fn concurrent_local_write_during_transfer_resolves_without_loss() {
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let id_a = generate_identity().unwrap();
@@ -2542,25 +3313,51 @@ mod tests {
         assert!(handled, "remote op never durably handled");
         assert_eq!(engine_b.store.recv_cursor(A).await.unwrap(), 1);
 
-        // ...as Concurrent: the row keeps the LOCAL content and the remote
-        // VV component was NOT merged (no causal masking).
-        let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();
-        assert_eq!(row.content_hash, Some(local_hash), "row clobbered");
-        assert_eq!(row.vv.get(&A), 0, "remote VV merged: clobber masked");
-        assert_eq!(row.vv.get(&B), 1);
-
-        // And the DISK was repaired back to the local content.
-        let mut repaired = false;
-        for _ in 0..100 {
-            if std::fs::read(dir_b.path().join("race.bin"))
-                .is_ok_and(|d| d == local_data.as_slice())
-            {
-                repaired = true;
+        // ...and RESOLVED (M3, FR-303): deterministic winner by the content
+        // total order, both VV components absorbed, the loser preserved as a
+        // conflict copy — zero loss, no causal masking.
+        let remote_data = b"remote content R";
+        let remote_hash = *blake3::hash(remote_data).as_bytes();
+        let (win_hash, win_data, lose_hash, lose_data): (_, &[u8], _, &[u8]) =
+            if local_hash > remote_hash {
+                (local_hash, local_data, remote_hash, remote_data)
+            } else {
+                (remote_hash, remote_data, local_hash, local_data)
+            };
+        let copy_rel =
+            crate::conflict::copy_path_for("race.bin", &lose_hash, &crate::conflict::META_NONE);
+        let mut resolved = false;
+        for _ in 0..200 {
+            let row = engine_b.store.load_file("race.bin").await.unwrap().unwrap();
+            if row.content_hash == Some(win_hash) && row.vv.get(&A) == 1 && row.vv.get(&B) == 1 {
+                resolved = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(repaired, "disk clobber was not repaired to local content");
+        assert!(resolved, "conflict was not resolved to the winner row");
+        let copy_row = engine_b.store.load_file(&copy_rel).await.unwrap().unwrap();
+        assert_eq!(copy_row.content_hash, Some(lose_hash), "loser not copied");
+        assert_eq!(
+            copy_row.vv,
+            crate::conflict::copy_vv(&copy_rel),
+            "copy row VV is not the deterministic synthetic vector"
+        );
+
+        // The DISK agrees: winner at the path, loser at the copy.
+        let mut disk_ok = false;
+        for _ in 0..100 {
+            let path_ok =
+                std::fs::read(dir_b.path().join("race.bin")).is_ok_and(|d| d == win_data.to_vec());
+            let copy_ok =
+                std::fs::read(dir_b.path().join(&copy_rel)).is_ok_and(|d| d == lose_data.to_vec());
+            if path_ok && copy_ok {
+                disk_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(disk_ok, "disk does not hold winner + conflict copy");
 
         // The stream continues past the conflict: a later op still lands.
         std::fs::write(dir_a.path().join("after.txt"), b"flows").unwrap();

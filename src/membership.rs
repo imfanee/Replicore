@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! membership.rs — the agent-owned roster (mandate 2, FR-1302/1303/1306).
 //!
 //! ## What this is (own the honest semantics)
@@ -364,6 +365,10 @@ struct Inner {
     allowlist: Arc<RwLock<HashSet<[u8; 32]>>>,
     /// Bumped on every applied change; the supervisor watches it.
     changed: watch::Sender<u64>,
+    /// Serializes merge_signed's stage→persist→commit sequence so two
+    /// concurrent merges (control socket + gossip) can never lose an update
+    /// while persistence I/O runs outside the roster read/write locks.
+    merge_serial: std::sync::Mutex<()>,
 }
 
 impl Membership {
@@ -383,6 +388,7 @@ impl Membership {
                 effective: RwLock::new(HashMap::new()),
                 allowlist: Arc::new(RwLock::new(HashSet::new())),
                 changed,
+                merge_serial: std::sync::Mutex::new(()),
             }),
         };
         m.recompute();
@@ -425,30 +431,35 @@ impl Membership {
         *self.inner.allowlist.write().expect("allowlist lock") = allow;
     }
 
-    /// Persist the roster atomically (daemon-owned file; the intent file is
-    /// never touched). Snapshots under the lock, writes outside it.
-    fn persist(&self) -> Result<(), RosterError> {
-        let snapshot = self.inner.roster.read().expect("roster lock").clone();
-        let path = self.inner.roster_path.read().expect("path lock").clone();
-        snapshot.save(&path)
-    }
-
-    /// THE mutation entry point for control/gossip/on-connect push: verify and
-    /// merge one signed entry, then (if state advanced) recompute the views,
-    /// persist, and notify the supervisor. Returns the merge outcome.
+    /// THE mutation entry point for control/gossip/on-connect push: verify
+    /// and merge one signed entry. **Disk is the commit point** (review
+    /// finding S4): the entry is merged into a STAGED clone, the staged
+    /// roster is persisted, and only then does the live state swap +
+    /// recompute + supervisor notify happen. A failed persist therefore
+    /// leaves the live roster, allowlist, and effective set UNTOUCHED — the
+    /// same signed entry retries cleanly (it is not yet merged, so no
+    /// `Superseded` dead-end), connections to a being-removed peer are
+    /// never half-severed against unpersisted state, and a restart loads a
+    /// roster consistent with what the mesh observed. `merge_serial` keeps
+    /// concurrent merges from staging off the same base and losing one.
     pub fn merge_signed(&self, entry: SignedEntry) -> Result<MergeOutcome, MembershipError> {
+        let _serial = self.inner.merge_serial.lock().expect("merge serial lock");
+        // Stage on a clone (rosters are small: one entry per member).
+        let mut staged = self.inner.roster.read().expect("roster lock").clone();
         let outcome = {
             let pk_guard = self.inner.admin_pubkey.read().expect("admin lock");
             let pk = pk_guard.as_ref().ok_or(MembershipError::NoAdminKey)?;
-            self.inner
-                .roster
-                .write()
-                .expect("roster lock")
-                .merge_entry(entry, pk)
+            staged.merge_entry(entry, pk)
         };
         if outcome == MergeOutcome::Applied {
+            // Persist the STAGED roster first; failure returns here with
+            // nothing visible changed.
+            let path = self.inner.roster_path.read().expect("path lock").clone();
+            staged.save(&path)?;
+            // Commit + recompute + notify — the supervisor severs
+            // connections only for state that is already durable.
+            *self.inner.roster.write().expect("roster lock") = staged;
             self.recompute();
-            self.persist()?;
             self.inner.changed.send_modify(|v| *v = v.wrapping_add(1));
         }
         Ok(outcome)
@@ -676,6 +687,49 @@ mod tests {
         }
         assert_eq!(a.digest(), b.digest());
         assert_eq!(a.digest(), c.digest());
+    }
+
+    #[test]
+    fn failed_persist_leaves_membership_untouched_and_retryable() {
+        // Review finding S4: if the roster cannot be written, the merge
+        // must NOT mutate the live view (else the supervisor is never
+        // notified, removed peers stay connected, and the retry dead-ends
+        // as Superseded). Disk is the commit point.
+        let dir = tempfile::tempdir().unwrap();
+        // Load with a healthy path, THEN break it: replace the roster's
+        // parent directory with a regular file, so save() fails with
+        // NotADirectory even when running as root (permission bits would
+        // not stop root).
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (sk, pk) = admin();
+        let mut cfg = cfg_with(Some(pk), sub.join("roster.json"), vec![]);
+        let m = Membership::load(&cfg).unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, b"not a directory").unwrap();
+        let mut watch = m.subscribe();
+        watch.mark_unchanged();
+
+        let entry = make(&sk, 0xC, 7000, 0xCC, 1, EntryKind::Add);
+
+        // Persist fails → error surfaces, NOTHING visible changed, no
+        // supervisor notification.
+        assert!(m.merge_signed(entry.clone()).is_err());
+        assert!(
+            !m.effective_peers().iter().any(|p| p.node_id == nid(0xC)),
+            "failed persist leaked into the effective set"
+        );
+        assert!(!watch.has_changed().unwrap(), "notified without durability");
+
+        // Repair the path; the SAME entry retries cleanly (no Superseded
+        // dead-end) and commits durably + notifies.
+        cfg.roster_path = dir.path().join("roster.json");
+        m.apply_reload(&cfg).unwrap();
+        watch.mark_unchanged();
+        assert_eq!(m.merge_signed(entry).unwrap(), MergeOutcome::Applied);
+        assert!(m.effective_peers().iter().any(|p| p.node_id == nid(0xC)));
+        assert!(watch.has_changed().unwrap(), "commit must notify");
+        assert!(cfg.roster_path.exists(), "roster not persisted");
     }
 
     #[test]

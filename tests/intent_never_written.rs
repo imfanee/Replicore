@@ -1,3 +1,4 @@
+//! Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 //! Grep-gate + runtime gate for invariant FR-1302: the daemon NEVER writes the
 //! human-owned intent file (`replicore.toml`). Dynamically-learned membership
 //! lives only in the agent-owned roster. This is a non-negotiable invariant, so
