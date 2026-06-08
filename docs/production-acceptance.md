@@ -71,35 +71,58 @@ so an operator can recover the alternate ownership/mtime views. This adds fideli
 without changing the determinism guarantee. *(Source: review-copy-naming.md;
 notes-m3-followups.md §2.)*
 
-### R-02 — `owner_policy=numeric` under NFS `root_squash` — **VERIFY-THEN-MITIGATE**
+### R-02 — `owner_policy=numeric` under NFS `root_squash` — **VERIFY-THEN-MITIGATE → likely Accept-with-verification**
 
 **Risk.** Root-owned writes arriving from NFS clients are squashed by the node's
 `nfsd` before the agent observes them; with `owner_policy=numeric` the agent then
 replicates the squashed ownership.
 
-**Task-1 finding (read-only investigation — see "R-02 finding" appendix below):**
-the trigger is **present at the config layer** (the recommended exports set
-`root_squash` on every export line) but only produces an effect **if the workload
-writes root-owned files via NFS** — which the documented IVR workload (A2) does
-not. Net: **depends-on-X**, X = "does any client write root-owned files into an
-exported subtree?" For the intended non-root IVR writer, R-02 does not fire.
+**Verdict (code-grounded read-only investigation): DEPENDS ON X**, where **X =
+"does the IVR application (or any NFS client) write files as root (uid 0) into an
+exported subtree?"** The question decomposes into two distinct claims, and the
+code lets us separate them:
 
-**Decision: VERIFY-THEN-MITIGATE.** Mitigate **only if the trigger is present**
-(i.e. the deployment confirms root-owned NFS-client writes occur), and then as a
-**post-soak code change requiring a soak restart**. If the trigger is confirmed
-absent (writer is a non-root service account), **downgrade R-02 to
-Accept-with-verification** — record the writer uid and the export `root_squash`
-setting as evidence, no code change.
+1. **The dangerous op-storm residual → NOT PRESENT (closed in code, independent
+   of X).** `src/main.rs:79–89` refuses to boot under `owner_policy = "numeric"`
+   without `CAP_CHOWN` (`bail!`). The ping-pong/op-storm residual described in
+   `review-3c-metadata.md` requires EPERM-on-apply, which requires *no* CAP_CHOWN
+   — unreachable under the mandated config. With CAP_CHOWN, `apply_meta`'s
+   `lchown(meta.uid, meta.gid)` (`src/metadata.rs:340`) succeeds for *any* target
+   uid including `nobody`/65534 — no EPERM, no skip, no ping-pong.
 
-**Why no code mitigation is possible at the agent today:** the squash happens at
-the NFS layer, upstream of the local write; by the time any agent code runs the
-file is already owned by `nobody`. A mitigation would live at the export layer
-(`no_root_squash` for a trusted writer) or be a capture-side pinning change.
-**No divergence/data-loss risk regardless:** the squash is applied
-deterministically by each node's own `nfsd`, and under A1 only one site writes a
-given path, so all peers apply the same ownership — content is intact, no node
-divergence, and the storm corner is closed by the `CAP_CHOWN` boot gate (A3).
-*(Source: review-3c-metadata.md FINDING + residual; runbook R4.)*
+2. **The ownership-fidelity squash (root → nobody before capture) → real
+   mechanism, fires only if X is true.** The intended exports set `root_squash`
+   on all three export lines (`DEPLOYMENT-NFS-RUNBOOK.md:135/138/139`), with no
+   `anonuid` override (→ default 65534). `root_squash` is an `nfsd`-layer remap
+   applied **before** the byte reaches local disk, so it affects **only** writes
+   performed as root; non-root uids pass through unchanged. `Meta::capture` under
+   `Numeric` reads `st.uid()/st.gid()` from local disk
+   (`src/metadata.rs:211`) — i.e. the **already-squashed** owner; the agent
+   provably never sees uid 0. So if a client writes a root-owned file it lands as
+   `nobody` before capture and replicates as `nobody`. **No divergence or
+   data-loss even when it fires:** the squash is deterministic and per-server, and
+   under A1 only one site writes a given path, so every peer applies the same
+   ownership and content is intact — a fidelity gap, not a correctness bug.
+
+**Decision: VERIFY-THEN-MITIGATE.**
+- **If X is false** (IVR recorder writes as a non-root service account — the
+  expected case under A2): the squash never engages, captured ownership is
+  faithful, and **R-02 downgrades to Accept-with-verification — no code fix, the
+  current soak continues.** Record the writer uid and the per-export `root_squash`
+  setting as the verification evidence.
+- **If X is true** (root-owned NFS-client writes genuinely occur): this is **not
+  fixable by an agent code change** — the squash is upstream of the local write,
+  so no capture-time code can recover uid 0. The remedy is at the **export layer**
+  (`no_root_squash` for the trusted writer, or an `anonuid` mapping) or
+  operational. A soak restart on a fixed commit is warranted **only** if you elect
+  a capture-side pinning change; the dangerous storm residual stays closed (1)
+  regardless.
+
+**Verification action:** confirm X by checking the uid the IVR recorder writes as,
+and the per-export squash setting. Expected resolution given the documented
+non-root write-once workload: **Accept-with-verification, no fix, soak continues.**
+*(Sources: `src/main.rs:79–89` boot gate; `src/metadata.rs:211` capture / `:340`
+lchown; `DEPLOYMENT-NFS-RUNBOOK.md` R4 + exports; `review-3c-metadata.md` residual.)*
 
 ### R-03 — Hardlinks not preserved as links — **ACCEPT (schedule M4)**
 
@@ -176,9 +199,12 @@ root-owned NFS-client writes to land squashed before the agent captures them?
 
 **Method.** Read-only review of the export configuration and ownership policy in
 `docs/DEPLOYMENT-NFS-RUNBOOK.md` (recommended `/etc/exports`, R4) and
-`docs/DEPLOYMENT-NFS.md`, cross-referenced with the metadata apply/capture
-analysis in `docs/review-3c-metadata.md`. No code or config changed; the rig was
-not touched.
+`docs/DEPLOYMENT-NFS.md`, **plus the source itself**: the capture/apply ownership
+handling in `src/metadata.rs` (`capture` at `:211`, `apply_meta` lchown at `:340`)
+and the `CAP_CHOWN` boot gate in `src/main.rs:79–89`, cross-referenced with
+`docs/review-3c-metadata.md`. No code or config changed; the rig was not touched.
+See the R-02 decision above for the two-claim decomposition (storm residual closed
+by the boot gate; fidelity squash depends on X).
 
 **Finding — TRIGGER PRESENT AT CONFIG LAYER, EFFECT DEPENDS ON WORKLOAD:**
 
