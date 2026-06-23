@@ -1,9 +1,14 @@
 # Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
 [package]
 name = "replicore"
-version = "0.0.1"
+version = "1.0.0"
 edition = "2021"
 description = "Replicore: multi-master, eventually-consistent file replication engine"
+repository = "https://github.com/imfanee/Replicore"
+readme = "README.md"
+license-file = "LICENSE"
+authors = ["Faisal Hanif <imfanee@gmail.com>"]
+publish = false
 
 [[bin]]
 name = "replicored"
