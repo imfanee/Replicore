@@ -28,18 +28,26 @@ change to all peers **without blocking local I/O**.
 
 ## Status
 
-**M3 — production hardening — complete.** The engine implements the full
+**1.0.0 — first production release.** The engine implements the full
 correctness core (op-log, version vectors, apply-suppression, conflict
 resolution, metadata fidelity), the self-healing mesh (chunking, multi-source
 fetch, Merkle anti-entropy), dynamic cluster membership with a signed control
 plane, and production concerns (QoS/bandwidth shaping, free-space guard, metrics,
-BBR congestion control). It is under long-duration soak validation on the
-emulated-WAN rig.
+BBR congestion control). It passed a 48 h chaos soak — ~270 hard `kill -9`s,
+46/46 hourly checkpoints converged byte-identically, bounded resources,
+`damaged=0` — with a final byte-identical convergence proof across all three
+nodes (see [Production-Readiness-test.md](Production-Readiness-test.md)).
+
+**Install:** prebuilt statically-linked binaries (one per CPU arch, runs on any
+Linux distro) are attached to each [GitHub Release](https://github.com/imfanee/Replicore/releases).
+See **[INSTALL.md](INSTALL.md)** to install on your distro, or build from source
+below.
 
 ## Documentation
 
 | Document | Audience | What it covers |
 |---|---|---|
+| [INSTALL.md](INSTALL.md) | Anyone deploying | Install on any Linux distro: prebuilt static binaries, checksum verification, per-distro notes, build-from-source, systemd |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Everyone | How Replicore works: op-log, version vectors, chunks, anti-entropy, membership |
 | [docs/DEPLOYMENT-GUIDE.md](docs/DEPLOYMENT-GUIDE.md) | DevOps / SRE | Install, provision identities, configure, run under systemd, firewall, upgrade, back up |
 | [docs/ADMIN-GUIDE.md](docs/ADMIN-GUIDE.md) | Cluster admins | Day-2 ops: `replicorectl`, membership, monitoring, conflicts, config reload, troubleshooting |

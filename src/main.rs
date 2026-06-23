@@ -44,9 +44,20 @@ async fn main() -> Result<()> {
         Some("gen-cert") => gen_cert(args),
         Some("gen-admin-key") => gen_admin_key(args),
         Some("run") => run(args).await,
+        Some("version") | Some("--version") | Some("-V") => {
+            // Print to stdout (a query, not a diagnostic): package version plus
+            // the wire protocol version, since a mesh runs one protocol end to
+            // end (a flag-day version) and operators pin peers by it.
+            println!(
+                "replicored {} (protocol v{})",
+                env!("CARGO_PKG_VERSION"),
+                replicore::proto::PROTO_VERSION
+            );
+            Ok(())
+        }
         _ => {
             eprintln!(
-                "usage:\n  replicored gen-cert --out-dir DIR --name NAME\n  replicored gen-admin-key --out FILE\n  replicored run --config FILE"
+                "usage:\n  replicored gen-cert --out-dir DIR --name NAME\n  replicored gen-admin-key --out FILE\n  replicored run --config FILE\n  replicored version"
             );
             Ok(())
         }

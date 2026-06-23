@@ -1,0 +1,65 @@
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
+#
+# Build the static-musl release matrix and publish it to a GitHub Release.
+# Triggered by pushing a version tag, e.g.:
+#   git tag -a v1.0.0 -m "Replicore 1.0.0" && git push origin v1.0.0
+#
+# Produces, for each target, a fully statically-linked tarball that runs on any
+# Linux distribution + a single SHA256SUMS, attached to the Release.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}   # allow a manual run for dry-tests (no Release upload)
+
+permissions:
+  contents: write          # needed to create the Release and upload assets
+
+jobs:
+  build:
+    name: build static matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + musl targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+
+      # zig + cargo-zigbuild let one runner cross-compile every musl target
+      # (incl. aarch64) with no per-architecture C toolchain.
+      - name: Install zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - name: Build + package release artifacts
+        env:
+          USE_ZIGBUILD: "1"
+          TARGETS: "x86_64-unknown-linux-musl aarch64-unknown-linux-musl"
+        run: scripts/build-release.sh
+
+      - name: Upload artifacts (for inspection on every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: replicore-release
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true

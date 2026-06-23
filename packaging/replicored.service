@@ -1,0 +1,34 @@
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
+#
+# Canonical systemd unit for the Replicore replication agent.
+# Install to /etc/systemd/system/replicored.service, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now replicored
+#
+# Adjust ReadWritePaths to match your share_dir, db_path, and cas_dir.
+# If owner_policy = "skip", remove the two CAP_CHOWN lines.
+# See docs/DEPLOYMENT-GUIDE.md for the full production procedure.
+
+[Unit]
+Description=Replicore replication agent
+Documentation=https://github.com/imfanee/Replicore
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/replicored run --config /etc/replicore/replicore.toml
+Restart=on-failure
+RestartSec=5
+User=replicore
+Group=replicore
+# owner_policy=numeric (the default) needs CAP_CHOWN; drop everything else:
+AmbientCapabilities=CAP_CHOWN
+CapabilityBoundingSet=CAP_CHOWN
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/replicore /var/lib/replicore /run/replicore
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

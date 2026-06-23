@@ -1,0 +1,43 @@
+# Architected & Developed By:- Faisal Hanif | imfanee@gmail.com
+#
+# Continuous integration: format, lint, build, and test on every push/PR.
+# Privilege-requiring integration tests (root + network namespaces) are marked
+# #[ignore] and are NOT run here — they run on the emulated-WAN rig. See
+# scripts/wan-testbed.sh and the test headers.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt · clippy · build · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + components)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build (release)
+        run: cargo build --release --bins
+
+      - name: Test (excludes #[ignore] root/netns tests)
+        run: cargo test --all

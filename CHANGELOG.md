@@ -6,6 +6,29 @@ Replicore is developed in milestones. Each milestone is independently tested on
 the emulated-WAN rig before the next begins. The wire protocol is a flag-day
 version — a mesh runs one protocol version end to end.
 
+## 1.0.0 — First production release
+
+First tagged production release. Rolls up the complete M0–M3 engine (correctness
+core, self-healing mesh, dynamic signed membership, production guards) into a
+versioned, distributable product.
+
+- **Protocol v4** (ALPN `replicore/4`) — a mesh runs one protocol version end to
+  end.
+- **Validation.** Passed a 48 h chaos confirmatory soak: 3-node mesh, a hard
+  `kill -9` every ~600 s (~270 kills), **46/46 hourly checkpoints converged**
+  (byte-identical trees), bounded RSS/lag/conflict-copies, and a final
+  byte-identical convergence proof across all three nodes (`damaged=0`
+  throughout). See `Production-Readiness-test.md`.
+- **Release artifacts.** Statically-linked (musl) `replicored` + `replicorectl`
+  for `x86_64` and `aarch64`, published per release — one binary runs on any
+  Linux distribution/version. Built reproducibly via `scripts/build-release.sh`
+  and the `release` GitHub Actions workflow; checksummed in `SHA256SUMS`.
+- **Install guide.** `INSTALL.md` covers every major distro (Debian/Ubuntu,
+  RHEL/Rocky/Alma, Fedora, Alpine, Arch, openSUSE), checksum verification,
+  build-from-source, and systemd.
+- **`replicored version`** — prints the package and wire-protocol versions
+  (`replicorectl version` already reports both for a running daemon).
+
 ## M3 — Production hardening (complete)
 
 Hardens a dynamic cluster for production.
