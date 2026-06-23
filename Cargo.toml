@@ -6,6 +6,9 @@ edition = "2021"
 description = "Replicore: multi-master, eventually-consistent file replication engine"
 repository = "https://github.com/imfanee/Replicore"
 readme = "README.md"
+license-file = "LICENSE"
+authors = ["Faisal Hanif <imfanee@gmail.com>"]
+publish = false
 
 [[bin]]
 name = "replicored"

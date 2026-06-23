@@ -13,6 +13,10 @@ verified. For the full production procedure — identities, configuration,
 firewalling, backups, upgrades — follow **[docs/DEPLOYMENT-GUIDE.md](docs/DEPLOYMENT-GUIDE.md)**
 after installing.
 
+> **License.** Replicore is proprietary software (© 2026 Faisal Hanif, all rights
+> reserved). Installing or running it requires a license from the Author —
+> contact **imfanee@gmail.com**. See [LICENSE](LICENSE) for terms.
+
 ---
 
 ## 1. Requirements

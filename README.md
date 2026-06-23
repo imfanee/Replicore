@@ -127,3 +127,11 @@ agent can load it.
   Protocol") spells out both steps.
 - Keep `AGENTS.md` factual and append-oriented; it is the handoff between
   sessions, not a scratchpad. There is no other agent-memory file in the repo.
+
+## License
+
+Replicore is **proprietary software** — Copyright © 2026 Faisal Hanif, all
+rights reserved. The availability of source code and prebuilt binaries does not
+grant any right to use, deploy, or distribute it. To obtain a license (evaluation
+or commercial), contact **Faisal Hanif &lt;imfanee@gmail.com&gt;**. See
+[LICENSE](LICENSE) for the full terms.
