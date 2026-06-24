@@ -55,6 +55,7 @@ below.
 | [docs/SECURITY.md](docs/SECURITY.md) | Security / DevOps | Trust model, mutual TLS, admin signing, control-socket auth |
 | [docs/DEPLOYMENT-NFS.md](docs/DEPLOYMENT-NFS.md) | DevOps | Theory for NFS-fronted topologies |
 | [docs/DEPLOYMENT-NFS-RUNBOOK.md](docs/DEPLOYMENT-NFS-RUNBOOK.md) | DevOps | Actionable deploy-time runbook for NFS-fronted nodes |
+| [docs/design-m4-single-copy-serving.md](docs/design-m4-single-copy-serving.md) | Engineers | Proposed M4 design: serve from the live tree to drop steady-state footprint from ~2× to ~1× the dataset |
 | [CHANGELOG.md](CHANGELOG.md) | Everyone | Milestone history and notable fixes |
 | [AGENTS.md](AGENTS.md) | Engineers / AI agents | The single source of project memory and build guidance: non-negotiable invariants, build order, and the session protocol |
 
