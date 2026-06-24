@@ -155,6 +155,12 @@ Build, test on the rig, and review each milestone before starting the next.
   file identity + renames, full POSIX metadata fidelity (protocol v4), fanotify
   FID watcher, QoS, Prometheus metrics, free-space guard, BBR, then a
   long-duration soak.
+- **M4 — Single-copy serving (proposed).** Eliminate steady-state storage
+  amplification: serve chunks from the live tree (reverse index + verify-on-read)
+  instead of from a permanent hash-addressed CAS, so the CAS becomes a transient,
+  ack-frontier-scoped working set and per-node footprint drops from ~2× to ~1× the
+  dataset. Flag-day to protocol v5; touches the high-risk serve/fetch path, so
+  design-first + full re-soak. Design: [docs/design-m4-single-copy-serving.md](docs/design-m4-single-copy-serving.md).
 
 **Definition of Done (per milestone):** implemented + `cargo clippy --all-targets
 -- -D warnings` clean + unit/property tests pass + the milestone integration test
